@@ -19,6 +19,7 @@ package org.apache.kafka.server.config;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.utils.Utils;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -84,7 +85,9 @@ public final class ServerTopicConfigSynonyms {
         sameNameWithLogPrefix(TopicConfig.MESSAGE_TIMESTAMP_BEFORE_MAX_MS_CONFIG),
         sameNameWithLogPrefix(TopicConfig.MESSAGE_TIMESTAMP_AFTER_MAX_MS_CONFIG),
         sameNameWithLogPrefix(TopicConfig.LOCAL_LOG_RETENTION_MS_CONFIG),
-        sameNameWithLogPrefix(TopicConfig.LOCAL_LOG_RETENTION_BYTES_CONFIG)
+        sameNameWithLogPrefix(TopicConfig.LOCAL_LOG_RETENTION_BYTES_CONFIG),
+        sameName(TopicConfig.URSA_STORAGE_ENABLE_CONFIG,
+            new ConfigSynonym("ursa.storage.topic.default.enable"))
     );
 
     /**
@@ -110,6 +113,13 @@ public final class ServerTopicConfigSynonyms {
 
     private static Entry<String, List<ConfigSynonym>> sameName(String configName) {
         return Utils.mkEntry(configName, List.of(new ConfigSynonym(configName)));
+    }
+
+    private static Entry<String, List<ConfigSynonym>> sameName(String configName, ConfigSynonym... synonyms) {
+        List<ConfigSynonym> allSynonyms = new ArrayList<>();
+        allSynonyms.add(new ConfigSynonym(configName));
+        allSynonyms.addAll(Arrays.asList(synonyms));
+        return Utils.mkEntry(configName, List.copyOf(allSynonyms));
     }
 
     private static Entry<String, List<ConfigSynonym>> sameNameWithLogPrefix(String configName) {
