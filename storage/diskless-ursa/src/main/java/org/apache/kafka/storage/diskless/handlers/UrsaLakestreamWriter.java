@@ -17,16 +17,16 @@
 package org.apache.kafka.storage.diskless.handlers;
 
 /**
- * Writer implementation using ManagedLedger for storage.
+ * Writer implementation using Lakestream for storage.
  */
-public class UrsaManagedLedgerWriter extends AbstractUrsaStorageWriter {
+public class UrsaLakestreamWriter extends AbstractUrsaStorageWriter {
 
-    public UrsaManagedLedgerWriter(UrsaStorageState state) {
+    public UrsaLakestreamWriter(UrsaStorageState state) {
         super(state);
     }
 
     @Override
     protected String writerName() {
-        return "ManagedLedger";
+        return "Lakestream";
     }
 }

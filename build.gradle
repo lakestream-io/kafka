@@ -2870,7 +2870,8 @@ project(':storage:storage-diskless-ursa') {
       exclude group: 'io.streamnative', module: 'pulsar-client-original'
       exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
     }
-    implementation("io.streamnative:ursa-storage-ml:$ursaStorageVersion") {
+    implementation "io.streamnative:lakestream-api:$ursaStorageVersion"
+    implementation("io.streamnative:ursa-storage-lakestream:$ursaStorageVersion") {
       exclude group: 'io.streamnative', module: 'pulsar-broker'
       exclude group: 'io.streamnative', module: 'pulsar-client-original'
       exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
@@ -2887,15 +2888,12 @@ project(':storage:storage-diskless-ursa') {
       exclude group: 'io.streamnative', module: 'pulsar-client-original'
       exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
     }
+    // Lakestream's StorageApi bridge still exposes ManagedLedger API types at runtime
+    // (for example EntryList and fenced append exceptions).
     implementation("io.streamnative:managed-ledger:$ursaPulsarVersion")
     implementation("io.streamnative:pulsar-broker-common:$ursaPulsarVersion") {
       exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
       exclude group: 'io.streamnative', module: 'pulsar-client-original'
-    }
-    implementation("io.streamnative:pulsar-broker:$ursaPulsarVersion") {
-      // Only used for a small set of API types (e.g. ManagedLedgerStorage / BookKeeperClientFactory).
-      // Avoid pulling the broker dependency graph (Jetty/Jersey, etc.) into Kafka's binary distribution.
-      transitive = false
     }
     implementation "io.github.oxia-db:oxia-client-api:$oxiaClientVersion"
     implementation 'io.netty:netty-buffer:4.1.131.Final'

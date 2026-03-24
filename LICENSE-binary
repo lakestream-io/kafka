@@ -752,7 +752,6 @@ bundled under ./ursa-storage.
 - protobuf-java-4.34.0
 - protobuf-java-util-3.25.8
 - protocol-core-2.32.28
-- pulsar-broker-4.2.1.11
 - pulsar-broker-common-4.2.1.11
 - pulsar-client-admin-api-4.2.1.11
 - pulsar-client-api-4.2.1.11
@@ -797,7 +796,6 @@ bundled under ./ursa-storage.
 - ursa-storage-lakehouse-5.0.0-M1-SNAPSHOT
 - ursa-storage-lakestream-5.0.0-M1-SNAPSHOT
 - ursa-storage-materialization-5.0.0-M1-SNAPSHOT
-- ursa-storage-ml-5.0.0-M1-SNAPSHOT
 - util-2.2.31
 - util-hadoop-hadoop3-2.2.31
 - utils-2.32.28

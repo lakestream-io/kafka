@@ -249,9 +249,9 @@ public class ServerLogConfigs {
     public static final String URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG =
             "ursa.storage.external.reader.factory.class";
     public static final String URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DEFAULT =
-            "io.streamnative.ursa.mledger.reader.NoopExternalReaderFactory";
+            "io.streamnative.ursa.lakestream.reader.NoopCompactedObjectReaderFactory";
     public static final String URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DOC =
-            "The external reader factory class used by Ursa managed ledger readers.";
+            "The compacted object reader factory class used by Lakestream readers.";
 
     public static final String URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_CONFIG =
             "ursa.storage.kop.schema.registry.url";

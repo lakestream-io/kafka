@@ -22,13 +22,6 @@ import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.storage.diskless.handlers.KafkaEntryFormatter;
 
-import org.apache.bookkeeper.mledger.AsyncCallbacks;
-import org.apache.bookkeeper.mledger.Entry;
-import org.apache.bookkeeper.mledger.ManagedCursor;
-import org.apache.bookkeeper.mledger.ManagedLedger;
-import org.apache.bookkeeper.mledger.ManagedLedgerException;
-import org.apache.bookkeeper.mledger.Position;
-import org.apache.bookkeeper.mledger.PositionFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,7 +48,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import io.oxia.client.api.AsyncOxiaClient;
-import io.streamnative.ursa.mledger.UrsaPosition;
+import io.streamnative.lakestream.api.Log;
+import io.streamnative.lakestream.api.LogCursor;
+import io.streamnative.lakestream.api.LogEntry;
 
 /**
  * Per-partition producer state manager for diskless idempotent produce.
@@ -179,7 +174,7 @@ public class ProducerStateManager implements Closeable {
 
     private final TopicIdPartition topicIdPartition;
     private final Supplier<AsyncOxiaClient> oxiaClientSupplier;
-    private final Supplier<CompletableFuture<ManagedLedger>> managedLedgerSupplier;
+    private final Supplier<CompletableFuture<Log>> logSupplier;
     private final String zone;
     private final long snapshotIntervalMs;
     private final int snapshotRecordThreshold;
@@ -200,8 +195,8 @@ public class ProducerStateManager implements Closeable {
     public ProducerStateManager(
             TopicIdPartition topicIdPartition,
             Supplier<AsyncOxiaClient> oxiaClientSupplier,
-            Supplier<CompletableFuture<ManagedLedger>> managedLedgerSupplier) {
-        this(topicIdPartition, oxiaClientSupplier, managedLedgerSupplier,
+            Supplier<CompletableFuture<Log>> logSupplier) {
+        this(topicIdPartition, oxiaClientSupplier, logSupplier,
             DisklessClientZone.NO_ZONE,
             DEFAULT_SNAPSHOT_INTERVAL_MS, DEFAULT_SNAPSHOT_RECORD_THRESHOLD,
             new ScheduledThreadPoolExecutor(1, runnable -> {
@@ -214,12 +209,12 @@ public class ProducerStateManager implements Closeable {
     public ProducerStateManager(
             TopicIdPartition topicIdPartition,
             Supplier<AsyncOxiaClient> oxiaClientSupplier,
-            Supplier<CompletableFuture<ManagedLedger>> managedLedgerSupplier,
+            Supplier<CompletableFuture<Log>> logSupplier,
             String zone,
             long snapshotIntervalMs,
             int snapshotRecordThreshold,
             ScheduledExecutorService scheduler) {
-        this(topicIdPartition, oxiaClientSupplier, managedLedgerSupplier,
+        this(topicIdPartition, oxiaClientSupplier, logSupplier,
             zone,
             snapshotIntervalMs, snapshotRecordThreshold, scheduler, false);
     }
@@ -227,7 +222,7 @@ public class ProducerStateManager implements Closeable {
     private ProducerStateManager(
             TopicIdPartition topicIdPartition,
             Supplier<AsyncOxiaClient> oxiaClientSupplier,
-            Supplier<CompletableFuture<ManagedLedger>> managedLedgerSupplier,
+            Supplier<CompletableFuture<Log>> logSupplier,
             String zone,
             long snapshotIntervalMs,
             int snapshotRecordThreshold,
@@ -235,7 +230,7 @@ public class ProducerStateManager implements Closeable {
             boolean ownsScheduler) {
         this.topicIdPartition = Objects.requireNonNull(topicIdPartition, "topicIdPartition must not be null");
         this.oxiaClientSupplier = Objects.requireNonNull(oxiaClientSupplier, "oxiaClientSupplier must not be null");
-        this.managedLedgerSupplier = Objects.requireNonNull(managedLedgerSupplier, "managedLedgerSupplier must not be null");
+        this.logSupplier = Objects.requireNonNull(logSupplier, "logSupplier must not be null");
         this.zone = DisklessClientZone.normalize(zone);
         this.snapshotIntervalMs = snapshotIntervalMs;
         this.snapshotRecordThreshold = snapshotRecordThreshold;
@@ -448,7 +443,7 @@ public class ProducerStateManager implements Closeable {
 
     private CompletableFuture<Void> recover() {
         return loadSnapshot()
-            .thenCompose(ignored -> replayFromManagedLedger())
+            .thenCompose(ignored -> replayFromLog())
             .exceptionally(error -> {
                 throw new CompletionException(error);
             });
@@ -465,68 +460,77 @@ public class ProducerStateManager implements Closeable {
         return loadSnapshotFromKey(client, snapshotKey()).thenAccept(ignored -> { });
     }
 
-    private CompletableFuture<Void> replayFromManagedLedger() {
-        return managedLedgerSupplier.get().thenCompose(this::replayManagedLedgerEntries);
+    private CompletableFuture<Void> replayFromLog() {
+        return logSupplier.get().thenCompose(this::replayLogEntries);
     }
 
-    private CompletableFuture<Void> replayManagedLedgerEntries(ManagedLedger managedLedger) {
-        Position lastConfirmed = managedLedger.getLastConfirmedEntry();
-        long endOffset = getNextOffsetForUrsa(lastConfirmed);
+    private CompletableFuture<Void> replayLogEntries(Log logInstance) {
+        return logInstance.getLastOffset().thenCompose(lastOffset -> {
+            long endOffset = lastOffset.offset() < 0 ? 0L
+                    : lastOffset.offset() + Math.max(1, lastOffset.numberOfRecords());
 
-        long startOffset;
-        synchronized (this) {
-            startOffset = nextOffsetToRecover;
-        }
-        if (startOffset >= endOffset) {
-            return CompletableFuture.completedFuture(null);
-        }
+            long startOffset;
+            synchronized (this) {
+                startOffset = nextOffsetToRecover;
+            }
+            if (startOffset >= endOffset) {
+                return CompletableFuture.completedFuture(null);
+            }
 
-        boolean hasNoSnapshot = startOffset == DEFAULT_NEXT_OFFSET;
-        long messagesToRecover = endOffset - startOffset;
-        if (hasNoSnapshot
-                && snapshotRecordThreshold > 0
-                && messagesToRecover > snapshotRecordThreshold) {
+            boolean hasNoSnapshot = startOffset == DEFAULT_NEXT_OFFSET;
+            if (shouldSkipReplay(hasNoSnapshot, endOffset - startOffset)) {
+                return CompletableFuture.completedFuture(null);
+            }
+
+            long cursorStartOffset = startOffset == DEFAULT_NEXT_OFFSET ? 0L : startOffset;
+            return openReplayCursorAndReplay(logInstance, cursorStartOffset, endOffset, hasNoSnapshot);
+        });
+    }
+
+    private boolean shouldSkipReplay(boolean hasNoSnapshot, long messagesToRecover) {
+        if (hasNoSnapshot && snapshotRecordThreshold > 0 && messagesToRecover > snapshotRecordThreshold) {
             synchronized (this) {
                 recoverySkippedDueToExcessiveReplay = true;
                 bypassedProducerIdsAfterSkippedRecovery.clear();
             }
             log.warn("[{}] Skipping producer-state replay without snapshot because messages to recover {} "
                     + "exceed snapshot threshold {}", topicIdPartition, messagesToRecover, snapshotRecordThreshold);
-            return CompletableFuture.completedFuture(null);
+            return true;
         }
-        Position startPosition = startOffset == DEFAULT_NEXT_OFFSET
-            ? PositionFactory.EARLIEST
-            : PositionFactory.create(lastConfirmed.getLedgerId(), startOffset);
-
-        String cursorName = "producer-state-replay-" + topicIdPartition.topic() + "-"
-            + topicIdPartition.partition() + "-" + startOffset;
-        ManagedCursor cursor;
-        try {
-            cursor = managedLedger.newNonDurableCursor(startPosition, cursorName);
-        } catch (ManagedLedgerException e) {
-            throw new CompletionException(e);
-        }
-
-        CompletableFuture<Void> replayFuture = new CompletableFuture<>();
-        AtomicInteger replayEntries = new AtomicInteger();
-        replayFuture.whenComplete((__, error) -> {
-            cleanupReplayCursor(managedLedger, cursor.getName());
-            if (error != null) {
-                log.warn("[{}] Failed to replay producer state from managed ledger", topicIdPartition, error);
-            } else {
-                if (replayEntries.get() > 0) {
-                    takeSnapshotAsync("replay");
-                }
-                log.info("[{}] Finished replaying producer state from managed ledger, replayed {} entries",
-                    topicIdPartition, replayEntries.get());
-            }
-        });
-        scheduleNextReplayRead(cursor, lastConfirmed, endOffset, hasNoSnapshot, replayEntries, replayFuture);
-        return replayFuture;
+        return false;
     }
 
-    private void asyncReplayEntries(ManagedCursor cursor,
-                                    Position lastConfirmed,
+    private CompletableFuture<Void> openReplayCursorAndReplay(
+            Log logInstance, long cursorStartOffset, long endOffset, boolean hasNoSnapshot) {
+        String cursorName = "producer-state-replay-" + topicIdPartition.topic() + "-"
+            + topicIdPartition.partition() + "-" + cursorStartOffset;
+
+        return logInstance.openEphemeralCursor(cursorName, cursorStartOffset)
+            .thenCompose(cursor -> {
+                CompletableFuture<Void> replayFuture = new CompletableFuture<>();
+                AtomicInteger replayEntries = new AtomicInteger();
+                replayFuture.whenComplete((__, error) -> {
+                    try {
+                        cursor.close();
+                    } catch (Exception e) {
+                        log.warn("[{}] Failed to close replay cursor", topicIdPartition, e);
+                    }
+                    if (error != null) {
+                        log.warn("[{}] Failed to replay producer state from log", topicIdPartition, error);
+                    } else {
+                        if (replayEntries.get() > 0) {
+                            takeSnapshotAsync("replay");
+                        }
+                        log.info("[{}] Finished replaying producer state from log, replayed {} entries",
+                            topicIdPartition, replayEntries.get());
+                    }
+                });
+                scheduleNextReplayRead(cursor, endOffset, hasNoSnapshot, replayEntries, replayFuture);
+                return replayFuture;
+            });
+    }
+
+    private void asyncReplayEntries(LogCursor cursor,
                                     long endOffset,
                                     boolean hasNoSnapshot,
                                     final AtomicInteger replayedEntries,
@@ -542,61 +546,62 @@ public class ProducerStateManager implements Closeable {
             replayFuture.complete(null);
             return;
         }
-        cursor.asyncReadEntries(REPLAY_MAX_ENTRIES_PER_READ, REPLAY_MAX_BYTES_PER_READ,
-                new AsyncCallbacks.ReadEntriesCallback() {
-                    @Override
-                    public void readEntriesComplete(List<Entry> entries, Object ctx) {
-                        if (replayFuture.isDone()) {
-                            if (entries != null && !entries.isEmpty()) {
-                                entries.forEach(ProducerStateManager::safeRelease);
-                            }
-                            return;
-                        }
-                        if (entries == null || entries.isEmpty()) {
-                            replayFuture.complete(null);
-                            return;
-                        }
-                        for (Entry entry : entries) {
-                            try {
-                                if (entry.getPosition().compareTo(lastConfirmed) > 0) {
-                                    replayFuture.complete(null);
-                                    return;
-                                }
-                                ReplayEntryResult replayEntryResult = replayEntry(entry);
-                                if (hasNoSnapshot
-                                        && replayedEntries.get() == 0
-                                        && replayEntryResult == ReplayEntryResult.NO_PRODUCER_BATCH) {
-                                    // Align with KoP behavior: when recovering from scratch and the first entry is
-                                    // non-idempotent, stop replay early and rebuild state from subsequent
-                                    // new idempotent writes.
-                                    replayFuture.complete(null);
-                                    return;
-                                }
-                                replayedEntries.incrementAndGet();
-                            } catch (Exception e) {
-                                log.error("[{}] Failed to replay entry at offset {}",
-                                        topicIdPartition, entry == null ? "null" : entry.getEntryId(), e);
-                                replayFuture.completeExceptionally(e);
-                                return;
-                            } finally {
-                                safeRelease(entry);
-                            }
-                        }
-                        scheduleNextReplayRead(cursor, lastConfirmed, endOffset,
-                            hasNoSnapshot, replayedEntries, replayFuture);
-                    }
-
-                    @Override
-                    public void readEntriesFailed(ManagedLedgerException exception, Object ctx) {
-                        if (!replayFuture.isDone()) {
-                            replayFuture.completeExceptionally(exception);
-                        }
-                    }
-                }, null, lastConfirmed);
+        CompletableFuture<List<LogEntry>> readFuture;
+        try {
+            readFuture = cursor.readEntries(
+                    REPLAY_MAX_ENTRIES_PER_READ, REPLAY_MAX_BYTES_PER_READ, null, endOffset);
+            if (readFuture == null) {
+                throw new IllegalStateException("LogCursor.readEntries returned null future");
+            }
+        } catch (Throwable readError) {
+            replayFuture.completeExceptionally(readError);
+            return;
+        }
+        readFuture.whenComplete((entries, readError) -> {
+            if (readError != null) {
+                if (!replayFuture.isDone()) {
+                    replayFuture.completeExceptionally(readError);
+                }
+                return;
+            }
+            processReplayBatch(entries, cursor, endOffset, hasNoSnapshot, replayedEntries, replayFuture);
+        });
     }
 
-    private void scheduleNextReplayRead(ManagedCursor cursor,
-                                        Position lastConfirmed,
+    private void processReplayBatch(List<LogEntry> entries,
+                                    LogCursor cursor,
+                                    long endOffset,
+                                    boolean hasNoSnapshot,
+                                    AtomicInteger replayedEntries,
+                                    CompletableFuture<Void> replayFuture) {
+        if (replayFuture.isDone()) {
+            return;
+        }
+        if (entries == null || entries.isEmpty()) {
+            replayFuture.complete(null);
+            return;
+        }
+        for (LogEntry entry : entries) {
+            try {
+                ReplayEntryResult replayEntryResult = replayEntry(entry);
+                if (hasNoSnapshot
+                        && replayedEntries.get() == 0
+                        && replayEntryResult == ReplayEntryResult.NO_PRODUCER_BATCH) {
+                    replayFuture.complete(null);
+                    return;
+                }
+                replayedEntries.incrementAndGet();
+            } catch (Exception e) {
+                log.error("[{}] Failed to replay entry at offset {}",
+                        topicIdPartition, entry == null ? "null" : entry.offset(), e);
+                replayFuture.completeExceptionally(e);
+                return;
+            }
+        }
+        scheduleNextReplayRead(cursor, endOffset, hasNoSnapshot, replayedEntries, replayFuture);
+    }
+
+    private void scheduleNextReplayRead(LogCursor cursor,
                                         long endOffset,
                                         boolean hasNoSnapshot,
                                         AtomicInteger replayedEntries,
@@ -606,32 +611,21 @@ public class ProducerStateManager implements Closeable {
         }
         try {
             scheduler.execute(() -> asyncReplayEntries(
-                cursor, lastConfirmed, endOffset, hasNoSnapshot, replayedEntries, replayFuture));
+                cursor, endOffset, hasNoSnapshot, replayedEntries, replayFuture));
         } catch (RuntimeException scheduleError) {
             replayFuture.completeExceptionally(scheduleError);
         }
     }
 
-    private void cleanupReplayCursor(ManagedLedger managedLedger, String cursorName) {
-        managedLedger.asyncDeleteCursor(cursorName, new AsyncCallbacks.DeleteCursorCallback() {
-            @Override
-            public void deleteCursorComplete(Object ctx) {
-                log.debug("[{}] Replay cursor {} deleted", topicIdPartition, cursorName);
-            }
-
-            @Override
-            public void deleteCursorFailed(ManagedLedgerException exception, Object ctx) {
-                log.warn("[{}] Failed to delete replay cursor {}", topicIdPartition, cursorName, exception);
-            }
-        }, null);
-    }
-
-    private ReplayEntryResult replayEntry(Entry entry) {
-        long baseOffset = entry.getEntryId();
-        long nextOffset = getNextOffsetForUrsa(entry.getPosition());
+    private ReplayEntryResult replayEntry(LogEntry entry) {
+        long baseOffset = entry.offset();
+        long nextOffset = entry.offset() + Math.max(1, entry.numberOfRecords());
 
         try {
-            ByteBuffer kafkaRecordsBuffer = KafkaEntryFormatter.decode(entry.getDataBuffer().duplicate());
+            ByteBuffer decodedRecords = KafkaEntryFormatter.decode(entry.payload().duplicate());
+            ByteBuffer kafkaRecordsBuffer = ByteBuffer.allocate(decodedRecords.remaining());
+            kafkaRecordsBuffer.put(decodedRecords.duplicate());
+            kafkaRecordsBuffer.flip();
             if (kafkaRecordsBuffer.remaining() >= Long.BYTES) {
                 kafkaRecordsBuffer.putLong(kafkaRecordsBuffer.position(), baseOffset);
             }
@@ -947,24 +941,6 @@ public class ProducerStateManager implements Closeable {
         producers.clear();
         bypassedProducerIdsAfterSkippedRecovery.clear();
         nextOffsetToRecover = DEFAULT_NEXT_OFFSET;
-    }
-
-    private static void safeRelease(Entry entry) {
-        try {
-            entry.release();
-        } catch (Exception releaseError) {
-            log.warn("Failed to release managed-ledger entry {}", entry.getPosition(), releaseError);
-        }
-    }
-
-    private static long getNextOffsetForUrsa(Position position) {
-        if (position == null || position.getEntryId() < 0) {
-            return 0L;
-        }
-        if (position instanceof UrsaPosition ursaPosition) {
-            return ursaPosition.getEntryId() + Math.max(1L, ursaPosition.numMessages());
-        }
-        return position.getEntryId() + 1L;
     }
 
     private static int nextSequence(int lastSequence) {

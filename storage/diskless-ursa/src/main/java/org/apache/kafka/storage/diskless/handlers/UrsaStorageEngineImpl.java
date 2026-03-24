@@ -37,8 +37,8 @@ import java.util.function.Function;
 public class UrsaStorageEngineImpl implements DisklessStorageEngine {
 
     private final UrsaStorageState state;
-    private final UrsaManagedLedgerWriter writer;
-    private final UrsaManagedLedgerReader reader;
+    private final UrsaLakestreamWriter writer;
+    private final UrsaLakestreamReader reader;
 
     public UrsaStorageEngineImpl(
             Time time,
@@ -55,8 +55,8 @@ public class UrsaStorageEngineImpl implements DisklessStorageEngine {
                 logConfigDefaults,
                 topicConfigSupplier
         );
-        this.writer = new UrsaManagedLedgerWriter(state);
-        this.reader = new UrsaManagedLedgerReader(state);
+        this.writer = new UrsaLakestreamWriter(state);
+        this.reader = new UrsaLakestreamReader(state);
     }
 
     @Override

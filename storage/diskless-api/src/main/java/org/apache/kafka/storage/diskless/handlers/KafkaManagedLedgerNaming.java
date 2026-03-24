@@ -19,7 +19,7 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 
 /**
- * Naming convention for Kafka diskless topics when backed by Pulsar ManagedLedger metadata layout.
+ * Pulsar-compatible naming convention used by the Lakestream catalog for Kafka diskless topics.
  *
  * <p>Note: ursa-for-kafka does not have tenant/namespace concepts today. We use a fixed
  * {@code public/default/persistent} naming to ensure Oxia topic discovery via {@code /managed-ledgers}.
@@ -36,7 +36,7 @@ public final class KafkaManagedLedgerNaming {
     }
 
     /**
-     * ManagedLedger name passed into {@code StorageWalManagedLedgerFactory.open(name, ...)}.
+     * Stable key passed to the Lakestream stream-ID generator.
      *
      * <p>The Oxia metadata key will be {@code /managed-ledgers/ + name}.
      */
@@ -49,7 +49,7 @@ public final class KafkaManagedLedgerNaming {
     }
 
     /**
-     * Oxia metadata key for the managed ledger.
+     * Oxia catalog metadata key for the partition log.
      */
     public static String managedLedgerMetadataPath(TopicIdPartition tp) {
         return MANAGED_LEDGER_PREFIX + managedLedgerName(tp);

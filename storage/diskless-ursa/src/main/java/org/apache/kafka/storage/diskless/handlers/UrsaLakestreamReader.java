@@ -33,14 +33,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
- * Reader implementation using ManagedLedger for storage.
+ * Reader implementation using Lakestream for storage.
  * Per-partition read state and logic live in {@link UrsaPartitionLog}.
  */
-public class UrsaManagedLedgerReader implements Reader {
+public class UrsaLakestreamReader implements Reader {
 
     private final UrsaStorageState state;
 
-    public UrsaManagedLedgerReader(UrsaStorageState state) {
+    public UrsaLakestreamReader(UrsaStorageState state) {
         this.state = state;
     }
 

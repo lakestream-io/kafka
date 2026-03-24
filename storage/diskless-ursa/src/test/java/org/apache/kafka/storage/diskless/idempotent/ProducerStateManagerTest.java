@@ -25,11 +25,6 @@ import org.apache.kafka.common.record.internal.SimpleRecord;
 import org.apache.kafka.storage.diskless.handlers.KafkaEntryFormatter;
 import org.apache.kafka.storage.diskless.handlers.RecordAnalyzer;
 
-import org.apache.bookkeeper.mledger.AsyncCallbacks;
-import org.apache.bookkeeper.mledger.Entry;
-import org.apache.bookkeeper.mledger.ManagedCursor;
-import org.apache.bookkeeper.mledger.ManagedLedger;
-import org.apache.bookkeeper.mledger.Position;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -38,6 +33,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.netty.buffer.ByteBuf;
@@ -45,19 +44,24 @@ import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
-import io.streamnative.ursa.mledger.UrsaPosition;
+import io.streamnative.lakestream.api.Log;
+import io.streamnative.lakestream.api.LogCursor;
+import io.streamnative.lakestream.api.LogEntry;
+import io.streamnative.lakestream.api.LogOffset;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -66,7 +70,7 @@ class ProducerStateManagerTest {
     @Test
     void testFirstWriteMustStartAtSequenceZero() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        ProducerStateManager manager = newManager(tp, () -> null, emptyManagedLedgerSupplier());
+        ProducerStateManager manager = newManager(tp, () -> null, emptyLogSupplier());
         try {
             ProducerStateManager.PrepareResult result = manager.prepareAppend(List.of(
                 batch(1L, (short) 0, 5, 9, 5, 1000L)
@@ -84,7 +88,7 @@ class ProducerStateManagerTest {
     @Test
     void testStaleEpochRejected() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        ProducerStateManager manager = newManager(tp, () -> null, emptyManagedLedgerSupplier());
+        ProducerStateManager manager = newManager(tp, () -> null, emptyLogSupplier());
         try {
             ProducerStateManager.PendingAppend firstPending =
                 ready(manager.prepareAppend(List.of(batch(1L, (short) 5, 0, 9, 10, 1000L))).get());
@@ -106,7 +110,7 @@ class ProducerStateManagerTest {
     @Test
     void testOutOfOrderSequenceRejected() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        ProducerStateManager manager = newManager(tp, () -> null, emptyManagedLedgerSupplier());
+        ProducerStateManager manager = newManager(tp, () -> null, emptyLogSupplier());
         try {
             ProducerStateManager.PendingAppend firstPending =
                 ready(manager.prepareAppend(List.of(batch(1L, (short) 0, 0, 9, 10, 1000L))).get());
@@ -128,7 +132,7 @@ class ProducerStateManagerTest {
     @Test
     void testDuplicateReturnsCachedOffset() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        ProducerStateManager manager = newManager(tp, () -> null, emptyManagedLedgerSupplier());
+        ProducerStateManager manager = newManager(tp, () -> null, emptyLogSupplier());
         try {
             ProducerStateManager.PendingAppend firstPending =
                 ready(manager.prepareAppend(List.of(batch(1L, (short) 0, 0, 9, 10, 1000L))).get());
@@ -151,7 +155,7 @@ class ProducerStateManagerTest {
     @Test
     void testInFlightDuplicateReusesFuture() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        ProducerStateManager manager = newManager(tp, () -> null, emptyManagedLedgerSupplier());
+        ProducerStateManager manager = newManager(tp, () -> null, emptyLogSupplier());
         try {
             ProducerStateManager.PendingAppend firstPending =
                 ready(manager.prepareAppend(List.of(batch(1L, (short) 0, 0, 9, 10, 1000L))).get());
@@ -179,7 +183,7 @@ class ProducerStateManagerTest {
         TopicIdPartition tp = testTopicPartition();
         InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
 
-        ProducerStateManager manager1 = newManager(tp, snapshotStore::client, emptyManagedLedgerSupplier());
+        ProducerStateManager manager1 = newManager(tp, snapshotStore::client, emptyLogSupplier());
         ProducerStateManager manager2 = null;
         try {
             ProducerStateManager.PendingAppend firstPending =
@@ -187,9 +191,9 @@ class ProducerStateManagerTest {
             manager1.completeAppend(firstPending, 0L, 1000L);
             manager1.takeSnapshot("test").get();
 
-            Entry replayEntry = newReplayEntry(tp, 1L, (short) 0, 2, "r2", 2L, 1L);
-            ManagedLedger replayLedger = replayLedger(replayEntry, 2L, 1L);
-            manager2 = newManager(tp, snapshotStore::client, () -> CompletableFuture.completedFuture(replayLedger));
+            LogEntry replayEntry = newReplayEntry(tp, 1L, (short) 0, 2, "r2", 2L, 1);
+            Log replayLog = replayLog(replayEntry, 2L, 1);
+            manager2 = newManager(tp, snapshotStore::client, () -> CompletableFuture.completedFuture(replayLog));
 
             ProducerStateManager.PrepareResult recovered = manager2.prepareAppend(List.of(
                 batch(1L, (short) 0, 3, 3, 1, 3000L)
@@ -210,7 +214,7 @@ class ProducerStateManagerTest {
         String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(tp.topicId().toString(), tp.partition());
         snapshotStore.data().put(snapshotKey, "bad-snapshot".getBytes(StandardCharsets.UTF_8));
 
-        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyManagedLedgerSupplier());
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
         try {
             ProducerStateManager.PendingAppend pending =
                 ready(manager.prepareAppend(List.of(batch(1L, (short) 0, 0, 0, 1, 1000L))).get());
@@ -226,13 +230,87 @@ class ProducerStateManagerTest {
     }
 
     @Test
+    void testSnapshotRecoveryIsScopedByZone() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        SupplierWithException<CompletableFuture<Log>> logSupplier = emptyLogSupplier();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        ProducerStateManager zoneAManager = null;
+        ProducerStateManager zoneBManager = null;
+        ProducerStateManager zoneAReloadedManager = null;
+        try {
+            zoneAManager = new ProducerStateManager(
+                tp,
+                snapshotStore::client,
+                logSupplier::get,
+                " zone-a ",
+                0L,
+                ProducerStateManager.DEFAULT_SNAPSHOT_RECORD_THRESHOLD,
+                scheduler);
+            ProducerStateManager.PendingAppend initialAppend = ready(zoneAManager.prepareAppend(List.of(
+                batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            zoneAManager.completeAppend(initialAppend, 0L, 1000L);
+            zoneAManager.takeSnapshot("zone-a").get();
+            zoneAManager.close();
+            zoneAManager = null;
+
+            String zoneAKey = ProducerStateSnapshotKeys.snapshotKey(
+                tp.topicId().toString(), tp.partition(), "zone-a");
+            assertTrue(snapshotStore.data().containsKey(zoneAKey));
+
+            zoneBManager = new ProducerStateManager(
+                tp,
+                snapshotStore::client,
+                logSupplier::get,
+                "zone-b",
+                0L,
+                ProducerStateManager.DEFAULT_SNAPSHOT_RECORD_THRESHOLD,
+                scheduler);
+            ProducerStateManager.PrepareResult zoneBResult = zoneBManager.prepareAppend(List.of(
+                batch(1L, (short) 0, 1, 1, 1, 2000L)
+            )).get();
+            assertInstanceOf(ProducerStateManager.OutOfOrderSequence.class, zoneBResult);
+            ProducerStateManager.OutOfOrderSequence zoneBOutOfOrder =
+                (ProducerStateManager.OutOfOrderSequence) zoneBResult;
+            assertEquals(0, zoneBOutOfOrder.expectedSequence());
+            zoneBManager.close();
+            zoneBManager = null;
+
+            zoneAReloadedManager = new ProducerStateManager(
+                tp,
+                snapshotStore::client,
+                logSupplier::get,
+                "zone-a",
+                0L,
+                ProducerStateManager.DEFAULT_SNAPSHOT_RECORD_THRESHOLD,
+                scheduler);
+            ProducerStateManager.PendingAppend recoveredAppend = ready(zoneAReloadedManager.prepareAppend(List.of(
+                batch(1L, (short) 0, 1, 1, 1, 3000L)
+            )).get());
+            zoneAReloadedManager.completeAppend(recoveredAppend, 1L, 3000L);
+        } finally {
+            if (zoneAManager != null) {
+                zoneAManager.close();
+            }
+            if (zoneBManager != null) {
+                zoneBManager.close();
+            }
+            if (zoneAReloadedManager != null) {
+                zoneAReloadedManager.close();
+            }
+            scheduler.shutdownNow();
+        }
+    }
+
+    @Test
     void testReplayStopsWhenFirstEntryHasNoProducerAndNoSnapshot() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        Entry nonIdempotentReplayEntry = newReplayEntryWithoutProducer(tp, "legacy", 0L, 1L);
-        Entry idempotentReplayEntry = newReplayEntry(tp, 1L, (short) 0, 0, "idempotent", 1L, 1L);
-        ManagedLedger replayLedger = replayLedger(List.of(nonIdempotentReplayEntry, idempotentReplayEntry), 1L, 1L);
+        LogEntry nonIdempotentReplayEntry = newReplayEntryWithoutProducer(tp, "legacy", 0L, 1);
+        LogEntry idempotentReplayEntry = newReplayEntry(tp, 1L, (short) 0, 0, "idempotent", 1L, 1);
+        Log replayLog = replayLog(List.of(nonIdempotentReplayEntry, idempotentReplayEntry), 1L, 1);
 
-        ProducerStateManager manager = newManager(tp, () -> null, () -> CompletableFuture.completedFuture(replayLedger));
+        ProducerStateManager manager = newManager(tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
         try {
             ProducerStateManager.PrepareResult result = manager.prepareAppend(List.of(
                 batch(1L, (short) 0, 0, 0, 1, 3000L)
@@ -244,14 +322,48 @@ class ProducerStateManagerTest {
     }
 
     @Test
+    void testSynchronousReplayReadFailureCompletesPreparationAndClosesCursor() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        RuntimeException readFailure = new RuntimeException("synchronous replay read failure");
+        LogOffset lastOffset = mockLogOffset(0L, 1);
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(lastOffset));
+        when(logInstance.openEphemeralCursor(anyString(), anyLong())).thenReturn(
+                CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), any(), anyLong())).thenThrow(readFailure);
+
+        ProducerStateManager manager = newManager(
+                tp, () -> null, () -> CompletableFuture.completedFuture(logInstance));
+        try {
+            CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 3000L)
+            ));
+
+            ExecutionException prepareError = assertThrows(
+                    ExecutionException.class,
+                    () -> prepareFuture.get(5, TimeUnit.SECONDS));
+            Throwable rootCause = prepareError;
+            while (rootCause.getCause() != null) {
+                rootCause = rootCause.getCause();
+            }
+            assertSame(readFailure, rootCause);
+            assertTrue(prepareFuture.isCompletedExceptionally());
+            verify(cursor, timeout(5_000)).close();
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
     void testReplaySkippedWhenNoSnapshotAndMessagesExceedThreshold() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        ManagedLedger managedLedger = mock(ManagedLedger.class);
-        // No snapshot -> startOffset is 0. With default threshold 10_000, this should skip replay.
-        UrsaPosition lastConfirmed = new UrsaPosition(1L, 0L, 10_001L);
-        when(managedLedger.getLastConfirmedEntry()).thenReturn(lastConfirmed);
+        Log logInstance = mock(Log.class);
+        LogOffset lastOffset = mockLogOffset(0L, 10_001);
+        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
 
-        ProducerStateManager manager = newManager(tp, () -> null, () -> CompletableFuture.completedFuture(managedLedger));
+        ProducerStateManager manager = newManager(tp, () -> null, () -> CompletableFuture.completedFuture(logInstance));
         try {
             // Producer 1: first append bypasses sequence check once after recovery is skipped.
             ProducerStateManager.PrepareResult firstProducerFirst = manager.prepareAppend(List.of(
@@ -272,7 +384,7 @@ class ProducerStateManagerTest {
                 batch(1L, (short) 0, 7, 7, 1, 3002L)
             )).get();
             assertInstanceOf(ProducerStateManager.OutOfOrderSequence.class, firstProducerSecond);
-            verify(managedLedger, never()).newNonDurableCursor(any(), anyString());
+            verify(logInstance, never()).openEphemeralCursor(anyString(), anyLong());
         } finally {
             manager.close();
         }
@@ -281,13 +393,12 @@ class ProducerStateManagerTest {
     @Test
     void testBypassedPrepareAbortDoesNotGrantSecondBypassForSameProducer() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        ManagedLedger managedLedger = mock(ManagedLedger.class);
-        // No snapshot -> startOffset is 0. With default threshold 10_000, this should skip replay.
-        UrsaPosition lastConfirmed = new UrsaPosition(1L, 0L, 10_001L);
-        when(managedLedger.getLastConfirmedEntry()).thenReturn(lastConfirmed);
+        Log logInstance = mock(Log.class);
+        LogOffset lastOffset = mockLogOffset(0L, 10_001);
+        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
 
         try (ProducerStateManager manager = newManager(
-                tp, () -> null, () -> CompletableFuture.completedFuture(managedLedger))) {
+                tp, () -> null, () -> CompletableFuture.completedFuture(logInstance))) {
             ProducerStateManager.PrepareResult first = manager.prepareAppend(List.of(
                     batch(1L, (short) 0, 5, 5, 1, 3000L)
             )).get();
@@ -315,15 +426,15 @@ class ProducerStateManagerTest {
             assertEquals(42L, producerState.get().lastOffset());
             assertEquals(1, producerState.get().retainedBatchCount());
 
-            verify(managedLedger, never()).newNonDurableCursor(any(), anyString());
+            verify(logInstance, never()).openEphemeralCursor(anyString(), anyLong());
         }
     }
 
     private static ProducerStateManager newManager(
             TopicIdPartition tp,
             SupplierWithException<AsyncOxiaClient> oxiaClientSupplier,
-            SupplierWithException<CompletableFuture<ManagedLedger>> managedLedgerSupplier) {
-        return new ProducerStateManager(tp, oxiaClientSupplier::get, managedLedgerSupplier::get);
+            SupplierWithException<CompletableFuture<Log>> logSupplier) {
+        return new ProducerStateManager(tp, oxiaClientSupplier::get, logSupplier::get);
     }
 
     private static ProducerStateManager.AppendBatch batch(
@@ -350,63 +461,56 @@ class ProducerStateManagerTest {
         return new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
     }
 
-    private static SupplierWithException<CompletableFuture<ManagedLedger>> emptyManagedLedgerSupplier() {
+    private static SupplierWithException<CompletableFuture<Log>> emptyLogSupplier() {
         return () -> {
-            ManagedLedger managedLedger = mock(ManagedLedger.class);
-            Position empty = mock(Position.class);
-            when(empty.getEntryId()).thenReturn(-1L);
-            when(empty.getLedgerId()).thenReturn(-1L);
-            when(managedLedger.getLastConfirmedEntry()).thenReturn(empty);
-            return CompletableFuture.completedFuture(managedLedger);
+            Log logInstance = mock(Log.class);
+            LogOffset emptyOffset = mockLogOffset(-1L, 0);
+            when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(emptyOffset));
+            return CompletableFuture.completedFuture(logInstance);
         };
     }
 
-    private static ManagedLedger replayLedger(Entry replayEntry, long baseOffset, long numMessages) throws Exception {
-        return replayLedger(List.of(replayEntry), baseOffset, numMessages);
+    private static LogOffset mockLogOffset(long offset, int numberOfRecords) {
+        LogOffset logOffset = mock(LogOffset.class);
+        when(logOffset.offset()).thenReturn(offset);
+        when(logOffset.numberOfRecords()).thenReturn(numberOfRecords);
+        when(logOffset.timestamp()).thenReturn(-1L);
+        return logOffset;
     }
 
-    private static ManagedLedger replayLedger(List<Entry> replayEntries, long baseOffset, long numMessages) throws Exception {
-        ManagedLedger managedLedger = mock(ManagedLedger.class);
-        ManagedCursor cursor = mock(ManagedCursor.class);
-        UrsaPosition lastConfirmed = new UrsaPosition(1L, baseOffset, numMessages);
+    private static Log replayLog(LogEntry replayEntry, long baseOffset, int numMessages) throws Exception {
+        return replayLog(List.of(replayEntry), baseOffset, numMessages);
+    }
 
-        when(managedLedger.getLastConfirmedEntry()).thenReturn(lastConfirmed);
-        when(managedLedger.newNonDurableCursor(any(Position.class), anyString())).thenReturn(cursor);
+    private static Log replayLog(List<LogEntry> replayEntries, long baseOffset, int numMessages) throws Exception {
+        Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        LogOffset lastOffset = mockLogOffset(baseOffset, numMessages);
+
+        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
+        when(logInstance.openEphemeralCursor(anyString(), anyLong())).thenReturn(
+                CompletableFuture.completedFuture(cursor));
 
         AtomicInteger readCount = new AtomicInteger(0);
-        doAnswer(invocation -> {
-            AsyncCallbacks.ReadEntriesCallback callback = invocation.getArgument(2);
-            Object ctx = invocation.getArgument(3);
+        when(cursor.readEntries(anyInt(), anyLong(), any(), anyLong())).thenAnswer(invocation -> {
             if (readCount.getAndIncrement() == 0) {
-                callback.readEntriesComplete(replayEntries, ctx);
+                return CompletableFuture.completedFuture(replayEntries);
             } else {
-                callback.readEntriesComplete(List.of(), ctx);
+                return CompletableFuture.completedFuture(List.of());
             }
-            return null;
-        }).when(cursor).asyncReadEntries(
-            anyInt(),
-            anyLong(),
-            any(AsyncCallbacks.ReadEntriesCallback.class),
-            any(),
-            any(Position.class));
+        });
 
-        doAnswer(invocation -> {
-            AsyncCallbacks.DeleteCursorCallback callback = invocation.getArgument(1);
-            callback.deleteCursorComplete(invocation.getArgument(2));
-            return null;
-        }).when(managedLedger).asyncDeleteCursor(anyString(), any(AsyncCallbacks.DeleteCursorCallback.class), any());
-
-        return managedLedger;
+        return logInstance;
     }
 
-    private static Entry newReplayEntry(
+    private static LogEntry newReplayEntry(
             TopicIdPartition tp,
             long producerId,
             short producerEpoch,
             int firstSeq,
             String value,
             long baseOffset,
-            long numMessages) {
+            int numMessages) {
         MemoryRecords memoryRecords = MemoryRecords.withIdempotentRecords(
             Compression.NONE,
             producerId,
@@ -420,20 +524,19 @@ class ProducerStateManagerTest {
             0);
         ByteBuf data = KafkaEntryFormatter.encode(memoryRecords, analysisResult);
 
-        Entry entry = mock(Entry.class);
-        UrsaPosition position = new UrsaPosition(1L, baseOffset, numMessages);
-        when(entry.getPosition()).thenReturn(position);
-        when(entry.getEntryId()).thenReturn(baseOffset);
-        when(entry.getDataBuffer()).thenReturn(data.duplicate());
-        when(entry.release()).thenReturn(true);
+        LogEntry entry = mock(LogEntry.class);
+        when(entry.offset()).thenReturn(baseOffset);
+        when(entry.numberOfRecords()).thenReturn(numMessages);
+        when(entry.size()).thenReturn(data.readableBytes());
+        when(entry.payload()).thenReturn(data.asReadOnly());
         return entry;
     }
 
-    private static Entry newReplayEntryWithoutProducer(
+    private static LogEntry newReplayEntryWithoutProducer(
             TopicIdPartition tp,
             String value,
             long baseOffset,
-            long numMessages) {
+            int numMessages) {
         MemoryRecords memoryRecords = MemoryRecords.withRecords(
             Compression.NONE,
             new SimpleRecord(value.getBytes(StandardCharsets.UTF_8)));
@@ -444,12 +547,11 @@ class ProducerStateManagerTest {
             0);
         ByteBuf data = KafkaEntryFormatter.encode(memoryRecords, analysisResult);
 
-        Entry entry = mock(Entry.class);
-        UrsaPosition position = new UrsaPosition(1L, baseOffset, numMessages);
-        when(entry.getPosition()).thenReturn(position);
-        when(entry.getEntryId()).thenReturn(baseOffset);
-        when(entry.getDataBuffer()).thenReturn(data.duplicate());
-        when(entry.release()).thenReturn(true);
+        LogEntry entry = mock(LogEntry.class);
+        when(entry.offset()).thenReturn(baseOffset);
+        when(entry.numberOfRecords()).thenReturn(numMessages);
+        when(entry.size()).thenReturn(data.readableBytes());
+        when(entry.payload()).thenReturn(data.asReadOnly());
         return entry;
     }
 

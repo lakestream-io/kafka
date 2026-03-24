@@ -22,7 +22,7 @@ import org.apache.kafka.server.config.ServerLogConfigs;
 import java.util.Map;
 
 /**
- * Configuration for Ursa storage integration using ManagedLedger.
+ * Configuration for Ursa storage integration using Lakestream.
  */
 public class UrsaStorageConfig {
     public static final String NOOP_EXTERNAL_READER_FACTORY_CLASS =
@@ -31,7 +31,7 @@ public class UrsaStorageConfig {
     private final boolean enabled;
     /**
      * The metadata store URL used for Pulsar's metadata store:
-     * 1. Managed ledger: used for Ursa storage to store managed ledger's metadata
+     * 1. Lakestream catalog: used for Ursa storage to store log metadata
      * 2. {@link org.apache.kafka.storage.diskless.UrsaPartitionedTopicsMetadataSync}
      */
     private final String pulsarOxiaServiceUrl;

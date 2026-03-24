@@ -34,7 +34,7 @@ import java.util.stream.Collectors;
 
 /**
  * Abstract base class for Ursa storage writers.
- * Consolidates common logic for both StorageApi and ManagedLedger implementations.
+ * Consolidates the common partition fan-out for the Lakestream implementation.
  */
 public abstract class AbstractUrsaStorageWriter implements Writer {
 

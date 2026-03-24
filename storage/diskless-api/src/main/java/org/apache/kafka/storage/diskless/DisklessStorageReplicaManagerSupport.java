@@ -55,7 +55,7 @@ import java.util.function.Function;
 /**
  * Support class for integrating Ursa storage with ReplicaManager.
  * This class provides methods to partition requests by storage mode
- * and route them to the appropriate handlers using ManagedLedger.
+ * and route them to the configured diskless storage engine.
  */
 public class DisklessStorageReplicaManagerSupport implements Closeable {
 
@@ -132,7 +132,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
                 topicConfigSupplier
         );
 
-        log.info("Diskless support initialized with ManagedLedger, oxia URLs: {} {}",
+        log.info("Diskless support initialized with Lakestream, oxia URLs: {} {}",
                 ursaConfig.getPulsarOxiaServiceUrl(), ursaConfig.getUrsaOxiaServiceUrl());
     }
 
