@@ -1224,7 +1224,7 @@ public class SharePartitionManagerTest {
             OptionalInt.empty(),
             false
         );
-        when(mockDisklessStorageSupport.handleFetch(any(), any()))
+        when(mockDisklessStorageSupport.handleFetch(any(), any(), Mockito.isNull()))
             .thenReturn(CompletableFuture.completedFuture(Map.of(disklessTp, disklessFetchData)));
 
         CompletableFuture<Map<TopicIdPartition, PartitionData>> future = sharePartitionManager.fetchMessages(
@@ -1241,7 +1241,7 @@ public class SharePartitionManagerTest {
         assertFalse(result.get(disklessTp).acquiredRecords().isEmpty());
 
         verify(mockReplicaManager, times(1)).readFromLog(any(), any(), any(ReplicaQuota.class), anyBoolean());
-        verify(mockDisklessStorageSupport, times(1)).handleFetch(any(), any());
+        verify(mockDisklessStorageSupport, times(1)).handleFetch(any(), any(), Mockito.isNull());
     }
 
     @Test
