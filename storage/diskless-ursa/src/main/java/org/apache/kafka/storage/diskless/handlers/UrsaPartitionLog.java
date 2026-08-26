@@ -82,6 +82,7 @@ final class UrsaPartitionLog {
     private final AtomicBoolean retentionWorkerRunning = new AtomicBoolean();
     private final AtomicReference<RetentionRequest> pendingRetention = new AtomicReference<>();
     private final AtomicReference<CompletableFuture<Log>> inFlightRetention = new AtomicReference<>();
+    private final Set<OwnedWritePayload> ownedWritePayloads = ConcurrentHashMap.newKeySet();
     private CompletableFuture<Long> activeTrimFuture;
     private volatile LogCursorPool fetchCursorPool;
     private volatile boolean closed;
@@ -133,11 +134,37 @@ final class UrsaPartitionLog {
             return CompletableFuture.completedFuture(new PartitionResponse(Errors.NONE));
         }
 
+        PreparedWrite preparedWrite = prepareWrite(records);
+        if (preparedWrite.errorResponse != null) {
+            return CompletableFuture.completedFuture(preparedWrite.errorResponse);
+        }
+
+        OwnedWritePayload payload = preparedWrite.payload;
+        ownedWritePayloads.add(payload);
+        if (closed) {
+            payload.release();
+            return CompletableFuture.completedFuture(notLeaderResponse());
+        }
+
+        try {
+            return writeSequencer.submit(() -> writeValidated(
+                    payload,
+                    preparedWrite.analysisResult,
+                    preparedWrite.appendBatches,
+                    preparedWrite.idempotent,
+                    zone));
+        } catch (Throwable submitError) {
+            payload.release();
+            return CompletableFuture.completedFuture(writeErrorResponse(submitError));
+        }
+    }
+
+    private PreparedWrite prepareWrite(MemoryRecords records) {
         boolean hasProducerId = false;
         for (RecordBatch batch : records.batches()) {
             if (batch.isTransactional()) {
                 log.warn("Transactional produce rejected for partition {}", topicIdPartition);
-                return CompletableFuture.completedFuture(new PartitionResponse(Errors.INVALID_REQUEST));
+                return new PreparedWrite(null, null, null, false, new PartitionResponse(Errors.INVALID_REQUEST));
             }
             if (batch.hasProducerId()) {
                 hasProducerId = true;
@@ -153,30 +180,52 @@ final class UrsaPartitionLog {
             );
         } catch (Exception e) {
             log.warn("Record validation failed for partition {}: {}", topicIdPartition, e.getMessage());
-            return CompletableFuture.completedFuture(new PartitionResponse(Errors.INVALID_RECORD));
+            return new PreparedWrite(null, null, null, false, new PartitionResponse(Errors.INVALID_RECORD));
         }
 
-        if (analysisResult.validBytes() <= 0) {
-            return CompletableFuture.completedFuture(new PartitionResponse(Errors.NONE));
+        try {
+            KafkaRecordsPayload.validateForAppend(records, analysisResult.recordCount());
+        } catch (Exception e) {
+            log.warn("Raw MemoryRecords validation failed for partition {}: {}", topicIdPartition, e.getMessage());
+            return new PreparedWrite(null, null, null, false, new PartitionResponse(Errors.INVALID_RECORD));
         }
 
         final boolean idempotent = hasProducerId;
-        return writeSequencer.submit(() -> writeValidated(records, analysisResult, idempotent, zone));
+        final List<ProducerStateManager.AppendBatch> appendBatches;
+        final OwnedWritePayload payload;
+        try {
+            appendBatches = idempotent ? buildAppendBatches(records) : List.of();
+            payload = new OwnedWritePayload(KafkaRecordsPayload.copyForAppend(records));
+        } catch (Throwable prepareError) {
+            log.error("Failed to copy records for partition {}", topicIdPartition, prepareError);
+            return new PreparedWrite(null, null, null, false, new PartitionResponse(Errors.KAFKA_STORAGE_ERROR));
+        }
+        return new PreparedWrite(payload, analysisResult, appendBatches, idempotent, null);
     }
 
     private PartitionWriteSequencer.WriteTask<PartitionResponse> writeValidated(
-            MemoryRecords records,
+            OwnedWritePayload payload,
             RecordAnalysisResult analysisResult,
+            List<ProducerStateManager.AppendBatch> appendBatches,
             boolean idempotent,
             String zone) {
         if (closed) {
+            payload.release();
             return closedWriteTask();
         }
 
         CompletableFuture<Void> submissionFuture = new CompletableFuture<>();
-        CompletableFuture<PartitionResponse> result = idempotent
-                ? appendIdempotentRecords(records, analysisResult, zone, submissionFuture)
-                : appendNonIdempotentRecords(records, analysisResult, submissionFuture);
+        CompletableFuture<PartitionResponse> result;
+        try {
+            result = idempotent
+                    ? appendIdempotentRecords(
+                            payload, appendBatches, analysisResult, zone, submissionFuture)
+                    : appendNonIdempotentRecords(payload, analysisResult, submissionFuture);
+        } catch (Throwable writeError) {
+            payload.release();
+            submissionFuture.complete(null);
+            result = CompletableFuture.failedFuture(writeError);
+        }
         CompletableFuture<PartitionResponse> mappedResult = result.exceptionally(this::writeErrorResponse);
         return new PartitionWriteSequencer.WriteTask<>(submissionFuture, mappedResult);
     }
@@ -294,18 +343,20 @@ final class UrsaPartitionLog {
     }
 
     CompletableFuture<PartitionResponse> appendIdempotentRecords(
-            MemoryRecords records,
+            OwnedWritePayload payload,
+            List<ProducerStateManager.AppendBatch> appendBatches,
             RecordAnalysisResult analysisResult,
             String zone,
             CompletableFuture<Void> submissionFuture) {
         if (closed) {
+            payload.release();
             submissionFuture.complete(null);
             return CompletableFuture.completedFuture(notLeaderResponse());
         }
 
         ProducerStateManager producerStateManager = getOrCreateProducerStateManager(zone);
-        List<ProducerStateManager.AppendBatch> appendBatches = buildAppendBatches(records);
         if (appendBatches.isEmpty()) {
+            payload.release();
             submissionFuture.complete(null);
             return CompletableFuture.completedFuture(new PartitionResponse(Errors.NONE));
         }
@@ -317,16 +368,19 @@ final class UrsaPartitionLog {
                         if (prepareResult instanceof ProducerStateManager.Ready ready) {
                             producerStateManager.abortAppend(ready.pendingAppend(), ownershipError);
                         }
+                        payload.release();
                         submissionFuture.complete(null);
                         return CompletableFuture.completedFuture(notLeaderResponse());
                     }
 
                     if (prepareResult instanceof ProducerStateManager.InvalidEpoch invalidEpoch) {
+                        payload.release();
                         submissionFuture.complete(null);
                         return CompletableFuture.completedFuture(
                                 new PartitionResponse(Errors.INVALID_PRODUCER_EPOCH, invalidEpoch.message()));
                     }
                     if (prepareResult instanceof ProducerStateManager.OutOfOrderSequence outOfOrderSequence) {
+                        payload.release();
                         submissionFuture.complete(null);
                         return CompletableFuture.completedFuture(
                                 new PartitionResponse(
@@ -334,6 +388,7 @@ final class UrsaPartitionLog {
                                         outOfOrderSequence.message()));
                     }
                     if (prepareResult instanceof ProducerStateManager.Duplicate duplicate) {
+                        payload.release();
                         submissionFuture.complete(null);
                         return duplicate.appendResultFuture()
                                 .thenApply(appendResult ->
@@ -346,21 +401,27 @@ final class UrsaPartitionLog {
                     }
                     if (prepareResult instanceof ProducerStateManager.Ready ready) {
                         return appendPreparedBatches(
-                                records, analysisResult, producerStateManager, ready.pendingAppend(), submissionFuture);
+                                payload,
+                                analysisResult,
+                                producerStateManager,
+                                ready.pendingAppend(),
+                                submissionFuture);
                     }
+                    payload.release();
                     submissionFuture.complete(null);
                     return CompletableFuture.failedFuture(
                             new IllegalStateException("Unexpected prepare result: " + prepareResult));
                 })
                 .whenComplete((response, error) -> {
                     if (error != null) {
+                        payload.release();
                         submissionFuture.complete(null);
                     }
                 });
     }
 
     private CompletableFuture<PartitionResponse> appendPreparedBatches(
-            MemoryRecords records,
+            OwnedWritePayload payload,
             RecordAnalysisResult analysisResult,
             ProducerStateManager producerStateManager,
             ProducerStateManager.PendingAppend pendingAppend,
@@ -370,6 +431,7 @@ final class UrsaPartitionLog {
         initialized().whenComplete((logInstance, logError) -> {
             if (logError != null) {
                 producerStateManager.abortAppend(pendingAppend, logError);
+                payload.release();
                 submissionFuture.complete(null);
                 result.completeExceptionally(logError);
                 return;
@@ -378,20 +440,20 @@ final class UrsaPartitionLog {
             if (closed) {
                 NotLeaderOrFollowerException ownershipError = ownershipLostException();
                 producerStateManager.abortAppend(pendingAppend, ownershipError);
+                payload.release();
                 submissionFuture.complete(null);
                 result.completeExceptionally(ownershipError);
                 return;
             }
 
-            final ByteBuf data;
-            try {
-                data = KafkaEntryFormatter.encode(records);
-            } catch (Throwable encodeError) {
-                producerStateManager.abortAppend(pendingAppend, encodeError);
+            if (!payload.beginAppend()) {
+                NotLeaderOrFollowerException ownershipError = ownershipLostException();
+                producerStateManager.abortAppend(pendingAppend, ownershipError);
                 submissionFuture.complete(null);
-                result.completeExceptionally(encodeError);
+                result.completeExceptionally(ownershipError);
                 return;
             }
+            ByteBuf data = payload.buffer();
 
             CompletableFuture<LogEntryHeader> appendFuture;
             try {
@@ -403,7 +465,7 @@ final class UrsaPartitionLog {
                     throw new IllegalStateException("Log.append returned null future");
                 }
             } catch (Throwable appendInitError) {
-                data.release();
+                payload.release();
                 producerStateManager.abortAppend(pendingAppend, appendInitError);
                 submissionFuture.complete(null);
                 result.completeExceptionally(appendInitError);
@@ -431,7 +493,7 @@ final class UrsaPartitionLog {
                     producerStateManager.abortAppend(pendingAppend, completeError);
                     result.completeExceptionally(completeError);
                 } finally {
-                    data.release();
+                    payload.release();
                 }
             });
         });
@@ -440,32 +502,32 @@ final class UrsaPartitionLog {
     }
 
     CompletableFuture<PartitionResponse> appendNonIdempotentRecords(
-            MemoryRecords records,
+            OwnedWritePayload payload,
             RecordAnalysisResult analysisResult,
             CompletableFuture<Void> submissionFuture) {
         CompletableFuture<PartitionResponse> result = new CompletableFuture<>();
 
         initialized().whenComplete((logInstance, logError) -> {
             if (logError != null) {
+                payload.release();
                 submissionFuture.complete(null);
                 result.completeExceptionally(logError);
                 return;
             }
 
             if (closed) {
+                payload.release();
                 submissionFuture.complete(null);
                 result.completeExceptionally(ownershipLostException());
                 return;
             }
 
-            final ByteBuf data;
-            try {
-                data = KafkaEntryFormatter.encode(records);
-            } catch (Throwable encodeError) {
+            if (!payload.beginAppend()) {
                 submissionFuture.complete(null);
-                result.completeExceptionally(encodeError);
+                result.completeExceptionally(ownershipLostException());
                 return;
             }
+            ByteBuf data = payload.buffer();
 
             CompletableFuture<LogEntryHeader> appendFuture;
             try {
@@ -477,7 +539,7 @@ final class UrsaPartitionLog {
                     throw new IllegalStateException("Log.append returned null future");
                 }
             } catch (Throwable appendInitError) {
-                data.release();
+                payload.release();
                 submissionFuture.complete(null);
                 result.completeExceptionally(appendInitError);
                 return;
@@ -500,7 +562,7 @@ final class UrsaPartitionLog {
                 } catch (Throwable completeError) {
                     result.completeExceptionally(completeError);
                 } finally {
-                    data.release();
+                    payload.release();
                 }
             });
         });
@@ -532,53 +594,37 @@ final class UrsaPartitionLog {
         return offset == null || offset.offset() < 0;
     }
 
-    private ByteBuffer writableKafkaRecords(ByteBuf entryBuffer, long baseOffset) {
-        ByteBuffer decoded = KafkaEntryFormatter.decode(entryBuffer.duplicate());
-        ByteBuffer writable = ByteBuffer.allocate(decoded.remaining());
-        writable.put(decoded.duplicate());
-        writable.flip();
-        if (writable.remaining() >= Long.BYTES) {
-            writable.putLong(writable.position(), baseOffset);
-        }
-        return writable;
+    private MemoryRecords readableKafkaRecords(LogEntry entry) {
+        return KafkaRecordsPayload.copyAndRebase(
+                entry.payload(), entry.offset(), entry.numberOfRecords());
     }
 
-    private long[] findFirstTimestampGe(ByteBuf entryBuffer, long baseOffset, long targetTimestamp) {
-        try {
-            MemoryRecords records = MemoryRecords.readableRecords(writableKafkaRecords(entryBuffer, baseOffset));
-            for (RecordBatch batch : records.batches()) {
-                for (Record record : batch) {
-                    if (record.timestamp() >= targetTimestamp) {
-                        return new long[]{record.timestamp(), record.offset()};
-                    }
+    private long[] findFirstTimestampGe(LogEntry entry, long targetTimestamp) {
+        MemoryRecords records = readableKafkaRecords(entry);
+        for (RecordBatch batch : records.batches()) {
+            for (Record record : batch) {
+                if (record.timestamp() >= targetTimestamp) {
+                    return new long[]{record.timestamp(), record.offset()};
                 }
             }
-            return null;
-        } catch (Exception e) {
-            log.warn("Failed to parse records at offset {} for timestamp search", baseOffset, e);
-            return null;
         }
+        return null;
     }
 
-    private TimestampAndOffset findMaxTimestamp(ByteBuf entryBuffer, long baseOffset) {
-        try {
-            TimestampAndOffset best = null;
-            MemoryRecords records = MemoryRecords.readableRecords(writableKafkaRecords(entryBuffer, baseOffset));
-            for (RecordBatch batch : records.batches()) {
-                for (Record record : batch) {
-                    if (record.timestamp() == RecordBatch.NO_TIMESTAMP) {
-                        continue;
-                    }
-                    if (best == null || record.timestamp() > best.timestamp()) {
-                        best = new TimestampAndOffset(record.timestamp(), record.offset());
-                    }
+    private TimestampAndOffset findMaxTimestamp(LogEntry entry) {
+        TimestampAndOffset best = null;
+        MemoryRecords records = readableKafkaRecords(entry);
+        for (RecordBatch batch : records.batches()) {
+            for (Record record : batch) {
+                if (record.timestamp() == RecordBatch.NO_TIMESTAMP) {
+                    continue;
+                }
+                if (best == null || record.timestamp() > best.timestamp()) {
+                    best = new TimestampAndOffset(record.timestamp(), record.offset());
                 }
             }
-            return best;
-        } catch (Exception e) {
-            log.warn("Failed to parse records at offset {} for max-timestamp search", baseOffset, e);
-            return null;
         }
+        return best;
     }
 
     private CompletableFuture<MemoryRecords> readRecords(
@@ -649,15 +695,7 @@ final class UrsaPartitionLog {
         List<ByteBuffer> decodedEntries = new ArrayList<>(entries.size());
         int totalSize = 0;
         for (LogEntry entry : entries) {
-            ByteBuf payload = entry.payload();
-            if (payload == null || payload.readableBytes() == 0) {
-                continue;
-            }
-
-            ByteBuffer kafkaRecords = writableKafkaRecords(payload, entry.offset());
-            if (!kafkaRecords.hasRemaining()) {
-                continue;
-            }
+            ByteBuffer kafkaRecords = readableKafkaRecords(entry).buffer();
             totalSize = Math.addExact(totalSize, kafkaRecords.remaining());
             decodedEntries.add(kafkaRecords);
         }
@@ -761,7 +799,7 @@ final class UrsaPartitionLog {
             }
 
             for (LogEntry entry : entries) {
-                long[] found = findFirstTimestampGe(entry.payload(), entry.offset(), targetTimestamp);
+                long[] found = findFirstTimestampGe(entry, targetTimestamp);
                 if (found != null) {
                     return new ScanBatchResult<>(true, found);
                 }
@@ -813,7 +851,7 @@ final class UrsaPartitionLog {
 
             TimestampAndOffset best = bestSoFar;
             for (LogEntry entry : entries) {
-                TimestampAndOffset candidate = findMaxTimestamp(entry.payload(), entry.offset());
+                TimestampAndOffset candidate = findMaxTimestamp(entry);
                 if (candidate != null && (best == null || candidate.timestamp() > best.timestamp())) {
                     best = candidate;
                 }
@@ -1069,6 +1107,7 @@ final class UrsaPartitionLog {
             trimFuture = activeTrimFuture;
         }
         pendingRetention.set(null);
+        releasePendingWritePayloads();
         if (retentionFuture != null) {
             retentionFuture.cancel(false);
         }
@@ -1093,6 +1132,14 @@ final class UrsaPartitionLog {
 
     void cleanupWriteState() {
         writeSequencer.reset();
+    }
+
+    int ownedWritePayloadCount() {
+        return ownedWritePayloads.size();
+    }
+
+    private void releasePendingWritePayloads() {
+        ownedWritePayloads.forEach(OwnedWritePayload::cancelBeforeAppend);
     }
 
     void cleanupReadState() {
@@ -1372,6 +1419,76 @@ final class UrsaPartitionLog {
 
     private static String fetchCursorNamePrefix(TopicIdPartition tp) {
         return "kafka-fetch-" + tp.topic() + "-partition-" + tp.partition() + "-cursor";
+    }
+
+    private enum WritePayloadState {
+        PENDING,
+        APPENDING,
+        RELEASED
+    }
+
+    private static final class PreparedWrite {
+        private final OwnedWritePayload payload;
+        private final RecordAnalysisResult analysisResult;
+        private final List<ProducerStateManager.AppendBatch> appendBatches;
+        private final boolean idempotent;
+        private final PartitionResponse errorResponse;
+
+        private PreparedWrite(
+                OwnedWritePayload payload,
+                RecordAnalysisResult analysisResult,
+                List<ProducerStateManager.AppendBatch> appendBatches,
+                boolean idempotent,
+                PartitionResponse errorResponse) {
+            this.payload = payload;
+            this.analysisResult = analysisResult;
+            this.appendBatches = appendBatches;
+            this.idempotent = idempotent;
+            this.errorResponse = errorResponse;
+        }
+
+    }
+
+    private final class OwnedWritePayload {
+        private final ByteBuf data;
+        private final AtomicReference<WritePayloadState> payloadState =
+                new AtomicReference<>(WritePayloadState.PENDING);
+
+        private OwnedWritePayload(ByteBuf data) {
+            this.data = data;
+        }
+
+        private boolean beginAppend() {
+            return payloadState.compareAndSet(WritePayloadState.PENDING, WritePayloadState.APPENDING);
+        }
+
+        private ByteBuf buffer() {
+            if (payloadState.get() != WritePayloadState.APPENDING) {
+                throw new IllegalStateException("Write payload is not owned by an append");
+            }
+            return data;
+        }
+
+        private void cancelBeforeAppend() {
+            if (payloadState.compareAndSet(WritePayloadState.PENDING, WritePayloadState.RELEASED)) {
+                releaseBuffer();
+            }
+        }
+
+        private void release() {
+            WritePayloadState previous = payloadState.getAndSet(WritePayloadState.RELEASED);
+            if (previous != WritePayloadState.RELEASED) {
+                releaseBuffer();
+            }
+        }
+
+        private void releaseBuffer() {
+            try {
+                data.release();
+            } finally {
+                ownedWritePayloads.remove(this);
+            }
+        }
     }
 
     private record FetchOffsetRange(long logStartOffset, long highWatermark) {

@@ -20,14 +20,13 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
-import org.apache.kafka.storage.diskless.handlers.KafkaEntryFormatter;
+import org.apache.kafka.storage.diskless.handlers.KafkaRecordsPayload;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -142,7 +141,6 @@ public class ProducerStateManager implements Closeable {
     private enum ReplayEntryResult {
         HAS_PRODUCER_BATCH,
         NO_PRODUCER_BATCH,
-        DECODE_FAILED,
         MANAGER_CLOSED
     }
 
@@ -693,51 +691,35 @@ public class ProducerStateManager implements Closeable {
             return ReplayEntryResult.MANAGER_CLOSED;
         }
         long baseOffset = entry.offset();
-        long nextOffset = entry.offset() + Math.max(1, entry.numberOfRecords());
+        long nextOffset = Math.addExact(baseOffset, entry.numberOfRecords());
 
-        try {
-            ByteBuffer decodedRecords = KafkaEntryFormatter.decode(entry.payload().duplicate());
-            ByteBuffer kafkaRecordsBuffer = ByteBuffer.allocate(decodedRecords.remaining());
-            kafkaRecordsBuffer.put(decodedRecords.duplicate());
-            kafkaRecordsBuffer.flip();
-            if (kafkaRecordsBuffer.remaining() >= Long.BYTES) {
-                kafkaRecordsBuffer.putLong(kafkaRecordsBuffer.position(), baseOffset);
-            }
-
-            MemoryRecords memoryRecords = MemoryRecords.readableRecords(kafkaRecordsBuffer);
-            long batchBaseOffset = baseOffset;
-            boolean hasProducerBatch = false;
-            for (RecordBatch batch : memoryRecords.batches()) {
-                int recordCount = batch.countOrNull() != null ? batch.countOrNull() : 0;
-                if (batch.hasProducerId()) {
-                    hasProducerBatch = true;
-                    synchronized (this) {
-                        if (closed.get()) {
-                            return ReplayEntryResult.MANAGER_CLOSED;
-                        }
-                        appendRecoveredBatchLocked(
-                            batch.producerId(),
-                            batch.producerEpoch(),
-                            batch.baseSequence(),
-                            batch.lastSequence(),
-                            batchBaseOffset,
-                            batch.maxTimestamp()
-                        );
+        MemoryRecords memoryRecords = KafkaRecordsPayload.copyAndRebase(
+                entry.payload(), baseOffset, entry.numberOfRecords());
+        boolean hasProducerBatch = false;
+        for (RecordBatch batch : memoryRecords.batches()) {
+            if (batch.hasProducerId()) {
+                hasProducerBatch = true;
+                synchronized (this) {
+                    if (closed.get()) {
+                        return ReplayEntryResult.MANAGER_CLOSED;
                     }
-                }
-                batchBaseOffset += recordCount;
-            }
-            return hasProducerBatch ? ReplayEntryResult.HAS_PRODUCER_BATCH : ReplayEntryResult.NO_PRODUCER_BATCH;
-        } catch (Exception decodeError) {
-            log.warn("[{}] Failed to replay entry at offset {}", topicIdPartition, baseOffset, decodeError);
-            return ReplayEntryResult.DECODE_FAILED;
-        } finally {
-            synchronized (this) {
-                if (!closed.get()) {
-                    nextOffsetToRecover = Math.max(nextOffsetToRecover, nextOffset);
+                    appendRecoveredBatchLocked(
+                        batch.producerId(),
+                        batch.producerEpoch(),
+                        batch.baseSequence(),
+                        batch.lastSequence(),
+                        batch.baseOffset(),
+                        batch.maxTimestamp()
+                    );
                 }
             }
         }
+        synchronized (this) {
+            if (!closed.get()) {
+                nextOffsetToRecover = Math.max(nextOffsetToRecover, nextOffset);
+            }
+        }
+        return hasProducerBatch ? ReplayEntryResult.HAS_PRODUCER_BATCH : ReplayEntryResult.NO_PRODUCER_BATCH;
     }
 
     private IllegalStateException replayClosedException() {

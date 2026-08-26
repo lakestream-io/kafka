@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -47,6 +48,7 @@ import io.netty.buffer.ByteBuf;
 import io.streamnative.lakestream.api.Log;
 import io.streamnative.lakestream.api.LogEntryHeader;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -102,6 +104,32 @@ class UrsaLakestreamWriterNonIdempotentTest {
 
         assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, response.error);
         verify(logInstance, never()).append(anyInt(), any(ByteBuf.class));
+    }
+
+    @Test
+    void testWriteRejectsTrailingBytesWithoutAppending() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        UrsaPartitionLog partitionLog = attachPartitionLog(state, tp, logInstance);
+        MemoryRecords validRecords = MemoryRecords.withRecords(
+                Compression.NONE,
+                new SimpleRecord("valid".getBytes(StandardCharsets.UTF_8)));
+        ByteBuffer malformedBuffer = ByteBuffer.allocate(validRecords.buffer().remaining() + 1);
+        malformedBuffer.put(validRecords.buffer()).put((byte) 1).flip();
+        MemoryRecords malformedRecords = MemoryRecords.readableRecords(malformedBuffer);
+
+        try {
+            PartitionResponse response = partitionLog.write(
+                    malformedRecords,
+                    DisklessClientZone.NO_ZONE,
+                    "test-writer").get(5, TimeUnit.SECONDS);
+
+            assertEquals(Errors.INVALID_RECORD, response.error);
+            verify(logInstance, never()).append(anyInt(), any(ByteBuf.class));
+        } finally {
+            partitionLog.close();
+        }
     }
 
     @Test
@@ -259,6 +287,95 @@ class UrsaLakestreamWriterNonIdempotentTest {
     }
 
     @Test
+    void testQueuedWriteOwnsRecordsBeforeReturning() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        CompletableFuture<Log> logFuture = new CompletableFuture<>();
+        AtomicInteger appendCalls = new AtomicInteger();
+        AtomicReference<byte[]> secondAppendedPayload = new AtomicReference<>();
+
+        when(logInstance.append(anyInt(), any(ByteBuf.class))).thenAnswer(invocation -> {
+            int appendIndex = appendCalls.getAndIncrement();
+            ByteBuf buffer = invocation.getArgument(1);
+            byte[] appendedPayload = new byte[buffer.readableBytes()];
+            buffer.getBytes(buffer.readerIndex(), appendedPayload);
+            if (appendIndex == 1) {
+                secondAppendedPayload.set(appendedPayload);
+            }
+            return CompletableFuture.completedFuture(mockLogEntryHeader(appendIndex));
+        });
+
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        when(state.time()).thenReturn(Time.SYSTEM);
+        UrsaPartitionLog partitionLog = newPartitionLog(state, tp, logFuture);
+        MemoryRecords firstRecords = MemoryRecords.withRecords(
+                Compression.NONE,
+                new SimpleRecord("first".getBytes(StandardCharsets.UTF_8)));
+        MemoryRecords queuedRecords = MemoryRecords.withRecords(
+                Compression.NONE,
+                new SimpleRecord("queued".getBytes(StandardCharsets.UTF_8)));
+        byte[] expectedQueuedPayload = copyBytes(queuedRecords.buffer());
+
+        try {
+            CompletableFuture<PartitionResponse> firstWrite = partitionLog.write(
+                    firstRecords,
+                    DisklessClientZone.NO_ZONE,
+                    "test");
+            CompletableFuture<PartitionResponse> queuedWrite = partitionLog.write(
+                    queuedRecords,
+                    DisklessClientZone.NO_ZONE,
+                    "test");
+            assertEquals(2, partitionLog.ownedWritePayloadCount());
+
+            ByteBuffer callerBuffer = queuedRecords.buffer();
+            assertFalse(callerBuffer.isReadOnly());
+            for (int index = callerBuffer.position(); index < callerBuffer.limit(); index++) {
+                callerBuffer.put(index, (byte) 0);
+            }
+
+            logFuture.complete(logInstance);
+
+            assertEquals(Errors.NONE, firstWrite.get(5, TimeUnit.SECONDS).error);
+            assertEquals(Errors.NONE, queuedWrite.get(5, TimeUnit.SECONDS).error);
+            assertEquals(2, appendCalls.get());
+            assertArrayEquals(expectedQueuedPayload, secondAppendedPayload.get());
+            assertEquals(0, partitionLog.ownedWritePayloadCount());
+        } finally {
+            partitionLog.close();
+        }
+    }
+
+    @Test
+    void testAppendInitializationFailureReleasesOwnedPayload() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        AtomicReference<ByteBuf> appendedBuffer = new AtomicReference<>();
+        when(logInstance.append(anyInt(), any(ByteBuf.class))).thenAnswer(invocation -> {
+            appendedBuffer.set(invocation.getArgument(1));
+            throw new IOException("append initialization failed");
+        });
+
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        UrsaPartitionLog partitionLog = attachPartitionLog(state, tp, logInstance);
+        MemoryRecords records = MemoryRecords.withRecords(
+                Compression.NONE,
+                new SimpleRecord("a".getBytes(StandardCharsets.UTF_8)));
+
+        try {
+            PartitionResponse response = partitionLog.write(
+                    records,
+                    DisklessClientZone.NO_ZONE,
+                    "test").get(5, TimeUnit.SECONDS);
+
+            assertEquals(Errors.KAFKA_STORAGE_ERROR, response.error);
+            assertEquals(0, appendedBuffer.get().refCnt());
+            assertEquals(0, partitionLog.ownedWritePayloadCount());
+        } finally {
+            partitionLog.close();
+        }
+    }
+
+    @Test
     void testFencedLogReturnsNotLeaderAndInvalidatesPartitionLog() throws Exception {
         TopicIdPartition tp = testTopicPartition();
         Log logInstance = mock(Log.class);
@@ -366,7 +483,14 @@ class UrsaLakestreamWriterNonIdempotentTest {
         return header;
     }
 
+    private static byte[] copyBytes(ByteBuffer buffer) {
+        ByteBuffer copy = buffer.duplicate();
+        byte[] data = new byte[copy.remaining()];
+        copy.get(data);
+        return data;
+    }
+
     private static MemoryRecords decodeKafkaRecords(ByteBuf buffer) {
-        return MemoryRecords.readableRecords(KafkaEntryFormatter.decode(buffer.duplicate()));
+        return MemoryRecords.readableRecords(buffer.nioBuffer(buffer.readerIndex(), buffer.readableBytes()));
     }
 }

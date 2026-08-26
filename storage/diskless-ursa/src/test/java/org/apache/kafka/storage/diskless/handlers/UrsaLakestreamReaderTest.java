@@ -33,7 +33,6 @@ import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
 
 import org.junit.jupiter.api.Test;
 
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -205,10 +204,11 @@ class UrsaLakestreamReaderTest {
                 CompletableFuture.completedFuture(logOffset(10L, 3)));
         when(logInstance.openEphemeralCursor(anyString(), eq(10L)))
                 .thenReturn(CompletableFuture.completedFuture(cursor));
-        LogEntry oldEntry = createKafkaRecordsEntry(10L, new long[]{1000L}, true);
-        LogEntry newEntry = createKafkaRecordsEntry(11L, new long[]{1200L, 1500L});
+        LogEntry firstEntry = createKafkaRecordsEntry(10L, new long[]{1000L});
+        LogEntry multiBatchEntry = createKafkaRecordsEntry(
+                11L, new long[]{1200L}, new long[]{1500L});
         when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(13L)))
-                .thenReturn(CompletableFuture.completedFuture(List.of(oldEntry, newEntry)));
+                .thenReturn(CompletableFuture.completedFuture(List.of(firstEntry, multiBatchEntry)));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -228,8 +228,8 @@ class UrsaLakestreamReaderTest {
         }
         assertEquals(List.of(10L, 11L, 12L), offsets);
         assertEquals(List.of(1000L, 1200L, 1500L), timestamps);
-        verify(oldEntry).close();
-        verify(newEntry).close();
+        verify(firstEntry).close();
+        verify(multiBatchEntry).close();
     }
 
     @Test
@@ -634,45 +634,41 @@ class UrsaLakestreamReaderTest {
         return new LogOffset(offset, numberOfRecords, -1L);
     }
 
-    private static LogEntry createKafkaRecordsEntry(long baseOffset, long[] timestamps) {
-        return createKafkaRecordsEntry(baseOffset, timestamps, false);
-    }
-
-    private static LogEntry createKafkaRecordsEntry(long baseOffset, long[] timestamps, boolean preV1) {
-        SimpleRecord[] records = new SimpleRecord[timestamps.length];
+    private static LogEntry createKafkaRecordsEntry(long baseOffset, long[]... timestampBatches) {
         byte[] key = "key".getBytes(StandardCharsets.UTF_8);
         byte[] value = "value".getBytes(StandardCharsets.UTF_8);
-        for (int i = 0; i < timestamps.length; i++) {
-            records[i] = new SimpleRecord(timestamps[i], key, value);
+        List<MemoryRecords> batches = new ArrayList<>(timestampBatches.length);
+        int numberOfRecords = 0;
+        int payloadSize = 0;
+        for (long[] timestamps : timestampBatches) {
+            SimpleRecord[] records = new SimpleRecord[timestamps.length];
+            for (int i = 0; i < timestamps.length; i++) {
+                records[i] = new SimpleRecord(timestamps[i], key, value);
+            }
+            MemoryRecords batch = MemoryRecords.withRecords(Compression.NONE, records);
+            batches.add(batch);
+            numberOfRecords = Math.addExact(numberOfRecords, timestamps.length);
+            payloadSize = Math.addExact(payloadSize, batch.buffer().remaining());
         }
 
-        MemoryRecords memoryRecords = MemoryRecords.withRecords(Compression.NONE, records);
-        ByteBuf encoded = preV1 ? encodePreV1(memoryRecords) : KafkaEntryFormatter.encode(memoryRecords);
+        ByteBuf payload = Unpooled.buffer(payloadSize);
+        for (MemoryRecords batch : batches) {
+            payload.writeBytes(batch.buffer().duplicate());
+        }
 
         LogEntry entry = mock(LogEntry.class);
         AtomicBoolean closed = new AtomicBoolean();
         when(entry.offset()).thenReturn(baseOffset);
-        when(entry.numberOfRecords()).thenReturn(timestamps.length);
-        when(entry.size()).thenReturn(encoded.readableBytes());
-        when(entry.payload()).thenReturn(encoded.asReadOnly());
+        when(entry.numberOfRecords()).thenReturn(numberOfRecords);
+        when(entry.size()).thenReturn(payload.readableBytes());
+        when(entry.payload()).thenReturn(payload.asReadOnly());
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
-                encoded.release();
+                payload.release();
             }
             return null;
         }).when(entry).close();
         return entry;
-    }
-
-    private static ByteBuf encodePreV1(MemoryRecords records) {
-        ByteBuffer recordsBuffer = records.buffer().duplicate();
-        ByteBuf encoded = Unpooled.buffer(Integer.BYTES + 3 + recordsBuffer.remaining());
-        encoded.writeInt(3);
-        encoded.writeByte(1);
-        encoded.writeByte(2);
-        encoded.writeByte(3);
-        encoded.writeBytes(recordsBuffer);
-        return encoded;
     }
 
     private static UrsaPartitionLog attachReaderPartitionLog(

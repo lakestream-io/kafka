@@ -22,7 +22,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.SimpleRecord;
-import org.apache.kafka.storage.diskless.handlers.KafkaEntryFormatter;
+import org.apache.kafka.storage.diskless.handlers.KafkaRecordsPayload;
 
 import org.junit.jupiter.api.Test;
 
@@ -41,7 +41,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
@@ -194,22 +193,44 @@ class ProducerStateManagerTest {
             manager1.completeAppend(firstPending, 0L, 1000L);
             manager1.takeSnapshot("test").get();
 
-            LogEntry oldReplayEntry = newReplayEntry(1L, (short) 0, 2, "r2", 2L, 1, true);
-            LogEntry newReplayEntry = newReplayEntry(1L, (short) 0, 3, "r3", 3L, 1);
-            Log replayLog = replayLog(List.of(oldReplayEntry, newReplayEntry), 3L, 1);
+            LogEntry firstReplayEntry = newReplayEntry(1L, (short) 0, 2, "r2", 2L, 1);
+            LogEntry secondReplayEntry = newReplayEntry(1L, (short) 0, 3, "r3", 3L, 1);
+            Log replayLog = replayLog(List.of(firstReplayEntry, secondReplayEntry), 3L, 1);
             manager2 = newManager(tp, snapshotStore::client, () -> CompletableFuture.completedFuture(replayLog));
 
             ProducerStateManager.PrepareResult recovered = manager2.prepareAppend(List.of(
                 batch(1L, (short) 0, 4, 4, 1, 3000L)
             )).get();
             assertInstanceOf(ProducerStateManager.Ready.class, recovered);
-            verify(oldReplayEntry).close();
-            verify(newReplayEntry).close();
+            verify(firstReplayEntry).close();
+            verify(secondReplayEntry).close();
         } finally {
             manager1.close();
             if (manager2 != null) {
                 manager2.close();
             }
+        }
+    }
+
+    @Test
+    void testReplayRebasesEveryBatchInRawMemoryRecords() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        LogEntry replayEntry = newMultiBatchReplayEntry(10L);
+        Log replayLog = replayLog(replayEntry, 10L, 3);
+        ProducerStateManager manager = newManager(
+                tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
+
+        try {
+            ProducerStateManager.PrepareResult duplicate = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 2, 2, 1, 3000L)
+            )).get();
+            assertInstanceOf(ProducerStateManager.Duplicate.class, duplicate);
+            ProducerStateManager.AppendResult duplicateResult =
+                    ((ProducerStateManager.Duplicate) duplicate).appendResultFuture().get();
+            assertEquals(12L, duplicateResult.baseOffset());
+            verify(replayEntry).close();
+        } finally {
+            manager.close();
         }
     }
 
@@ -352,6 +373,27 @@ class ProducerStateManagerTest {
             assertSame(entryFailure, rootCause);
             verify(failingEntry).close();
             verify(unvisitedEntry).close();
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
+    void testCorruptReplayEntryFailsRecoveryAndClosesEntireEntryBatch() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        LogEntry corruptEntry = newCorruptReplayEntry(0L);
+        LogEntry unvisitedEntry = newReplayEntry(1L, (short) 0, 0, "unvisited", 1L, 1);
+        Log replayLog = replayLog(List.of(corruptEntry, unvisitedEntry), 1L, 1);
+
+        ProducerStateManager manager = newManager(
+                tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
+        try {
+            assertThrows(ExecutionException.class, () -> manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 1, 1, 1, 3000L)
+            )).get());
+            verify(corruptEntry).close();
+            verify(unvisitedEntry).close();
+            verify(unvisitedEntry, never()).payload();
         } finally {
             manager.close();
         }
@@ -591,17 +633,6 @@ class ProducerStateManagerTest {
             String value,
             long baseOffset,
             int numMessages) {
-        return newReplayEntry(producerId, producerEpoch, firstSeq, value, baseOffset, numMessages, false);
-    }
-
-    private static LogEntry newReplayEntry(
-            long producerId,
-            short producerEpoch,
-            int firstSeq,
-            String value,
-            long baseOffset,
-            int numMessages,
-            boolean preV1) {
         MemoryRecords memoryRecords = MemoryRecords.withIdempotentRecords(
             Compression.NONE,
             producerId,
@@ -609,7 +640,7 @@ class ProducerStateManagerTest {
             firstSeq,
             new SimpleRecord(value.getBytes(StandardCharsets.UTF_8)));
 
-        ByteBuf data = preV1 ? encodePreV1(memoryRecords) : KafkaEntryFormatter.encode(memoryRecords);
+        ByteBuf data = KafkaRecordsPayload.copyForAppend(memoryRecords);
 
         LogEntry entry = mock(LogEntry.class);
         AtomicBoolean closed = new AtomicBoolean();
@@ -626,15 +657,59 @@ class ProducerStateManagerTest {
         return entry;
     }
 
-    private static ByteBuf encodePreV1(MemoryRecords records) {
-        ByteBuffer recordsBuffer = records.buffer().duplicate();
-        ByteBuf encoded = Unpooled.buffer(Integer.BYTES + 3 + recordsBuffer.remaining());
-        encoded.writeInt(3);
-        encoded.writeByte(1);
-        encoded.writeByte(2);
-        encoded.writeByte(3);
-        encoded.writeBytes(recordsBuffer);
-        return encoded;
+    private static LogEntry newCorruptReplayEntry(long baseOffset) {
+        ByteBuf data = KafkaRecordsPayload.copyForAppend(MemoryRecords.withRecords(
+                Compression.NONE,
+                new SimpleRecord("corrupt".getBytes(StandardCharsets.UTF_8))));
+        data.setByte(data.writerIndex() - 1, data.getByte(data.writerIndex() - 1) ^ 1);
+
+        LogEntry entry = mock(LogEntry.class);
+        AtomicBoolean closed = new AtomicBoolean();
+        when(entry.offset()).thenReturn(baseOffset);
+        when(entry.numberOfRecords()).thenReturn(1);
+        when(entry.size()).thenReturn(data.readableBytes());
+        when(entry.payload()).thenReturn(data.asReadOnly());
+        doAnswer(invocation -> {
+            if (closed.compareAndSet(false, true)) {
+                data.release();
+            }
+            return null;
+        }).when(entry).close();
+        return entry;
+    }
+
+    private static LogEntry newMultiBatchReplayEntry(long baseOffset) {
+        MemoryRecords firstBatch = MemoryRecords.withIdempotentRecords(
+                Compression.NONE,
+                1L,
+                (short) 0,
+                0,
+                new SimpleRecord("first".getBytes(StandardCharsets.UTF_8)),
+                new SimpleRecord("second".getBytes(StandardCharsets.UTF_8)));
+        MemoryRecords secondBatch = MemoryRecords.withIdempotentRecords(
+                Compression.NONE,
+                1L,
+                (short) 0,
+                2,
+                new SimpleRecord("third".getBytes(StandardCharsets.UTF_8)));
+        ByteBuffer combined = ByteBuffer.allocate(
+                firstBatch.buffer().remaining() + secondBatch.buffer().remaining());
+        combined.put(firstBatch.buffer()).put(secondBatch.buffer()).flip();
+        ByteBuf data = KafkaRecordsPayload.copyForAppend(MemoryRecords.readableRecords(combined));
+
+        LogEntry entry = mock(LogEntry.class);
+        AtomicBoolean closed = new AtomicBoolean();
+        when(entry.offset()).thenReturn(baseOffset);
+        when(entry.numberOfRecords()).thenReturn(3);
+        when(entry.size()).thenReturn(data.readableBytes());
+        when(entry.payload()).thenReturn(data.asReadOnly());
+        doAnswer(invocation -> {
+            if (closed.compareAndSet(false, true)) {
+                data.release();
+            }
+            return null;
+        }).when(entry).close();
+        return entry;
     }
 
     private static LogEntry newReplayEntryWithoutProducer(
@@ -645,7 +720,7 @@ class ProducerStateManagerTest {
             Compression.NONE,
             new SimpleRecord(value.getBytes(StandardCharsets.UTF_8)));
 
-        ByteBuf data = KafkaEntryFormatter.encode(memoryRecords);
+        ByteBuf data = KafkaRecordsPayload.copyForAppend(memoryRecords);
 
         LogEntry entry = mock(LogEntry.class);
         AtomicBoolean closed = new AtomicBoolean();

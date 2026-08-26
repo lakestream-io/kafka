@@ -98,8 +98,10 @@ class UrsaLakestreamWriterIdempotentTest {
                     Map.of(tp, idempotentRecords(4_444L, 1, "queued")),
                     DisklessClientZone.NO_ZONE);
             assertEquals(1, prepareAppendCalls.get(), "The second write should still be queued");
+            assertEquals(2, partitionLog.ownedWritePayloadCount());
 
             partitionLog.close();
+            assertEquals(0, partitionLog.ownedWritePayloadCount());
             releaseFirstPrepare.countDown();
 
             PartitionResponse firstResponse = firstWrite.get(5, TimeUnit.SECONDS).get(tp);
