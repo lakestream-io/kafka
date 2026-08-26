@@ -385,7 +385,7 @@ final class UrsaPartitionLog {
 
             final ByteBuf data;
             try {
-                data = KafkaEntryFormatter.encode(records, analysisResult);
+                data = KafkaEntryFormatter.encode(records);
             } catch (Throwable encodeError) {
                 producerStateManager.abortAppend(pendingAppend, encodeError);
                 submissionFuture.complete(null);
@@ -460,7 +460,7 @@ final class UrsaPartitionLog {
 
             final ByteBuf data;
             try {
-                data = KafkaEntryFormatter.encode(records, analysisResult);
+                data = KafkaEntryFormatter.encode(records);
             } catch (Throwable encodeError) {
                 submissionFuture.complete(null);
                 result.completeExceptionally(encodeError);

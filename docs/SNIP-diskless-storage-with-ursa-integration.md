@@ -276,6 +276,21 @@ This matters because “async storage” alone does not guarantee low end-to-end
 
 Without broker request pipelining, the network layer’s mute/unmute behavior makes the connection itself the bottleneck (head-of-line blocking), regardless of how asynchronous the storage layer is.
 
+#### Storage Entry Envelope
+
+Kafka record batches are persisted as a small, versioned envelope followed by the original `MemoryRecords` bytes:
+
+```
+[int32 header length = 8]["UKFE"][version = 1][flags = 0][reserved = 0][MemoryRecords]
+```
+
+Readers also accept pre-v1 entries by treating their length-prefixed header as opaque bytes. Unknown UKFE versions,
+flags, reserved values, truncated headers, and empty record payloads fail closed.
+
+The format change requires a decoder-first rollout. Before any broker writes UKFE v1, every broker and external
+materializer that may read the shared log must run a bridge build that understands both pre-v1 and UKFE v1 entries.
+Older readers cannot safely participate after the first UKFE v1 entry is written.
+
 #### Read Path (Fetch)
 
 ```

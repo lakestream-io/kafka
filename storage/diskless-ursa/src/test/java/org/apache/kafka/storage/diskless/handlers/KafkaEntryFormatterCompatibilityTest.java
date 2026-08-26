@@ -16,7 +16,6 @@
  */
 package org.apache.kafka.storage.diskless.handlers;
 
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.ControlRecordType;
@@ -25,7 +24,6 @@ import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.MemoryRecordsBuilder;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.record.internal.SimpleRecord;
-import org.apache.kafka.storage.diskless.handlers.RecordAnalyzer.RecordAnalysisResult;
 
 import org.junit.jupiter.api.Test;
 
@@ -40,25 +38,16 @@ import io.netty.buffer.Unpooled;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class KafkaEntryFormatterCompatibilityTest {
 
-    private static final TopicPartition TEST_PARTITION = new TopicPartition("test-topic", 0);
     private static final long TIMESTAMP = 1_700_000_000_000L;
-
-    // Captured from the former protocol-library encoder. These vectors include the four-byte metadata length.
-    private static final byte[] NON_IDEMPOTENT_LEGACY_PREFIX = HexFormat.of().parseHex(
-            "000000320a0e6b61666b612d70726f647563657210001880d095ffbc3122150a0c656e7472792e666f726d617412056b61666b615801");
-    private static final byte[] IDEMPOTENT_LEGACY_PREFIX = HexFormat.of().parseHex(
-            "0000002b0a043132333410071880d095ffbc3122150a0c656e7472792e666f726d617412056b61666b615802c00108");
-    private static final byte[] TRANSACTION_MARKER_LEGACY_PREFIX = HexFormat.of().parseHex(
-            "0000007c0a043132333410001880d095ffbc3122150a0c656e7472792e666f726d617412056b61666b61"
-                    + "22160a0e74786e2e70726f6475636572496412043132333422160a1174786e2e70726f64756365724570"
-                    + "6f636812013222190a0f74786e2e636f6e74726f6c547970651206434f4d4d49545801a00115b00100"
-                    + "b80100");
+    private static final byte[] UKFE_V1_PREFIX = HexFormat.of().parseHex("00000008554b464501000000");
+    private static final byte[] PRE_V1_OPAQUE_HEADER = HexFormat.of().parseHex("00000003010203");
 
     @Test
-    void testNonIdempotentMetadataMatchesLegacyEnvelope() {
+    void testNonIdempotentRecordsUseNeutralV1Envelope() {
         MemoryRecords records = MemoryRecords.withRecords(
                 Compression.NONE,
                 new SimpleRecord(
@@ -66,11 +55,11 @@ class KafkaEntryFormatterCompatibilityTest {
                         "key".getBytes(StandardCharsets.UTF_8),
                         "value".getBytes(StandardCharsets.UTF_8)));
 
-        assertEncodedEntry(records, NON_IDEMPOTENT_LEGACY_PREFIX);
+        assertEncodedEntry(records);
     }
 
     @Test
-    void testIdempotentMetadataMatchesLegacyEnvelope() {
+    void testIdempotentRecordsUseNeutralV1Envelope() {
         MemoryRecordsBuilder builder = MemoryRecords.builder(
                 ByteBuffer.allocate(1024),
                 RecordBatch.MAGIC_VALUE_V2,
@@ -84,11 +73,11 @@ class KafkaEntryFormatterCompatibilityTest {
         builder.append(new SimpleRecord(TIMESTAMP, "key-1".getBytes(), "value-1".getBytes()));
         builder.append(new SimpleRecord(TIMESTAMP, "key-2".getBytes(), "value-2".getBytes()));
 
-        assertEncodedEntry(builder.build(), IDEMPOTENT_LEGACY_PREFIX);
+        assertEncodedEntry(builder.build());
     }
 
     @Test
-    void testTransactionMarkerMetadataMatchesLegacyEnvelope() {
+    void testControlRecordsUseNeutralV1Envelope() {
         MemoryRecords records = MemoryRecords.withEndTransactionMarker(
                 0L,
                 TIMESTAMP,
@@ -97,18 +86,18 @@ class KafkaEntryFormatterCompatibilityTest {
                 (short) 2,
                 new EndTransactionMarker(ControlRecordType.COMMIT, 0));
 
-        assertEncodedEntry(records, TRANSACTION_MARKER_LEGACY_PREFIX);
+        assertEncodedEntry(records);
     }
 
     @Test
-    void testDecodesLegacyEnvelopeWithoutMutatingEntry() {
+    void testDecodesPreV1OpaqueHeaderWithoutMutatingEntry() {
         MemoryRecords records = MemoryRecords.withRecords(
                 Compression.NONE,
                 new SimpleRecord(TIMESTAMP, "key".getBytes(), "value".getBytes()));
         byte[] payload = toByteArray(records.buffer());
-        ByteBuf entry = Unpooled.buffer(3 + NON_IDEMPOTENT_LEGACY_PREFIX.length + payload.length);
+        ByteBuf entry = Unpooled.buffer(3 + PRE_V1_OPAQUE_HEADER.length + payload.length);
         entry.writeZero(3);
-        entry.writeBytes(NON_IDEMPOTENT_LEGACY_PREFIX);
+        entry.writeBytes(PRE_V1_OPAQUE_HEADER);
         entry.writeBytes(payload);
         entry.readerIndex(3);
 
@@ -122,31 +111,54 @@ class KafkaEntryFormatterCompatibilityTest {
     }
 
     @Test
-    void testRejectsInvalidMetadataLengths() {
+    void testRejectsUnsupportedV1HeaderValues() {
+        assertInvalidHeader("00000008554b464502000000", "version 2");
+        assertInvalidHeader("00000008554b464501010000", "flags 1");
+        assertInvalidHeader("00000008554b464501000001", "reserved value 1");
+        assertInvalidHeader("00000004554b4645", "header length 4");
+        assertInvalidHeader("00000008554b464501000000", "no Kafka MemoryRecords payload");
+    }
+
+    @Test
+    void testRejectsInvalidHeaderLengths() {
         assertInvalidEntry(Unpooled.wrappedBuffer(new byte[Integer.BYTES - 1]));
 
         ByteBuf negativeLength = Unpooled.buffer(Integer.BYTES);
         negativeLength.writeInt(-1);
         assertInvalidEntry(negativeLength);
 
-        ByteBuf truncatedMetadata = Unpooled.buffer(Integer.BYTES + 2);
-        truncatedMetadata.writeInt(3);
-        truncatedMetadata.writeZero(2);
-        assertInvalidEntry(truncatedMetadata);
+        ByteBuf truncatedHeader = Unpooled.buffer(Integer.BYTES + 2);
+        truncatedHeader.writeInt(3);
+        truncatedHeader.writeZero(2);
+        assertInvalidEntry(truncatedHeader);
     }
 
-    private static void assertEncodedEntry(MemoryRecords records, byte[] expectedPrefix) {
-        RecordAnalysisResult analysis = RecordAnalyzer.analyzeAndValidateRecords(records, TEST_PARTITION, 0);
+    private static void assertEncodedEntry(MemoryRecords records) {
         byte[] expectedPayload = toByteArray(records.buffer());
-        ByteBuf encoded = KafkaEntryFormatter.encode(records, analysis);
+        ByteBuf encoded = KafkaEntryFormatter.encode(records);
         try {
-            assertEquals(expectedPrefix.length + expectedPayload.length, encoded.readableBytes());
-            assertArrayEquals(expectedPrefix, ByteBufUtil.getBytes(encoded, 0, expectedPrefix.length));
+            assertEquals(UKFE_V1_PREFIX.length + expectedPayload.length, encoded.readableBytes());
+            assertArrayEquals(UKFE_V1_PREFIX, ByteBufUtil.getBytes(encoded, 0, UKFE_V1_PREFIX.length));
             assertArrayEquals(
                     expectedPayload,
-                    ByteBufUtil.getBytes(encoded, expectedPrefix.length, expectedPayload.length));
+                    ByteBufUtil.getBytes(encoded, UKFE_V1_PREFIX.length, expectedPayload.length));
+            int readerIndex = encoded.readerIndex();
+            assertArrayEquals(expectedPayload, toByteArray(KafkaEntryFormatter.decode(encoded)));
+            assertEquals(readerIndex, encoded.readerIndex());
+            assertEquals(1, encoded.refCnt());
         } finally {
             encoded.release();
+        }
+    }
+
+    private static void assertInvalidHeader(String hex, String message) {
+        ByteBuf entry = Unpooled.wrappedBuffer(HexFormat.of().parseHex(hex));
+        try {
+            IllegalArgumentException error = assertThrows(
+                    IllegalArgumentException.class, () -> KafkaEntryFormatter.decode(entry));
+            assertTrue(error.getMessage().contains(message));
+        } finally {
+            entry.release();
         }
     }
 
