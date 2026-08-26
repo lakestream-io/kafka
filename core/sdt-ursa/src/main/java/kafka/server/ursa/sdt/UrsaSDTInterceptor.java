@@ -151,8 +151,8 @@ public class UrsaSDTInterceptor implements ReplicaManagerInterceptor {
 
     AsyncOxiaClient getOxiaClient() {
         try {
-            var oxiaPulsarStorageUrl = clusterConfig.getString(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG);
-            var oxiaServiceUrl = UrsaStorage.validateOxiaUrl(oxiaPulsarStorageUrl);
+            var configuredOxiaServiceUrl = clusterConfig.getString(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG);
+            var oxiaServiceUrl = UrsaStorage.validateOxiaUrl(configuredOxiaServiceUrl);
             return OxiaClientBuilder.create(oxiaServiceUrl.getLeft())
                 .namespace(oxiaServiceUrl.getRight())
                 .asyncClient().get(30, TimeUnit.SECONDS);

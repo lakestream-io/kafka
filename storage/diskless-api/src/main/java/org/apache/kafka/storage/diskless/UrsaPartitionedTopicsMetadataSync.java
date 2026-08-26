@@ -16,7 +16,7 @@
  */
 package org.apache.kafka.storage.diskless;
 
-import org.apache.kafka.storage.diskless.handlers.KafkaManagedLedgerNaming;
+import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -61,8 +61,8 @@ public final class UrsaPartitionedTopicsMetadataSync implements AutoCloseable {
     /**
      * Delete the partitioned topic metadata entry and any producer-state snapshot entries if partitions >= 0.
      *
-     * <p>Managed ledger metadata and the underlying Ursa stream are deleted by the broker-side reconciliation path,
-     * which still has enough context to perform a complete delete through the managed ledger factory.
+     * <p>Catalog metadata and the underlying Ursa stream are deleted by the broker-side reconciliation path,
+     * which still has enough context to perform a complete log deletion.
      *
      * <p>Producer-state snapshot keys are only deleted when topicId is present.
      */
@@ -115,9 +115,9 @@ public final class UrsaPartitionedTopicsMetadataSync implements AutoCloseable {
 
     static String partitionedTopicMetadataPath(String topicName) {
         return PARTITIONED_TOPIC_PREFIX
-                + KafkaManagedLedgerNaming.TENANT + "/"
-                + KafkaManagedLedgerNaming.NAMESPACE + "/"
-                + KafkaManagedLedgerNaming.DOMAIN + "/"
+                + KafkaLogNaming.TENANT + "/"
+                + KafkaLogNaming.NAMESPACE + "/"
+                + KafkaLogNaming.DOMAIN + "/"
                 + topicName;
     }
 }

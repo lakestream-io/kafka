@@ -114,7 +114,6 @@ ext {
   commitId = determineCommitId()
 
   ursaStorageVersion = '5.0.0-M1-SNAPSHOT'
-  ursaPulsarVersion = '4.2.1.11'
   ursaOpenTelemetryVersion = '1.62.0'
   oxiaClientVersion = '0.9.4'
   hessianLiteVersion = '4.0.4'
@@ -145,24 +144,15 @@ ext {
     'com.fasterxml.jackson.module:jackson-module-parameter-names:2.21.5'
   ]
 
-  // Closure to exclude ursa-storage and pulsar dependencies from test classpath.
+  // Closure to exclude the isolated Ursa runtime from unrelated test classpaths.
   // These dependencies significantly slow down ClassGraph.scan() during plugin discovery
   // and are not needed for most integration tests.
   excludeUrsaStorageDeps = { configuration ->
     configuration.exclude group: 'io.streamnative', module: 'ursa-storage-core'
     configuration.exclude group: 'io.streamnative', module: 'ursa-storage-common'
-    configuration.exclude group: 'io.streamnative', module: 'ursa-storage-lakehouse'
+    configuration.exclude group: 'io.streamnative', module: 'ursa-storage-lakehouse-kafka-reader'
     configuration.exclude group: 'io.streamnative', module: 'ursa-storage-lakestream'
-    configuration.exclude group: 'io.streamnative', module: 'ursa-storage-materialization'
-    configuration.exclude group: 'io.streamnative', module: 'ursa-storage-ml'
     configuration.exclude group: 'io.streamnative', module: 'lakestream-api'
-    configuration.exclude group: 'io.streamnative', module: 'pulsar-broker-common'
-    configuration.exclude group: 'io.streamnative', module: 'pulsar-common'
-    configuration.exclude group: 'io.streamnative', module: 'pulsar-metadata'
-    configuration.exclude group: 'io.streamnative', module: 'pulsar-client-api'
-    configuration.exclude group: 'io.streamnative', module: 'pulsar-client-admin-api'
-    configuration.exclude group: 'io.streamnative', module: 'pulsar-opentelemetry'
-    configuration.exclude group: 'io.streamnative', module: 'managed-ledger'
     configuration.exclude group: 'io.streamnative.oxia', module: 'oxia-testcontainers'
     configuration.exclude group: 'io.github.oxia-db', module: 'oxia-client-api'
     configuration.exclude group: 'io.github.oxia-db', module: 'oxia-client'
@@ -240,7 +230,7 @@ allprojects {
     def githubPackagesToken = System.getenv('SNBOT_GITHUB_TOKEN')
     if (githubPackagesToken != null && !githubPackagesToken.isBlank()) {
       maven {
-        url = uri('https://maven.pkg.github.com/streamnative/pulsar')
+        url = uri('https://maven.pkg.github.com/streamnative/ursa-storage')
         credentials {
           username = 'streamnativebot'
           password = githubPackagesToken
@@ -280,13 +270,12 @@ allprojects {
           libs.jacksonDataformatYaml,
           libs.commonsLang,
 
-          // Force log4j2 version to avoid conflicts with transitive dependencies from bookkeeper
+          // Keep the logging implementation aligned with Kafka's runtime.
           libs.slf4jLog4j2,
           libs.log4j2Api,
           libs.log4j2Core,
 
-          // Force Jetty version to avoid conflicts with transitive dependencies from pulsar-broker-common
-          // which brings in Jetty 12.1.x that is incompatible with Kafka's jetty-ee10-* modules at 12.0.x
+          // Keep Jetty dependencies aligned with Kafka's jetty-ee10 modules.
           libs.jettyServer,
           libs.jettyClient,
           libs.jettyServlet,
@@ -299,18 +288,8 @@ allprojects {
           "org.eclipse.jetty:jetty-alpn-client:$versions.jetty",
 
           // Keep dependency resolution deterministic across environments (CI vs local)
-          // when consuming SNAPSHOT-based StreamNative/Pulsar artifacts.
+          // when consuming SNAPSHOT-based StreamNative artifacts.
           // These versions are expected to be present in the binary distribution's ./libs.
-          'org.apache.bookkeeper:bookkeeper-common:4.17.3',
-          'org.apache.bookkeeper:bookkeeper-common-allocator:4.17.3',
-          'org.apache.bookkeeper:bookkeeper-proto:4.17.3',
-          'org.apache.bookkeeper:bookkeeper-server:4.17.3',
-          'org.apache.bookkeeper:bookkeeper-slogger-api:4.17.3',
-          'org.apache.bookkeeper:bookkeeper-slogger-slf4j:4.17.3',
-          'org.apache.bookkeeper:bookkeeper-stats-api:4.17.3',
-          'org.apache.bookkeeper:bookkeeper-tools-framework:4.17.3',
-          'org.apache.bookkeeper:http-server:4.17.3',
-
           "io.opentelemetry:opentelemetry-api:$ursaOpenTelemetryVersion",
           "io.opentelemetry:opentelemetry-common:$ursaOpenTelemetryVersion",
           "io.opentelemetry:opentelemetry-context:$ursaOpenTelemetryVersion",
@@ -1165,24 +1144,14 @@ project(':server') {
     testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
     testImplementation 'org.testcontainers:localstack:1.21.4'
     testImplementation 'org.awaitility:awaitility:4.2.0'
-    // Needed by `PulsarStorageConfig` (depends on `PulsarConfiguration` interface).
-    testImplementation "io.streamnative:pulsar-broker-common:$ursaPulsarVersion"
     testImplementation("io.streamnative:ursa-storage-core:$ursaStorageVersion") {
-      exclude group: 'io.streamnative', module: 'pulsar-broker'
-      exclude group: 'io.streamnative', module: 'pulsar-client-original'
-      exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
-      exclude group: 'io.streamnative.pulsar.handlers', module: 'pulsar-kafka-common'
       exclude group: 'io.confluent', module: 'kafka-schema-registry-client'
       exclude group: 'org.apache.kafka', module: 'kafka-clients'
     }
-    // Required at runtime for parquet reads (loaded via `-Dursa.externalReaderFactoryClass=...`).
-    testRuntimeOnly("io.streamnative:ursa-storage-lakehouse:$ursaStorageVersion") {
+    // Required at runtime for Kafka V2 parquet reads.
+    testRuntimeOnly("io.streamnative:ursa-storage-lakehouse-kafka-reader:$ursaStorageVersion") {
       // Reuse the project's Kafka client classes to avoid version conflicts.
       exclude group: 'org.apache.kafka', module: 'kafka-clients'
-      // Avoid pulling in StreamNative Pulsar broker/client artifacts that are unused in this build.
-      exclude group: 'io.streamnative', module: 'pulsar-broker'
-      exclude group: 'io.streamnative', module: 'pulsar-client-original'
-      exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
     }
 
     testRuntimeOnly runtimeTestLibs
@@ -1684,11 +1653,6 @@ project(':core:core-sdt-ursa') {
     implementation "io.github.oxia-db:oxia-client-api:$oxiaClientVersion"
     runtimeOnly "io.github.oxia-db:oxia-client:$oxiaClientVersion"
     runtimeOnly "org.apache.dubbo:hessian-lite:$hessianLiteVersion"
-    runtimeOnly("io.streamnative:pulsar-common:$ursaPulsarVersion") {
-      exclude group: 'io.streamnative', module: 'pulsar-client-original'
-      exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
-    }
-
     testImplementation project(':clients').sourceSets.test.output
     testImplementation project(':server-common').sourceSets.test.output
     testImplementation project(':test-common:test-common-internal-api')
@@ -2447,7 +2411,7 @@ project(':clients:clients-integration-tests') {
     testRuntimeOnly runtimeTestLibs
   }
 
-  // Exclude ursa-storage and pulsar dependencies from test classpath
+  // Exclude the isolated Ursa runtime from this test classpath.
   excludeUrsaStorageDeps(configurations.testRuntimeClasspath)
 
   checkstyle {
@@ -2865,35 +2829,16 @@ project(':storage:storage-diskless-ursa') {
     implementation libs.jacksonDatabind
     implementation libs.metrics
     implementation libs.slf4jApi
-    implementation("io.streamnative:ursa-storage-core:$ursaStorageVersion") {
-      exclude group: 'io.streamnative', module: 'pulsar-broker'
-      exclude group: 'io.streamnative', module: 'pulsar-client-original'
-      exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
-    }
+    implementation "io.streamnative:ursa-storage-core:$ursaStorageVersion"
     implementation "io.streamnative:lakestream-api:$ursaStorageVersion"
-    implementation("io.streamnative:ursa-storage-lakestream:$ursaStorageVersion") {
-      exclude group: 'io.streamnative', module: 'pulsar-broker'
-      exclude group: 'io.streamnative', module: 'pulsar-client-original'
-      exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
-    }
-    // Required at runtime for parquet reads when `-Dursa.externalReaderFactoryClass=...LakehouseReaderFactory` is set
+    implementation "io.streamnative:ursa-storage-lakestream:$ursaStorageVersion"
+    // Required at runtime when `KafkaLakehouseReaderFactory` is configured
     // (e.g. `docker-compose-localstack-compaction.yml`).
-    runtimeOnly("io.streamnative:ursa-storage-lakehouse:$ursaStorageVersion") {
+    runtimeOnly("io.streamnative:ursa-storage-lakehouse-kafka-reader:$ursaStorageVersion") {
       // Reuse the project's Kafka client classes to avoid version conflicts.
       exclude group: 'org.apache.kafka', module: 'kafka-clients'
       // Kafka still uses SLF4J 1.7; the SLF4J 2.x Log4j bridge requires SLF4JServiceProvider.
       exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
-      // Avoid pulling in StreamNative Pulsar broker/client artifacts that are unused in this build.
-      exclude group: 'io.streamnative', module: 'pulsar-broker'
-      exclude group: 'io.streamnative', module: 'pulsar-client-original'
-      exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
-    }
-    // Lakestream's StorageApi bridge still exposes ManagedLedger API types at runtime
-    // (for example EntryList and fenced append exceptions).
-    implementation("io.streamnative:managed-ledger:$ursaPulsarVersion")
-    implementation("io.streamnative:pulsar-broker-common:$ursaPulsarVersion") {
-      exclude group: 'io.streamnative', module: 'bouncy-castle-bc'
-      exclude group: 'io.streamnative', module: 'pulsar-client-original'
     }
     implementation "io.github.oxia-db:oxia-client-api:$oxiaClientVersion"
     implementation 'io.netty:netty-buffer:4.1.131.Final'
@@ -3039,7 +2984,7 @@ project(':tools') {
     testRuntimeOnly libs.hamcrest
   }
 
-  // Exclude ursa-storage and pulsar dependencies from test classpath
+  // Exclude the isolated Ursa runtime from this test classpath.
   excludeUrsaStorageDeps(configurations.testRuntimeClasspath)
 
   javadoc {
@@ -3409,7 +3354,7 @@ project(':streams:integration-tests') {
     testRuntimeOnly runtimeTestLibs
   }
 
-  // Exclude ursa-storage and pulsar dependencies from test classpath
+  // Exclude the isolated Ursa runtime from this test classpath.
   excludeUrsaStorageDeps(configurations.testRuntimeClasspath)
 
   sourceSets {
@@ -4154,7 +4099,7 @@ project(':connect:runtime') {
     testRuntimeOnly runtimeTestLibs
   }
 
-  // Exclude ursa-storage and pulsar dependencies from test classpath
+  // Exclude the isolated Ursa runtime from this test classpath.
   excludeUrsaStorageDeps(configurations.testRuntimeClasspath)
 
   javadoc {
@@ -4266,7 +4211,7 @@ project(':connect:file') {
     testRuntimeOnly runtimeTestLibs
   }
 
-  // Exclude ursa-storage and pulsar dependencies from test classpath
+  // Exclude the isolated Ursa runtime from this test classpath.
   excludeUrsaStorageDeps(configurations.testRuntimeClasspath)
 
   javadoc {
@@ -4378,7 +4323,7 @@ project(':connect:mirror') {
     testRuntimeOnly runtimeTestLibs
   }
 
-  // Exclude ursa-storage and pulsar dependencies from test classpath
+  // Exclude the isolated Ursa runtime from this test classpath.
   excludeUrsaStorageDeps(configurations.testRuntimeClasspath)
 
   javadoc {

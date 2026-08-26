@@ -106,7 +106,8 @@ Apache Kafka's KIP-405 introduced tiered storage, where older log segments are m
 
 The diskless storage architecture introduces a **bypass layer** that intercepts storage operations in the `ReplicaManager` and routes them to Ursa instead of local logs.
 
-In this SNIP, diskless topics are handled by the ManagedLedger-based implementations `UrsaManagedLedgerWriter` / `UrsaManagedLedgerReader`.
+In this SNIP, diskless topics are handled by the Lakestream-backed implementations
+`UrsaLakestreamWriter` / `UrsaLakestreamReader`.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -180,8 +181,8 @@ In this SNIP, diskless topics are handled by the ManagedLedger-based implementat
 | Component | Responsibility |
 |-----------|----------------|
 | `DisklessStorageReplicaManagerSupport` | Entry point; partitions requests between diskless and classic paths |
-| `UrsaManagedLedgerWriter` | Write path for diskless topics; appends records via ManagedLedger |
-| `UrsaManagedLedgerReader` | Read path for diskless topics; handles Fetch and ListOffsets via ManagedLedger |
+| `UrsaLakestreamWriter` | Write path for diskless topics; appends records to a Lakestream log |
+| `UrsaLakestreamReader` | Read path for diskless topics; handles Fetch and ListOffsets via a Lakestream log |
 | `UrsaStorageState` | Manages stream IDs, offset tracking, and shared state |
 | `UrsaProducerStateStore` | Persists producer state to Oxia for idempotent semantics |
 | `UrsaStorageConfig` | Configuration holder for Ursa settings |
@@ -202,14 +203,14 @@ ReplicaManager.appendRecords()
        │         ├──▶ directEntries (diskless topics)
        │         │         │
        │         │         ▼
-       │         │    UrsaManagedLedgerWriter.write()
+       │         │    UrsaLakestreamWriter.write()
        │         │         │
        │         │         ├──▶ ProducerStateStore.validate()     ◄── Oxia
        │         │         │         (sequence validation)
        │         │         │
-       │         │         ├──▶ UrsaStorageState.getOrCreateManagedLedger()
+       │         │         ├──▶ UrsaStorageState.getOrCreatePartitionLog()
        │         │         │
-       │         │         ├──▶ ManagedLedger.asyncAddEntry(data, numberOfMessages)
+       │         │         ├──▶ Log.append(numberOfMessages, data)
        │         │         │
        │         │         └──▶ ProducerStateStore.updateAfterWrite()
        │         │
@@ -223,8 +224,8 @@ ReplicaManager.appendRecords()
 ```
 
 **Key Async Changes**:
-- `UrsaManagedLedgerWriter.write()` returns `CompletableFuture<Map<TopicIdPartition, PartitionResponse>>`
-- ManagedLedger append operations are non-blocking (`asyncAddEntry`)
+- `UrsaLakestreamWriter.write()` returns `CompletableFuture<Map<TopicIdPartition, PartitionResponse>>`
+- Lakestream append operations are non-blocking (`Log.append`)
 - Producer state validation and updates are async operations to Oxia
 - Callback composition using `thenCompose` and `whenComplete`
 
@@ -260,8 +261,8 @@ We make two complementary changes:
 
 2. **Per-partition Sequenced Writes for Non-idempotent Appends**:
    - Non-idempotent producers reuse the broker's per-partition sequenced write queue instead of a dedicated pipeline object.
-   - Each write is validated before append submission, then handed off to `ManagedLedger.asyncAddEntry()`.
-   - Once the append is submitted to ManagedLedger, the next queued write for that partition may be submitted, which preserves submission order without a separate configurable pipeline.
+   - Each write is validated before append submission, then handed off to `Log.append()`.
+   - Once the append is submitted to the Lakestream log, the next queued write for that partition may be submitted, which preserves submission order without a separate configurable pipeline.
 
 #### Threading Model (What Runs Where)
 
@@ -288,11 +289,11 @@ ReplicaManager.fetchMessages()
        │         ├──▶ directFetches (diskless topics)
        │         │         │
        │         │         ▼
-       │         │    UrsaManagedLedgerReader.fetch()
+       │         │    UrsaLakestreamReader.fetch()
        │         │         │
-       │         │         ├──▶ UrsaStorageState.getOrCreateManagedLedger()
+       │         │         ├──▶ UrsaStorageState.getOrCreatePartitionLog()
        │         │         │
-       │         │         ├──▶ ManagedCursor.asyncReadEntries()
+       │         │         ├──▶ LogCursor.readEntries()
        │         │         │
        │         │         └──▶ Convert entries to MemoryRecords
        │         │               (patch baseOffset = entryId)
@@ -307,8 +308,8 @@ ReplicaManager.fetchMessages()
 ```
 
 **Offset Handling**:
-- ManagedLedger entries use `entryId` as the base offset (and may contain multiple Kafka records)
-- `UrsaManagedLedgerReader` patches the `baseOffset` of fetched record batches to match `entryId`
+- Lakestream entries use their log offset as the base offset (and may contain multiple Kafka records)
+- `UrsaLakestreamReader` patches the `baseOffset` of fetched record batches to match the log-entry offset
 - This ensures consumers see consistent offsets regardless of storage backend
 
 #### ListOffsets Path
@@ -333,7 +334,7 @@ ReplicaManager.fetchOffset()
        │         │              DisklessStorageReplicaManagerSupport.handleListOffsets()
        │         │                   │
        │         │                   ▼
-       │         │              UrsaManagedLedgerReader.listOffsets()
+       │         │              UrsaLakestreamReader.listOffsets()
        │         │                   │
        │         │                   ├──▶ EARLIEST (-2): getFirstPosition()
        │         │                   │
@@ -355,7 +356,7 @@ ReplicaManager.fetchOffset()
 
 | Timestamp Value | Meaning | Diskless Behavior |
 |-----------------|---------|-------------------|
-| `-2` (EARLIEST) | First available offset | Returns earliest ManagedLedger position (offset) |
+| `-2` (EARLIEST) | First available offset | Returns the first available Lakestream log offset |
 | `-1` (LATEST) | High watermark | Returns high watermark derived from the last confirmed entry |
 | `-3` (MAX_TIMESTAMP) | Offset with highest timestamp | Returns last message offset and publishTime (if available) |
 | `-4` (EARLIEST_LOCAL) | First local offset | Same as EARLIEST for diskless (no local/remote distinction) |
@@ -368,7 +369,7 @@ ReplicaManager.fetchOffset()
    - Duplicate partition check → `INVALID_REQUEST`
    - Unsupported timestamp for protocol version → `UNSUPPORTED_VERSION`
 
-2. **EARLIEST/LATEST Optimization**: EARLIEST/LATEST are served from ManagedLedger positions (first position and last confirmed entry).
+2. **EARLIEST/LATEST Optimization**: EARLIEST/LATEST are served from the first and last Lakestream log offsets.
 
 3. **Timestamp Search**: Uses publishTime to narrow the candidate start entry (binary search), then scans Kafka records to compare actual record timestamps.
 
@@ -432,9 +433,10 @@ No protocol changes required.
 | `ursa.storage.enable` | boolean | `false` | Master toggle for Ursa storage mode |
 | `ursa.storage.topic.default.enable` | boolean | `false` | Enable diskless storage for topics by default |
 | `ursa.storage.oxia.service.url` | string | `localhost:6648` | Oxia service URL for metadata |
-| `pulsar.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for Pulsar-managed ledger metadata (format: `oxia://host:port/[namespace]`) |
+| `ursa.catalog.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for the Ursa log catalog (format: `oxia://host:port/[namespace]`) |
+| `pulsar.oxia.service.url` | string | `oxia://localhost:6648/default` | Deprecated compatibility alias for `ursa.catalog.oxia.service.url` |
 | `ursa.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for Ursa storage metadata (format: `oxia://host:port/[namespace]`) |
-| `ursa.storage.backend.type` | string | `LOCAL` | Storage backend: `LOCAL`, `S3`, `GCS`, `AZURE_BLOB` (`AZUREBLOB` is also accepted for compatibility) |
+| `ursa.storage.backend.type` | string | `LOCAL` | Storage backend: `LOCAL`, `S3`, `GCS`, `AZURE_BLOB` (`AZUREBLOB` is also accepted for compatibility). Azure compaction requires an HNS-enabled account because compacted files use ABFS. |
 | `ursa.storage.path` | string | `/tmp/ursa-data` | Local storage path for `LOCAL`, or the remote object prefix for `S3`/`GCS`/Azure Blob |
 | `ursa.storage.compaction.prefix` | string | `/tmp/compaction-data` | Compaction output prefix for remote object storage backends |
 | `ursa.storage.namespace` | string | `default` | Namespace for Ursa streams |
@@ -447,9 +449,12 @@ No protocol changes required.
 | `ursa.storage.s3.endpoint` | string | `""` | Remote object storage endpoint URL. Reused as an endpoint override for GCS/Azure-compatible deployments |
 | `ursa.storage.s3.bucket` | string | `kafka-ursa-storage` | Remote object storage bucket or container name. Reused for GCS/Azure backends |
 | `ursa.storage.compaction.bucket` | string | `kafka-ursa-storage` | Remote object storage bucket or container name for compaction output |
+| `ursa.storage.external.reader.factory.class` | string | `io.streamnative.ursa.lakestream.reader.NoopCompactedObjectReaderFactory` | Compacted-object reader factory. Use `io.streamnative.ursa.kafka.reader.KafkaLakehouseReaderFactory` for Kafka V2 Parquet output. |
 | `ursa.storage.s3.region` | string | `us-east-1` | Remote object storage region when the selected backend uses one |
 | `ursa.storage.s3.access.key` | string | `""` | S3 access key |
 | `ursa.storage.s3.secret.key` | string | `""` | S3 secret key |
+| `ursa.storage.s3.session.token` | password | `""` | Optional session token for temporary S3 credentials |
+| `ursa.storage.s3.path.style.access` | boolean | unset | Explicit S3 path-style override for compacted-object reads; custom endpoints default to path-style access |
 | `socket.server.enable.request.pipelining` | boolean | `false` | Allow multiple in-flight requests per connection; preserves response order but reduces latency amplification for diskless produces |
 
 **Diskless Performance Recommendation**:
@@ -595,9 +600,8 @@ return validateBeforeWrite(tp, records)
         if (validationError != null) {
             return CompletableFuture.completedFuture(errorResponse);
         }
-        return state.getOrCreateManagedLedger(tp)
-            .thenCompose(ledger -> addEntryAsync(ledger, data, numberOfMessages))
-            .thenCompose(position -> updateStateAfterWrite(tp, records, position.getEntryId(), logAppendTime));
+        return state.getOrCreatePartitionLog(tp)
+            .write(records, zone, writerName);
     })
     .exceptionally(e -> errorResponse);
 ```
@@ -642,6 +646,9 @@ For diskless topics:
 Diskless topics support **external compaction** via the Ursa compactor. In this mode, the compactor runs as a separate container and performs offline batch processing of WAL data, materializing it into Parquet files for efficient storage and analytical querying.
 
 This external compaction is **not** Kafka key/value log compaction and does **not** change consumer semantics for diskless topics. Kafka-side K/V log compaction remains unsupported for diskless topics (see **Limitations** → **No K/V Compaction**).
+
+The broker-side Kafka-only reader supports the V2 `KAFKA_BATCHED_RAW_PARQUET` format produced by this integration. It fails fast for legacy V1 lakehouse indexes instead of loading the legacy generic materialization runtime into Kafka.
+
 **Architecture**:
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐

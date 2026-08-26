@@ -19,39 +19,37 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 
 /**
- * Pulsar-compatible naming convention used by the Lakestream catalog for Kafka diskless topics.
+ * Stable Lakestream catalog naming for Kafka diskless partition logs.
  *
- * <p>Note: ursa-for-kafka does not have tenant/namespace concepts today. We use a fixed
- * {@code public/default/persistent} naming to ensure Oxia topic discovery via {@code /managed-ledgers}.
+ * <p>The namespace components and legacy Oxia metadata prefix are persisted compatibility contracts.
+ * Changing them would make existing partition logs appear missing.
  */
-public final class KafkaManagedLedgerNaming {
+public final class KafkaLogNaming {
 
     public static final String TENANT = "public";
     public static final String NAMESPACE = "default";
     public static final String DOMAIN = "persistent";
 
-    public static final String MANAGED_LEDGER_PREFIX = "/managed-ledgers/";
+    public static final String LEGACY_CATALOG_METADATA_PREFIX = "/managed-ledgers/";
 
-    private KafkaManagedLedgerNaming() {
+    private KafkaLogNaming() {
     }
 
     /**
      * Stable key passed to the Lakestream stream-ID generator.
-     *
-     * <p>The Oxia metadata key will be {@code /managed-ledgers/ + name}.
      */
-    public static String managedLedgerName(TopicIdPartition tp) {
-        return managedLedgerName(tp.topic(), tp.partition());
+    public static String logName(TopicIdPartition tp) {
+        return logName(tp.topic(), tp.partition());
     }
 
-    public static String managedLedgerName(String topic, int partition) {
+    public static String logName(String topic, int partition) {
         return TENANT + "/" + NAMESPACE + "/" + DOMAIN + "/" + topic + "-partition-" + partition;
     }
 
     /**
      * Oxia catalog metadata key for the partition log.
      */
-    public static String managedLedgerMetadataPath(TopicIdPartition tp) {
-        return MANAGED_LEDGER_PREFIX + managedLedgerName(tp);
+    public static String logMetadataPath(TopicIdPartition tp) {
+        return LEGACY_CATALOG_METADATA_PREFIX + logName(tp);
     }
 }

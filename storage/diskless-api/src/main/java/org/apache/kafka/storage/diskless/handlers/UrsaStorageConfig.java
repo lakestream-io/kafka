@@ -30,11 +30,10 @@ public class UrsaStorageConfig {
 
     private final boolean enabled;
     /**
-     * The metadata store URL used for Pulsar's metadata store:
-     * 1. Lakestream catalog: used for Ursa storage to store log metadata
-     * 2. {@link org.apache.kafka.storage.diskless.UrsaPartitionedTopicsMetadataSync}
+     * The metadata store URL used by the Lakestream catalog and
+     * {@link org.apache.kafka.storage.diskless.UrsaPartitionedTopicsMetadataSync}.
      */
-    private final String pulsarOxiaServiceUrl;
+    private final String catalogOxiaServiceUrl;
 
     // The metadata store URL used for Ursa storage, e.g. the offset generation
     private final String ursaOxiaServiceUrl;
@@ -48,20 +47,19 @@ public class UrsaStorageConfig {
     private final String s3Endpoint;
     private final String s3AccessKey;
     private final String s3SecretKey;
+    private final String s3SessionToken;
+    private final Boolean s3PathStyleAccess;
     private final String s3Bucket;
     private final String compactionBucket;
     private final String s3Region;
     private final String externalReaderFactoryClass;
-    private final String kopSchemaRegistryUrl;
-    private final String kopSchemaRegistryHttpHeaderAuthorization;
-    private final String kopSchemaRegistryHttpHeaderAuthorizationFile;
     private final long producerStateSnapshotIntervalMs;
     private final int producerStateSnapshotRecordThreshold;
     private final String classPath;
 
     @SuppressWarnings("checkstyle:ParameterNumber")
     private UrsaStorageConfig(boolean enabled,
-                              String pulsarOxiaServiceUrl,
+                              String catalogOxiaServiceUrl,
                               String ursaOxiaServiceUrl,
                               String backendType,
                               String storagePath,
@@ -72,19 +70,18 @@ public class UrsaStorageConfig {
                               String s3Endpoint,
                               String s3AccessKey,
                               String s3SecretKey,
+                              String s3SessionToken,
+                              Boolean s3PathStyleAccess,
                               String s3Bucket,
                               String compactionBucket,
                               String s3Region,
                               String externalReaderFactoryClass,
-                              String kopSchemaRegistryUrl,
-                              String kopSchemaRegistryHttpHeaderAuthorization,
-                              String kopSchemaRegistryHttpHeaderAuthorizationFile,
                               long producerStateSnapshotIntervalMs,
                               int producerStateSnapshotRecordThreshold,
                               String classPath) {
 
         this.enabled = enabled;
-        this.pulsarOxiaServiceUrl = pulsarOxiaServiceUrl;
+        this.catalogOxiaServiceUrl = catalogOxiaServiceUrl;
         this.ursaOxiaServiceUrl = ursaOxiaServiceUrl;
         this.backendType = backendType;
         this.storagePath = storagePath;
@@ -95,13 +92,12 @@ public class UrsaStorageConfig {
         this.s3Endpoint = s3Endpoint;
         this.s3AccessKey = s3AccessKey;
         this.s3SecretKey = s3SecretKey;
+        this.s3SessionToken = s3SessionToken;
+        this.s3PathStyleAccess = s3PathStyleAccess;
         this.s3Bucket = s3Bucket;
         this.compactionBucket = compactionBucket;
         this.s3Region = s3Region;
         this.externalReaderFactoryClass = externalReaderFactoryClass;
-        this.kopSchemaRegistryUrl = kopSchemaRegistryUrl;
-        this.kopSchemaRegistryHttpHeaderAuthorization = kopSchemaRegistryHttpHeaderAuthorization;
-        this.kopSchemaRegistryHttpHeaderAuthorizationFile = kopSchemaRegistryHttpHeaderAuthorizationFile;
         this.producerStateSnapshotIntervalMs = producerStateSnapshotIntervalMs;
         this.producerStateSnapshotRecordThreshold = producerStateSnapshotRecordThreshold;
         this.classPath = classPath;
@@ -123,7 +119,10 @@ public class UrsaStorageConfig {
                 ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT);
         final var defaultOxiaServiceUrl = "oxia://" + oxiaServiceUrl + "/" + namespace;
 
-        final var pulsarOxiaServiceUrl = getOxiaServiceUrlConfig(configs, ServerLogConfigs.PULSAR_OXIA_SERVICE_URL_CONFIG,
+        final var catalogOxiaServiceUrl = getAliasedOxiaServiceUrlConfig(
+                configs,
+                ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG,
+                ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG,
                 defaultOxiaServiceUrl);
         final var ursaOxiaServiceUrl = getOxiaServiceUrlConfig(configs, ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG,
                 defaultOxiaServiceUrl);
@@ -158,6 +157,12 @@ public class UrsaStorageConfig {
         String s3SecretKey = getStringConfig(configs, ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_CONFIG,
                 ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_DEFAULT);
 
+        String s3SessionToken = getOptionalStringConfig(configs,
+                ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_CONFIG);
+
+        Boolean s3PathStyleAccess = getOptionalBooleanConfig(configs,
+                ServerLogConfigs.URSA_STORAGE_S3_PATH_STYLE_ACCESS_CONFIG);
+
         String s3Bucket = getStringConfig(configs, ServerLogConfigs.URSA_STORAGE_S3_BUCKET_CONFIG,
                 ServerLogConfigs.URSA_STORAGE_S3_BUCKET_DEFAULT);
 
@@ -170,15 +175,6 @@ public class UrsaStorageConfig {
         String externalReaderFactoryClass = getOptionalStringConfig(configs,
                 ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG);
 
-        String kopSchemaRegistryUrl = getOptionalStringConfig(configs,
-                ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_CONFIG);
-
-        String kopSchemaRegistryHttpHeaderAuthorization = getOptionalStringConfig(configs,
-                ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_CONFIG);
-
-        String kopSchemaRegistryHttpHeaderAuthorizationFile = getOptionalStringConfig(configs,
-                ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_CONFIG);
-
         long producerStateSnapshotIntervalMs = getLongConfig(configs,
                 ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_CONFIG,
                 ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_DEFAULT);
@@ -188,12 +184,11 @@ public class UrsaStorageConfig {
                 ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_RECORD_THRESHOLD_DEFAULT);
         String classPath = getOptionalStringConfig(configs, ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG);
 
-        return new UrsaStorageConfig(enabled, pulsarOxiaServiceUrl, ursaOxiaServiceUrl,
+        return new UrsaStorageConfig(enabled, catalogOxiaServiceUrl, ursaOxiaServiceUrl,
                 backendType, storagePath, compactionPrefix,
                 writeBufferFlushIntervalMs, writeBufferSize, writeBufferFlushSize,
-                s3Endpoint, s3AccessKey, s3SecretKey, s3Bucket, compactionBucket, s3Region,
-                externalReaderFactoryClass, kopSchemaRegistryUrl, kopSchemaRegistryHttpHeaderAuthorization,
-                kopSchemaRegistryHttpHeaderAuthorizationFile,
+                s3Endpoint, s3AccessKey, s3SecretKey, s3SessionToken, s3PathStyleAccess,
+                s3Bucket, compactionBucket, s3Region, externalReaderFactoryClass,
                 producerStateSnapshotIntervalMs, producerStateSnapshotRecordThreshold, classPath
         );
     }
@@ -217,6 +212,11 @@ public class UrsaStorageConfig {
         return stringValue.isBlank() ? null : stringValue;
     }
 
+    private static Boolean getOptionalBooleanConfig(Map<String, ?> configs, String key) {
+        Object value = configs.get(key);
+        return value == null ? null : Boolean.valueOf(String.valueOf(value));
+    }
+
     private static long getLongConfig(Map<String, ?> configs, String key, long defaultValue) {
         Object value = configs.get(key);
         return value != null ? Long.parseLong(String.valueOf(value)) : defaultValue;
@@ -232,12 +232,24 @@ public class UrsaStorageConfig {
         return value != null ? String.valueOf(value) : defaultValue;
     }
 
+    private static String getAliasedOxiaServiceUrlConfig(
+            Map<String, ?> configs,
+            String primaryKey,
+            String legacyKey,
+            String defaultValue) {
+        Object value = configs.get(primaryKey);
+        if (value == null) {
+            value = configs.get(legacyKey);
+        }
+        return value != null ? String.valueOf(value) : defaultValue;
+    }
+
     public boolean isEnabled() {
         return enabled;
     }
 
-    public String getPulsarOxiaServiceUrl() {
-        return pulsarOxiaServiceUrl;
+    public String getCatalogOxiaServiceUrl() {
+        return catalogOxiaServiceUrl;
     }
 
     public String getUrsaOxiaServiceUrl() {
@@ -280,6 +292,14 @@ public class UrsaStorageConfig {
         return s3SecretKey;
     }
 
+    public String getS3SessionToken() {
+        return s3SessionToken;
+    }
+
+    public Boolean getS3PathStyleAccess() {
+        return s3PathStyleAccess;
+    }
+
     public String getS3Bucket() {
         return s3Bucket;
     }
@@ -298,18 +318,6 @@ public class UrsaStorageConfig {
 
     public String getConfiguredExternalReaderFactoryClass() {
         return externalReaderFactoryClass;
-    }
-
-    public String getKopSchemaRegistryUrl() {
-        return kopSchemaRegistryUrl;
-    }
-
-    public String getKopSchemaRegistryHttpHeaderAuthorization() {
-        return kopSchemaRegistryHttpHeaderAuthorization;
-    }
-
-    public String getKopSchemaRegistryHttpHeaderAuthorizationFile() {
-        return kopSchemaRegistryHttpHeaderAuthorizationFile;
     }
 
     public long getProducerStateSnapshotIntervalMs() {

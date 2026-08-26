@@ -346,7 +346,7 @@ class BrokerServer(
        */
       val defaultActionQueue = new DelayedActionQueue
 
-      val ursaStorageConfig = UrsaStorageConfig.fromConfigs(config.props.asInstanceOf[util.Map[String, _]])
+      val ursaStorageConfig = UrsaStorageConfig.fromConfigs(config.originals().asInstanceOf[util.Map[String, _]])
       val disklessStorageSupport = new DisklessStorageReplicaManagerSupport(
         time,
         config.brokerId,

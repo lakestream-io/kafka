@@ -142,9 +142,6 @@
 	        <allow pkg="io.oxia.client.api" />
 	        <allow pkg="io.opentelemetry.api" />
 	        <allow pkg="io.opentelemetry.sdk" />
-	        <allow pkg="org.apache.pulsar.common" />
-	        <allow pkg="org.apache.pulsar.broker" />
-	        <allow pkg="org.apache.pulsar.metadata" />
 	    </subpackage>
 
     <!-- START OF TIERED STORAGE INTEGRATION TEST IMPORT DEPENDENCIES -->

@@ -44,6 +44,7 @@ import io.streamnative.ursa.lakestream.impl.IndexedStreamCatalog;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anySet;
@@ -58,13 +59,10 @@ class LakestreamStorageHolderTest {
 
     private static final String SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP = "ursa.externalReaderFactoryClass";
     private static final String EXTERNAL_READER_FACTORY_CLASS_PROP = "externalReaderFactoryClass";
-    private static final String NOOP_EXTERNAL_READER_FACTORY_CLASS =
-            "io.streamnative.ursa.lakestream.reader.NoopCompactedObjectReaderFactory";
-    private static final String SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP = "kopSchemaRegistryUrl";
-    private static final String SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP =
-            "kopSchemaRegistryHttpHeaderAuthorization";
-    private static final String SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP =
-            "kopSchemaRegistryHttpHeaderAuthorizationFile";
+    private static final String KAFKA_LAKEHOUSE_READER_FACTORY_CLASS =
+            "io.streamnative.ursa.kafka.reader.KafkaLakehouseReaderFactory";
+    private static final String LEGACY_LAKEHOUSE_READER_FACTORY_CLASS =
+            "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory";
 
     @BeforeEach
     void setUp() {
@@ -78,9 +76,6 @@ class LakestreamStorageHolderTest {
 
     private static void clearSystemProperties() {
         System.clearProperty(SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP);
-        System.clearProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP);
-        System.clearProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP);
-        System.clearProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP);
         System.clearProperty("otel.service.name");
         System.clearProperty("otel.metrics.exporter");
         System.clearProperty("otel.traces.exporter");
@@ -89,98 +84,44 @@ class LakestreamStorageHolderTest {
     }
 
     @Test
-    void testDoesNotInjectSchemaRegistryConfigWhenExternalReaderFactoryIsNoop() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of());
-
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP, "http://example:8001");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP, "Bearer token");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP, "/mnt/secrets/token");
+    void testUsesNeutralOxiaStorageProperty() throws Exception {
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
+                ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG, "oxia://storage:6648/kafka"
+        ));
 
         Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
 
-        assertEquals(NOOP_EXTERNAL_READER_FACTORY_CLASS, properties.getProperty(EXTERNAL_READER_FACTORY_CLASS_PROP));
-        assertFalse(properties.containsKey(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP));
-        assertFalse(properties.containsKey(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP));
-        assertFalse(properties.containsKey(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP));
+        assertEquals("oxia://storage:6648/kafka", properties.getProperty("oxiaStorageUrl"));
     }
 
     @Test
-    void testInjectsSchemaRegistryAuthorizationWhenExternalReaderEnabled() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of());
-
-        System.setProperty(SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP,
-                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP, "http://example:8001");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP, "Bearer token");
-
-        Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
-
-        assertEquals(
-                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory",
-                properties.getProperty(EXTERNAL_READER_FACTORY_CLASS_PROP));
-        assertEquals("http://example:8001", properties.getProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP));
-        assertEquals("Bearer token", properties.getProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP));
-        assertFalse(properties.containsKey(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP));
-    }
-
-    @Test
-    void testAuthorizationFileTakesPrecedenceOverAuthorizationValue() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of());
-
-        System.setProperty(SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP,
-                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP, "http://example:8001");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP, "Bearer token");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP, "/mnt/secrets/token");
-
-        Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
-
-        assertEquals("http://example:8001", properties.getProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP));
-        assertEquals(
-                "/mnt/secrets/token",
-                properties.getProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP));
-        assertFalse(properties.containsKey(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP));
-    }
-
-    @Test
-    void testBlankAuthorizationIsIgnored() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of());
-
-        System.setProperty(SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP,
-                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP, "http://example:8001");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP, "   ");
-
-        Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
-
-        assertEquals("http://example:8001", properties.getProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP));
-        assertFalse(properties.containsKey(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP));
-        assertFalse(properties.containsKey(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP));
-    }
-
-    @Test
-    void testBrokerConfigOverridesLegacySystemPropertyFallback() throws Exception {
+    void testMapsLegacyLakehouseReaderFactoryToKafkaOnlyReader() throws Exception {
         UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
                 ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG,
-                        "io.streamnative.ursa.lakehouse.reader.ConfigReaderFactory",
-                ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_CONFIG, "http://config:8001",
-                ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_CONFIG,
-                        "Bearer config-token"
+                LEGACY_LAKEHOUSE_READER_FACTORY_CLASS
+        ));
+
+        Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
+
+        assertEquals(
+                KAFKA_LAKEHOUSE_READER_FACTORY_CLASS,
+                properties.getProperty(EXTERNAL_READER_FACTORY_CLASS_PROP));
+    }
+
+    @Test
+    void testBrokerReaderFactoryConfigOverridesLegacySystemPropertyFallback() throws Exception {
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
+                ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG,
+                        "io.streamnative.ursa.lakehouse.reader.ConfigReaderFactory"
         ));
         System.setProperty(SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP,
                 "io.streamnative.ursa.lakehouse.reader.LegacyReaderFactory");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP, "http://legacy:8001");
-        System.setProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP, "Bearer legacy-token");
 
         Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
 
         assertEquals(
                 "io.streamnative.ursa.lakehouse.reader.ConfigReaderFactory",
                 properties.getProperty(EXTERNAL_READER_FACTORY_CLASS_PROP));
-        assertEquals("http://config:8001", properties.getProperty(SYSTEM_KOP_SCHEMA_REGISTRY_URL_PROP));
-        assertEquals(
-                "Bearer config-token",
-                properties.getProperty(SYSTEM_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP));
     }
 
     @Test
@@ -219,7 +160,9 @@ class LakestreamStorageHolderTest {
                 ServerLogConfigs.URSA_STORAGE_S3_BUCKET_CONFIG, "s3-bucket",
                 ServerLogConfigs.URSA_STORAGE_S3_REGION_CONFIG, "us-east-1",
                 ServerLogConfigs.URSA_STORAGE_S3_ACCESS_KEY_CONFIG, "access",
-                ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_CONFIG, "secret"
+                ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_CONFIG, "secret",
+                ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_CONFIG, "session",
+                ServerLogConfigs.URSA_STORAGE_S3_PATH_STYLE_ACCESS_CONFIG, "false"
         ));
 
         Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
@@ -227,6 +170,8 @@ class LakestreamStorageHolderTest {
         assertEquals("S3", properties.getProperty("backendStorageType"));
         assertEquals("access", properties.getProperty("s3AccessKeyId"));
         assertEquals("secret", properties.getProperty("s3SecretAccessKey"));
+        assertEquals("session", properties.getProperty("s3SessionToken"));
+        assertEquals("false", properties.getProperty("s3PathStyleAccess"));
         assertEquals("s3-bucket", properties.getProperty("s3Bucket"));
         assertEquals("s3-prefix", properties.getProperty("s3Prefix"));
         assertEquals("us-east-1", properties.getProperty("s3Region"));
@@ -464,7 +409,7 @@ class LakestreamStorageHolderTest {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         AsyncOxiaClient catalogOxiaClient = mock(AsyncOxiaClient.class);
         AsyncOxiaClient producerStateOxiaClient = mock(AsyncOxiaClient.class);
-        String metadataPath = KafkaManagedLedgerNaming.managedLedgerMetadataPath(tp);
+        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
 
         when(catalog.getOxiaClient()).thenReturn(catalogOxiaClient);
         when(catalogOxiaClient.get(metadataPath)).thenReturn(CompletableFuture.completedFuture(null));
@@ -489,13 +434,13 @@ class LakestreamStorageHolderTest {
         AsyncOxiaClient producerStateOxiaClient = mock(AsyncOxiaClient.class);
         GetResult metadata = mock(GetResult.class);
         Log log = mock(Log.class);
-        String metadataPath = KafkaManagedLedgerNaming.managedLedgerMetadataPath(tp);
-        String managedLedgerName = KafkaManagedLedgerNaming.managedLedgerName(tp);
+        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
+        String logName = KafkaLogNaming.logName(tp);
 
         when(catalog.getOxiaClient()).thenReturn(catalogOxiaClient);
         when(catalogOxiaClient.get(metadataPath)).thenReturn(CompletableFuture.completedFuture(metadata));
         when(metadata.value()).thenReturn("{\"streamId\":42}".getBytes(StandardCharsets.UTF_8));
-        when(catalog.createLog(LogId.of(42L))).thenReturn(log);
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(42L))).thenReturn(log);
         when(log.delete()).thenReturn(CompletableFuture.completedFuture(null));
         when(producerStateOxiaClient.delete(anyString(), anySet()))
                 .thenReturn(CompletableFuture.completedFuture(true));
@@ -509,8 +454,59 @@ class LakestreamStorageHolderTest {
         deletionOrder.verify(log).close();
         deletionOrder.verify(catalogOxiaClient).delete(metadataPath);
         deletionOrder.verify(producerStateOxiaClient).delete(
-                eq("/stream-id-generator/" + managedLedgerName),
+                eq("/stream-id-generator/" + logName),
                 anySet());
+    }
+
+    @Test
+    void testPartitionDeletionClosesResolvedLogWhenDeleteThrowsSynchronously() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("delete-topic", 3));
+        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        AsyncOxiaClient catalogOxiaClient = mock(AsyncOxiaClient.class);
+        AsyncOxiaClient producerStateOxiaClient = mock(AsyncOxiaClient.class);
+        GetResult metadata = mock(GetResult.class);
+        Log log = mock(Log.class);
+        RuntimeException deleteError = new RuntimeException("delete failed");
+        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
+
+        when(catalog.getOxiaClient()).thenReturn(catalogOxiaClient);
+        when(catalogOxiaClient.get(metadataPath)).thenReturn(CompletableFuture.completedFuture(metadata));
+        when(metadata.value()).thenReturn("{\"streamId\":42}".getBytes(StandardCharsets.UTF_8));
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(42L))).thenReturn(log);
+        when(log.delete()).thenThrow(deleteError);
+
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, producerStateOxiaClient, null);
+
+        ExecutionException result = assertThrows(ExecutionException.class, () -> holder.deletePartitionData(tp).get());
+        assertSame(deleteError, result.getCause());
+        verify(log).close();
+        verify(catalogOxiaClient, never()).delete(anyString());
+        verify(producerStateOxiaClient, never()).delete(anyString(), anySet());
+    }
+
+    @Test
+    void testPartitionDeletionClosesResolvedLogWhenDeleteReturnsNull() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("delete-topic", 3));
+        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        AsyncOxiaClient catalogOxiaClient = mock(AsyncOxiaClient.class);
+        AsyncOxiaClient producerStateOxiaClient = mock(AsyncOxiaClient.class);
+        GetResult metadata = mock(GetResult.class);
+        Log log = mock(Log.class);
+        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
+
+        when(catalog.getOxiaClient()).thenReturn(catalogOxiaClient);
+        when(catalogOxiaClient.get(metadataPath)).thenReturn(CompletableFuture.completedFuture(metadata));
+        when(metadata.value()).thenReturn("{\"streamId\":42}".getBytes(StandardCharsets.UTF_8));
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(42L))).thenReturn(log);
+        when(log.delete()).thenReturn(null);
+
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, producerStateOxiaClient, null);
+
+        ExecutionException result = assertThrows(ExecutionException.class, () -> holder.deletePartitionData(tp).get());
+        assertInstanceOf(IllegalStateException.class, result.getCause());
+        verify(log).close();
+        verify(catalogOxiaClient, never()).delete(anyString());
+        verify(producerStateOxiaClient, never()).delete(anyString(), anySet());
     }
 
     @Test
@@ -519,7 +515,7 @@ class LakestreamStorageHolderTest {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         AsyncOxiaClient catalogOxiaClient = mock(AsyncOxiaClient.class);
         AsyncOxiaClient producerStateOxiaClient = mock(AsyncOxiaClient.class);
-        String metadataPath = KafkaManagedLedgerNaming.managedLedgerMetadataPath(tp);
+        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
 
         when(catalog.getOxiaClient()).thenReturn(catalogOxiaClient);
         when(catalogOxiaClient.get(metadataPath)).thenReturn(CompletableFuture.completedFuture(null));
@@ -573,7 +569,7 @@ class LakestreamStorageHolderTest {
         ));
 
         System.setProperty(SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP,
-                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory");
+                KAFKA_LAKEHOUSE_READER_FACTORY_CLASS);
 
         Properties properties = LakestreamStorageHolder.buildStorageProperties(config);
 
@@ -582,7 +578,7 @@ class LakestreamStorageHolderTest {
         assertEquals("azure-prefix", properties.getProperty("prefix"));
         assertEquals("unused-region", properties.getProperty("region"));
         assertEquals("https://account.blob.core.windows.net", properties.getProperty("cloudStorageEndpoint"));
-        assertEquals("AZUREBLOB", properties.getProperty("compactionBackendStorageType"));
+        assertEquals("AZUREDFS", properties.getProperty("compactionBackendStorageType"));
         assertEquals("account@container", properties.getProperty("compactionBucket"));
         assertEquals("/tmp/compaction-data", properties.getProperty("compactionPrefix"));
         assertEquals("unused-region", properties.getProperty("compactionBucketRegion"));

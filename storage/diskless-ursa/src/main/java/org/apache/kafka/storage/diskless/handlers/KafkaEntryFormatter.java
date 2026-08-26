@@ -22,169 +22,242 @@ import org.apache.kafka.common.record.internal.Record;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.storage.diskless.handlers.RecordAnalyzer.RecordAnalysisResult;
 
-import org.apache.pulsar.common.api.proto.MarkerType;
-import org.apache.pulsar.common.api.proto.MessageMetadata;
-import org.apache.pulsar.common.protocol.Commands;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 /**
- * Utility class for encoding and decoding Kafka records with Pulsar MessageMetadata.
- * This enables Ursa storage compaction to work with Kafka records by providing
- * the necessary metadata (producer info, sequence numbers, etc.).
+ * Encodes Kafka record batches in the storage envelope consumed by existing Ursa compactors.
+ *
+ * <p>The envelope is intentionally implemented without a dependency on a messaging protocol runtime. Its metadata
+ * field numbers are a persisted compatibility contract, so existing WAL entries and compacted objects remain
+ * readable while Kafka's Ursa plugin stays self-contained.
  */
 public final class KafkaEntryFormatter {
 
-    private static final Logger log = LoggerFactory.getLogger(KafkaEntryFormatter.class);
-
-    // Property key-value to identify entries as Kafka format
     public static final String ENTRY_FORMAT_KEY = "entry.format";
     public static final String ENTRY_FORMAT_VALUE = "kafka";
+
+    private static final int PRODUCER_NAME_FIELD = 1;
+    private static final int SEQUENCE_ID_FIELD = 2;
+    private static final int PUBLISH_TIME_FIELD = 3;
+    private static final int PROPERTY_FIELD = 4;
+    private static final int NUMBER_OF_RECORDS_FIELD = 11;
+    private static final int MARKER_TYPE_FIELD = 20;
+    private static final int TRANSACTION_ID_LEAST_BITS_FIELD = 22;
+    private static final int TRANSACTION_ID_MOST_BITS_FIELD = 23;
+    private static final int HIGHEST_SEQUENCE_ID_FIELD = 24;
+
+    private static final int PROPERTY_KEY_FIELD = 1;
+    private static final int PROPERTY_VALUE_FIELD = 2;
+
+    private static final int VARINT_WIRE_TYPE = 0;
+    private static final int LENGTH_DELIMITED_WIRE_TYPE = 2;
+    private static final int TRANSACTION_COMMIT_MARKER = 21;
+    private static final String DEFAULT_PRODUCER_NAME = "kafka-producer";
 
     private KafkaEntryFormatter() {
     }
 
     /**
-     * Encodes Kafka MemoryRecords with MessageMetadata for Ursa storage.
-     * The encoded format is: [MessageMetadata][Kafka Records]
+     * Encodes Kafka records as {@code [metadata length][metadata][Kafka records]}.
      *
      * @param records the Kafka records to encode
      * @param analysisResult the analysis result containing metadata from the records
      * @return ByteBuf containing the encoded entry (caller must release)
      */
     public static ByteBuf encode(MemoryRecords records, RecordAnalysisResult analysisResult) {
-        ByteBuf recordsWrapper = Unpooled.wrappedBuffer(records.buffer());
-
-        MessageMetadata msgMetadata = buildMessageMetadata(records, analysisResult);
-
-        ByteBuf encoded = Commands.serializeMetadataAndPayload(
-                Commands.ChecksumType.None,
-                msgMetadata,
-                recordsWrapper);
-
-        recordsWrapper.release();
-
-        return encoded;
+        ByteBuf metadata = buildMetadata(records, analysisResult);
+        try {
+            ByteBuffer recordsBuffer = records.buffer().duplicate();
+            ByteBuf encoded = Unpooled.buffer(Integer.BYTES + metadata.readableBytes() + recordsBuffer.remaining());
+            encoded.writeInt(metadata.readableBytes());
+            encoded.writeBytes(metadata, metadata.readerIndex(), metadata.readableBytes());
+            encoded.writeBytes(recordsBuffer);
+            return encoded;
+        } finally {
+            metadata.release();
+        }
     }
 
     /**
-     * Decodes an entry to extract the Kafka records payload.
-     * The entry format is: [MessageMetadata][Kafka Records]
+     * Decodes an entry to extract its Kafka records payload.
      *
      * @param entry the ByteBuf containing the encoded entry
-     * @return ByteBuffer containing the Kafka records (the entry buffer should not be released by caller)
+     * @return a view containing the Kafka records; it remains valid only while the caller owns the entry buffer
      */
     public static ByteBuffer decode(ByteBuf entry) {
-        // Parse and skip the metadata, returning the payload
-        MessageMetadata metadata = Commands.parseMessageMetadata(entry);
-        if (log.isTraceEnabled()) {
-            log.trace("Decoded entry with metadata: numMessages={}, producerName={}, sequenceId={}",
-                    metadata.getNumMessagesInBatch(),
-                    metadata.hasProducerName() ? metadata.getProducerName() : "none",
-                    metadata.hasSequenceId() ? metadata.getSequenceId() : -1);
+        int readableBytes = entry.readableBytes();
+        if (readableBytes < Integer.BYTES) {
+            throw new IllegalArgumentException("Storage entry is too small to contain its metadata length");
         }
 
-        // The entry's reader index now points to the payload (Kafka records)
-        return entry.nioBuffer();
+        int metadataSize = entry.getInt(entry.readerIndex());
+        int payloadSize = readableBytes - Integer.BYTES - metadataSize;
+        if (metadataSize < 0 || payloadSize < 0) {
+            throw new IllegalArgumentException(
+                    "Invalid storage entry metadata size " + metadataSize + " for " + readableBytes + " bytes");
+        }
+
+        return entry.nioBuffer(entry.readerIndex() + Integer.BYTES + metadataSize, payloadSize);
     }
 
-    /**
-     * Builds MessageMetadata from Kafka records and analysis result.
-     */
-    private static MessageMetadata buildMessageMetadata(MemoryRecords records, RecordAnalysisResult analysisResult) {
-        MessageMetadata metadata = new MessageMetadata();
+    private static ByteBuf buildMetadata(MemoryRecords records, RecordAnalysisResult analysisResult) {
+        MetadataFields fields = metadataFields(records.firstBatch(), analysisResult);
+        ByteBuf metadata = Unpooled.buffer();
+        boolean success = false;
+        try {
+            writeStringField(metadata, PRODUCER_NAME_FIELD, fields.producerName());
+            writeVarintField(metadata, SEQUENCE_ID_FIELD, fields.sequenceId());
+            writeVarintField(metadata, PUBLISH_TIME_FIELD, fields.publishTime());
+            for (MetadataProperty property : fields.properties()) {
+                writeProperty(metadata, property);
+            }
+            writeVarintField(metadata, NUMBER_OF_RECORDS_FIELD, analysisResult.recordCount());
+            writeMarker(metadata, fields.markerType());
+            writeTransactionId(metadata, fields.includeTransactionId());
+            writeHighestSequenceId(metadata, fields.highestSequenceId());
+            success = true;
+            return metadata;
+        } finally {
+            if (!success) {
+                metadata.release();
+            }
+        }
+    }
 
-        // Mark as Kafka entry format
-        metadata.addProperty()
-                .setKey(ENTRY_FORMAT_KEY)
-                .setValue(ENTRY_FORMAT_VALUE);
-
-        // Set publish time (required field). Prefer Kafka max timestamp to align publishTime-based
-        // searches (ListOffsets/offsetsForTimes) with Kafka semantics; fall back to wall clock.
+    private static MetadataFields metadataFields(RecordBatch firstBatch, RecordAnalysisResult analysisResult) {
         long maxTimestamp = analysisResult.maxTimestamp();
-        metadata.setPublishTime(maxTimestamp >= 0 ? maxTimestamp : System.currentTimeMillis());
-
-        // Set number of messages
-        metadata.setNumMessagesInBatch(analysisResult.recordCount());
-
-        // Extract producer info from the first batch
-        RecordBatch firstBatch = records.firstBatch();
-        if (firstBatch != null) {
-            setProducerInfo(metadata, firstBatch);
-            attachTransactionInfo(metadata, records, firstBatch);
-        } else {
-            // Default values for required fields when no batch is present
-            metadata.setProducerName("kafka-producer");
-            metadata.setSequenceId(0);
+        long publishTime = maxTimestamp >= 0 ? maxTimestamp : System.currentTimeMillis();
+        List<MetadataProperty> properties = new ArrayList<>();
+        properties.add(new MetadataProperty(ENTRY_FORMAT_KEY, ENTRY_FORMAT_VALUE));
+        if (firstBatch == null) {
+            return new MetadataFields(DEFAULT_PRODUCER_NAME, 0, publishTime, properties, null, false, null);
         }
 
-        return metadata;
+        ProducerFields producerFields = producerFields(firstBatch);
+        TransactionFields transactionFields = transactionFields(firstBatch, properties);
+        return new MetadataFields(
+                producerFields.producerName(),
+                producerFields.sequenceId(),
+                publishTime,
+                properties,
+                transactionFields.markerType(),
+                transactionFields.includeTransactionId(),
+                producerFields.highestSequenceId());
     }
 
-    /**
-     * Sets producer information in the metadata from a record batch.
-     */
-    private static void setProducerInfo(MessageMetadata metadata, RecordBatch batch) {
-        if (batch.hasProducerId()) {
-            // Use producer ID as producer name for compaction
-            metadata.setProducerName(String.valueOf(batch.producerId()));
-
-            // Set sequence IDs for idempotent/transactional producers
-            if (batch.baseSequence() >= 0) {
-                metadata.setSequenceId(batch.baseSequence());
-            } else {
-                metadata.setSequenceId(0);
-            }
-            if (batch.lastSequence() >= 0) {
-                metadata.setHighestSequenceId(batch.lastSequence());
-            }
-        } else {
-            // Non-idempotent producer - use a placeholder
-            metadata.setProducerName("kafka-producer");
-            metadata.setSequenceId(0);
+    private static ProducerFields producerFields(RecordBatch batch) {
+        if (!batch.hasProducerId()) {
+            return new ProducerFields(DEFAULT_PRODUCER_NAME, 0, null);
         }
+        Long highestSequenceId = batch.lastSequence() >= 0 ? (long) batch.lastSequence() : null;
+        return new ProducerFields(
+                String.valueOf(batch.producerId()),
+                Math.max(batch.baseSequence(), 0),
+                highestSequenceId);
     }
 
-    /**
-     * Attaches transaction information to the metadata if applicable.
-     */
-    private static void attachTransactionInfo(MessageMetadata metadata, MemoryRecords records, RecordBatch firstBatch) {
-        if (firstBatch.isControlBatch()) {
-            // Control batch - extract control record type
-            Record record = firstBatch.iterator().next();
+    private static TransactionFields transactionFields(RecordBatch batch, List<MetadataProperty> properties) {
+        if (batch.isControlBatch()) {
+            Record record = batch.iterator().next();
             ControlRecordType type = ControlRecordType.parse(record.key());
-
-            // Set marker type for transaction markers
-            if (type == ControlRecordType.COMMIT || type == ControlRecordType.ABORT) {
-                metadata.setMarkerType(MarkerType.TXN_COMMIT_VALUE);
-                metadata.setTxnidMostBits(0L);
-                metadata.setTxnidLeastBits(0L);
-            }
-
-            // Store transaction metadata
-            metadata.addProperty()
-                    .setKey("txn.producerId")
-                    .setValue(String.valueOf(firstBatch.producerId()));
-            metadata.addProperty()
-                    .setKey("txn.producerEpoch")
-                    .setValue(String.valueOf(firstBatch.producerEpoch()));
-            metadata.addProperty()
-                    .setKey("txn.controlType")
-                    .setValue(type.name());
-
-        } else if (firstBatch.isTransactional()) {
-            // Transactional data batch (not control)
-            metadata.addProperty()
-                    .setKey("txn.producerId")
-                    .setValue(String.valueOf(firstBatch.producerId()));
-            metadata.addProperty()
-                    .setKey("txn.producerEpoch")
-                    .setValue(String.valueOf(firstBatch.producerEpoch()));
+            addTransactionProperties(properties, batch, type.name());
+            boolean isTransactionMarker = type == ControlRecordType.COMMIT || type == ControlRecordType.ABORT;
+            return new TransactionFields(isTransactionMarker ? TRANSACTION_COMMIT_MARKER : null, isTransactionMarker);
         }
+        if (batch.isTransactional()) {
+            addTransactionProperties(properties, batch, null);
+        }
+        return new TransactionFields(null, false);
+    }
+
+    private static void addTransactionProperties(List<MetadataProperty> properties, RecordBatch batch, String controlType) {
+        properties.add(new MetadataProperty("txn.producerId", String.valueOf(batch.producerId())));
+        properties.add(new MetadataProperty("txn.producerEpoch", String.valueOf(batch.producerEpoch())));
+        if (controlType != null) {
+            properties.add(new MetadataProperty("txn.controlType", controlType));
+        }
+    }
+
+    private static void writeMarker(ByteBuf metadata, Integer markerType) {
+        if (markerType != null) {
+            writeVarintField(metadata, MARKER_TYPE_FIELD, markerType);
+        }
+    }
+
+    private static void writeTransactionId(ByteBuf metadata, boolean includeTransactionId) {
+        if (includeTransactionId) {
+            writeVarintField(metadata, TRANSACTION_ID_LEAST_BITS_FIELD, 0);
+            writeVarintField(metadata, TRANSACTION_ID_MOST_BITS_FIELD, 0);
+        }
+    }
+
+    private static void writeHighestSequenceId(ByteBuf metadata, Long highestSequenceId) {
+        if (highestSequenceId != null) {
+            writeVarintField(metadata, HIGHEST_SEQUENCE_ID_FIELD, highestSequenceId);
+        }
+    }
+
+    private static void writeProperty(ByteBuf target, MetadataProperty property) {
+        ByteBuf encodedProperty = Unpooled.buffer();
+        try {
+            writeStringField(encodedProperty, PROPERTY_KEY_FIELD, property.key());
+            writeStringField(encodedProperty, PROPERTY_VALUE_FIELD, property.value());
+            writeTag(target, PROPERTY_FIELD, LENGTH_DELIMITED_WIRE_TYPE);
+            writeVarint(target, encodedProperty.readableBytes());
+            target.writeBytes(encodedProperty, encodedProperty.readerIndex(), encodedProperty.readableBytes());
+        } finally {
+            encodedProperty.release();
+        }
+    }
+
+    private static void writeStringField(ByteBuf target, int fieldNumber, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        writeTag(target, fieldNumber, LENGTH_DELIMITED_WIRE_TYPE);
+        writeVarint(target, bytes.length);
+        target.writeBytes(bytes);
+    }
+
+    private static void writeVarintField(ByteBuf target, int fieldNumber, long value) {
+        writeTag(target, fieldNumber, VARINT_WIRE_TYPE);
+        writeVarint(target, value);
+    }
+
+    private static void writeTag(ByteBuf target, int fieldNumber, int wireType) {
+        writeVarint(target, ((long) fieldNumber << 3) | wireType);
+    }
+
+    private static void writeVarint(ByteBuf target, long value) {
+        long remaining = value;
+        while ((remaining & ~0x7fL) != 0) {
+            target.writeByte((int) ((remaining & 0x7fL) | 0x80L));
+            remaining >>>= 7;
+        }
+        target.writeByte((int) remaining);
+    }
+
+    private record MetadataProperty(String key, String value) {
+    }
+
+    private record MetadataFields(
+            String producerName,
+            long sequenceId,
+            long publishTime,
+            List<MetadataProperty> properties,
+            Integer markerType,
+            boolean includeTransactionId,
+            Long highestSequenceId
+    ) {
+    }
+
+    private record ProducerFields(String producerName, long sequenceId, Long highestSequenceId) {
+    }
+
+    private record TransactionFields(Integer markerType, boolean includeTransactionId) {
     }
 }

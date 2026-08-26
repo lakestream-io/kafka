@@ -69,7 +69,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * End-to-end integration tests for Ursa Storage with S3 backend using LocalStack.
  * Uses KafkaClusterTestKit to spin up a test Kafka cluster with Ursa storage mode
- * using ManagedLedger with embedded Oxia and LocalStack S3.
+ * using Lakestream logs with embedded Oxia and LocalStack S3.
  *
  * <p>Tests are organized into nested classes by functionality for better isolation.
  */

@@ -133,7 +133,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
         );
 
         log.info("Diskless support initialized with Lakestream, oxia URLs: {} {}",
-                ursaConfig.getPulsarOxiaServiceUrl(), ursaConfig.getUrsaOxiaServiceUrl());
+                ursaConfig.getCatalogOxiaServiceUrl(), ursaConfig.getUrsaOxiaServiceUrl());
     }
 
     // Visible for testing.
@@ -249,7 +249,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
         }
 
         // TODO: Since deleted partitions are only passed on the deletion delta,
-        //  there may be no subsequent retries—leaving managed-ledger metadata/stream leaked.
+        //  there may be no subsequent retries—leaving catalog metadata or stream data leaked.
         cleanupTrackedPartitions(trackedPartitionsToCleanup, topicMaybeEmptied);
         cleanupRetainedProducerStates(retainedOwnedZones);
         cleanupDeletedTrackedPartitions(trackedPartitionsToDelete, topicMaybeEmptied);

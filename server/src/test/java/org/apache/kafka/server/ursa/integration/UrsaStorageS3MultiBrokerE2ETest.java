@@ -278,8 +278,8 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
 
             produceRecords(cluster.bootstrapServers(), topicName, candidate.partition, numRecords);
 
-            waitForBrokerManagedLedgerState(candidate.oldOwnerBrokerId, topicIdPartition, true);
-            waitForBrokerManagedLedgerState(candidate.newOwnerBrokerId, topicIdPartition, false);
+            waitForBrokerPartitionLogState(candidate.oldOwnerBrokerId, topicIdPartition, true);
+            waitForBrokerPartitionLogState(candidate.newOwnerBrokerId, topicIdPartition, false);
 
             cluster.brokers().get(candidate.brokerToShutdown).shutdown();
             cluster.brokers().get(candidate.brokerToShutdown).awaitShutdown();
@@ -296,7 +296,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                     );
                 }
 
-                waitForBrokerManagedLedgerState(candidate.oldOwnerBrokerId, topicIdPartition, false);
+                waitForBrokerPartitionLogState(candidate.oldOwnerBrokerId, topicIdPartition, false);
 
                 consumeAndVerifyRecords(
                         brokerBootstrap(candidate.newOwnerBrokerId),
@@ -304,7 +304,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                         candidate.partition,
                         numRecords
                 );
-                waitForBrokerManagedLedgerState(candidate.newOwnerBrokerId, topicIdPartition, true);
+                waitForBrokerPartitionLogState(candidate.newOwnerBrokerId, topicIdPartition, true);
             } finally {
                 cluster.brokers().get(candidate.brokerToShutdown).startup();
                 cluster.waitForReadyBrokers();
@@ -339,7 +339,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
             }
 
             produceRecords(cluster.bootstrapServers(), topicName, 0, numRecords);
-            waitForExclusiveManagedLedgerState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
+            waitForExclusivePartitionLogState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
             waitForDisklessLogMetrics(topicName, 0, true);
 
             cluster.brokers().get(originalOwnerBrokerId).shutdown();
@@ -362,7 +362,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
 
                 waitForDisklessLogMetrics(topicName, 0, false);
                 consumeAndVerifyRecords(brokerBootstrap(failoverOwnerBrokerId), topicName, 0, numRecords);
-                waitForExclusiveManagedLedgerState(survivingBrokerIds, failoverOwnerBrokerId, topicIdPartition);
+                waitForExclusivePartitionLogState(survivingBrokerIds, failoverOwnerBrokerId, topicIdPartition);
                 waitForDisklessLogMetrics(topicName, 0, true);
 
                 cluster.brokers().get(originalOwnerBrokerId).startup();
@@ -375,7 +375,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
 
                 waitForDisklessLogMetrics(topicName, 0, false);
                 consumeAndVerifyRecords(brokerBootstrap(originalOwnerBrokerId), topicName, 0, numRecords);
-                waitForExclusiveManagedLedgerState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
+                waitForExclusivePartitionLogState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
                 waitForDisklessLogMetrics(topicName, 0, true);
             } finally {
                 if (cluster.brokers().get(originalOwnerBrokerId).brokerState() != BrokerState.RUNNING) {
@@ -420,9 +420,9 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                 producer.flush();
             }
 
-            waitForBrokerManagedLedgerState(leaderId, topicIdPartition, true);
-            assertFalse(brokerHasManagedLedgerState(nonOwnerBrokerId, topicIdPartition),
-                    "Non-owner broker should not retain managed ledger state before fetch");
+            waitForBrokerPartitionLogState(leaderId, topicIdPartition, true);
+            assertFalse(brokerHasPartitionLogState(nonOwnerBrokerId, topicIdPartition),
+                    "Non-owner broker should not retain partition log state before fetch");
 
             String nonOwnerBootstrapServer = brokerBootstrap(nonOwnerBrokerId);
             try (Consumer<byte[], byte[]> consumer = createConsumer(nonOwnerBootstrapServer)) {
@@ -439,8 +439,8 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                 }
             }
 
-            assertFalse(brokerHasManagedLedgerState(nonOwnerBrokerId, topicIdPartition),
-                    "Non-owner broker should still have no managed ledger state after fetch bootstrap redirect");
+            assertFalse(brokerHasPartitionLogState(nonOwnerBrokerId, topicIdPartition),
+                    "Non-owner broker should still have no partition log state after fetch bootstrap redirect");
         }
     }
 

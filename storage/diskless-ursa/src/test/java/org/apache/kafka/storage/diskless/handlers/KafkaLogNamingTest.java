@@ -24,31 +24,31 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-class KafkaManagedLedgerNamingTest {
+class KafkaLogNamingTest {
 
     @Test
-    void testManagedLedgerName() {
+    void testLogName() {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 2));
         assertEquals(
                 "public/default/persistent/test-topic-partition-2",
-                KafkaManagedLedgerNaming.managedLedgerName(tp)
+                KafkaLogNaming.logName(tp)
         );
     }
 
     @Test
-    void testManagedLedgerNameFromTopicAndPartition() {
+    void testLogNameFromTopicAndPartition() {
         assertEquals(
                 "public/default/persistent/test-topic-partition-0",
-                KafkaManagedLedgerNaming.managedLedgerName("test-topic", 0)
+                KafkaLogNaming.logName("test-topic", 0)
         );
     }
 
     @Test
-    void testManagedLedgerMetadataPath() {
+    void testLegacyCatalogMetadataPathIsStable() {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
         assertEquals(
                 "/managed-ledgers/public/default/persistent/test-topic-partition-0",
-                KafkaManagedLedgerNaming.managedLedgerMetadataPath(tp)
+                KafkaLogNaming.logMetadataPath(tp)
         );
     }
 }

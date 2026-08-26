@@ -195,8 +195,12 @@ public class LogConfig extends AbstractConfig {
                     ServerLogConfigs.URSA_STORAGE_CLASS_PATH_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_DOC)
-            .define(ServerLogConfigs.PULSAR_OXIA_SERVICE_URL_CONFIG, STRING, ServerLogConfigs.PULSAR_OXIA_SERVICE_URL_DEFAULT,
-                    new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.PULSAR_OXIA_SERVICE_URL_DOC)
+            .define(ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG, STRING,
+                    ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_DEFAULT,
+                    new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_DOC)
+            .define(ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG, STRING,
+                    ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_DEFAULT,
+                    new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_DOC)
             .define(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG, STRING, ServerLogConfigs.URSA_OXIA_SERVICE_URL_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_OXIA_SERVICE_URL_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_WAL_DIRECTORY_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_WAL_DIRECTORY_DEFAULT,
@@ -218,15 +222,6 @@ public class LogConfig extends AbstractConfig {
                     ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW,
                     ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DOC)
-            .define(ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_CONFIG, STRING,
-                    ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_DEFAULT, LOW,
-                    ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_DOC)
-            .define(ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_CONFIG, PASSWORD,
-                    ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_DEFAULT, LOW,
-                    ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_DOC)
-            .define(ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_CONFIG, STRING,
-                    ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_DEFAULT, LOW,
-                    ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS_CONFIG, LONG, ServerLogConfigs.URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS_DEFAULT, atLeast(0), LOW, ServerLogConfigs.URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE_CONFIG, LONG, ServerLogConfigs.URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE_DEFAULT, atLeast(0), LOW, ServerLogConfigs.URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_CONFIG, LONG,
@@ -238,6 +233,12 @@ public class LogConfig extends AbstractConfig {
             .define(ServerLogConfigs.URSA_STORAGE_S3_ENDPOINT_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_S3_ENDPOINT_DEFAULT, LOW, ServerLogConfigs.URSA_STORAGE_S3_ENDPOINT_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_S3_ACCESS_KEY_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_S3_ACCESS_KEY_DEFAULT, LOW, ServerLogConfigs.URSA_STORAGE_S3_ACCESS_KEY_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_DEFAULT, LOW, ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_DOC)
+            .define(ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_CONFIG, PASSWORD,
+                    ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_DEFAULT, LOW,
+                    ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_DOC)
+            .define(ServerLogConfigs.URSA_STORAGE_S3_PATH_STYLE_ACCESS_CONFIG, BOOLEAN,
+                    ServerLogConfigs.URSA_STORAGE_S3_PATH_STYLE_ACCESS_DEFAULT, LOW,
+                    ServerLogConfigs.URSA_STORAGE_S3_PATH_STYLE_ACCESS_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_S3_BUCKET_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_S3_BUCKET_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_STORAGE_S3_BUCKET_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_S3_REGION_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_S3_REGION_DEFAULT,

@@ -266,10 +266,10 @@ class ControllerServer(
           setDisklessStorageSystemEnabled(config.ursaStorageEnable).
           setDisklessTopicPreCommitHandler({
             if (config.ursaStorageEnable) {
-              val ursaConfig = UrsaStorageConfig.fromConfigs(config.props.asInstanceOf[util.Map[String, _]])
+              val ursaConfig = UrsaStorageConfig.fromConfigs(config.originals().asInstanceOf[util.Map[String, _]])
               ursaOxiaSync = new UrsaPartitionedTopicsMetadataSync(
                 (msg: String, cause: Throwable) => sharedServer.metadataPublishingFaultHandler.handleFault(msg, cause),
-                DisklessMetadataStoreLoader.load(ursaConfig.getPulsarOxiaServiceUrl, ursaConfig.getClassPath))
+                DisklessMetadataStoreLoader.load(ursaConfig.getCatalogOxiaServiceUrl, ursaConfig.getClassPath))
               Optional.of[DisklessTopicPreCommitHandler](
                 (topicName: String, partitions: Int, configs: util.Map[String, String]) => {
                 ursaOxiaSync.upsertPartitionedTopicMetadataSync(topicName, partitions, configs, 3000)

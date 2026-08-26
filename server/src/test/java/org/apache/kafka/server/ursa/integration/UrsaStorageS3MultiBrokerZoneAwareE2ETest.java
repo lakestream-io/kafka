@@ -141,7 +141,7 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                 producer.flush();
             }
 
-            waitForBrokerManagedLedgerState(zoneBOwnerBrokerId, topicIdPartition, true);
+            waitForBrokerPartitionLogState(zoneBOwnerBrokerId, topicIdPartition, true);
 
             try (Consumer<byte[], byte[]> consumer = createMultiBrokerConsumer(
                     zoneANonOwnerBootstrap,
@@ -161,9 +161,9 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                 }
             }
 
-            waitForBrokerManagedLedgerState(zoneBOwnerBrokerId, topicIdPartition, true);
-            assertFalse(brokerHasManagedLedgerState(zoneAOwnerBrokerId, topicIdPartition),
-                    "Zone-a bootstrap broker should not retain local managed ledger state for a zone-b client");
+            waitForBrokerPartitionLogState(zoneBOwnerBrokerId, topicIdPartition, true);
+            assertFalse(brokerHasPartitionLogState(zoneAOwnerBrokerId, topicIdPartition),
+                    "Zone-a bootstrap broker should not retain local partition log state for a zone-b client");
         }
 
         @Test
@@ -203,7 +203,7 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                     "Zone-a consumer should observe every payload written by both zones");
             assertEquals(expectedPayloads, trafficResult.zoneBObservedPayloads,
                     "Zone-b consumer should observe every payload written by both zones");
-            verifyManagedLedgerStateForZoneOwners(
+            verifyPartitionLogStateForZoneOwners(
                     zoneOwnerContext.topicIdPartition,
                     zoneOwnerContext.zoneAOwnerBrokerId,
                     zoneOwnerContext.zoneBOwnerBrokerId);

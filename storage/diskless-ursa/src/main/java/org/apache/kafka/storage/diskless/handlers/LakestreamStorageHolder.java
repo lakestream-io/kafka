@@ -65,11 +65,11 @@ final class LakestreamStorageHolder implements Closeable {
     public static final String EXTERNAL_READER_FACTORY_CLASS_PROP = "externalReaderFactoryClass";
     public static final String LEGACY_SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP =
             "ursa.externalReaderFactoryClass";
-    public static final String KOP_SCHEMA_REGISTRY_URL_PROP = "kopSchemaRegistryUrl";
-    public static final String KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP =
-            "kopSchemaRegistryHttpHeaderAuthorization";
-    public static final String KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP =
-            "kopSchemaRegistryHttpHeaderAuthorizationFile";
+    static final String KAFKA_LAKEHOUSE_READER_FACTORY_CLASS =
+            "io.streamnative.ursa.kafka.reader.KafkaLakehouseReaderFactory";
+    static final String LEGACY_LAKEHOUSE_READER_FACTORY_CLASS =
+            "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory";
+    private static final String OXIA_STORAGE_URL_PROP = "oxiaStorageUrl";
     private static final String SERVICE_NAME = "kafka-diskless-storage";
 
     private final IndexedStreamCatalog catalog;
@@ -186,8 +186,8 @@ final class LakestreamStorageHolder implements Closeable {
     }
 
     CompletableFuture<Void> deletePartitionData(TopicIdPartition tp) {
-        String managedLedgerName = KafkaManagedLedgerNaming.managedLedgerName(tp);
-        String metadataPath = KafkaManagedLedgerNaming.managedLedgerMetadataPath(tp);
+        String logName = KafkaLogNaming.logName(tp);
+        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
         return catalog.getOxiaClient().get(metadataPath).thenCompose(metadata -> {
             CompletableFuture<Void> deleteLogFuture;
             if (metadata == null || metadata.value().length == 0) {
@@ -199,8 +199,8 @@ final class LakestreamStorageHolder implements Closeable {
                     if (streamIdNode == null || streamIdNode.asLong(-1L) < 0) {
                         deleteLogFuture = CompletableFuture.completedFuture(null);
                     } else {
-                        Log log = catalog.createLog(LogId.of(streamIdNode.asLong()));
-                        deleteLogFuture = log.delete().whenComplete((ignored, error) -> closeLogQuietly(log));
+                        Log log = catalog.createLog(logName, LogId.of(streamIdNode.asLong()));
+                        deleteLogFuture = deleteLogAndClose(log);
                     }
                 } catch (IOException e) {
                     deleteLogFuture = CompletableFuture.failedFuture(e);
@@ -213,7 +213,7 @@ final class LakestreamStorageHolder implements Closeable {
                     // interrupted between the two, recreation reuses the same now-empty stream ID
                     // instead of registering a new ID while stale catalog metadata points at the old one.
                     .thenCompose(ignored -> producerStateOxiaClient.delete(
-                            STREAM_ID_GENERATOR_PATH + "/" + managedLedgerName,
+                            STREAM_ID_GENERATOR_PATH + "/" + logName,
                             Set.of(DeleteOption.PartitionKey(STREAM_ID_GENERATOR_PATH))))
                     .thenApply(ignored -> null);
         });
@@ -226,12 +226,12 @@ final class LakestreamStorageHolder implements Closeable {
         OpenTelemetrySdk openTelemetrySdk = null;
         try {
             openTelemetrySdk = createOpenTelemetrySdk();
-            String oxiaUrl = config.getPulsarOxiaServiceUrl().toString();
+            String oxiaUrl = config.getCatalogOxiaServiceUrl();
             Properties properties = buildStorageProperties(config);
             properties.setProperty("storageTier", "default");
 
             StreamCatalogService scs = new StreamCatalogService();
-            catalog = scs.open(oxiaUrl, CatalogType.PULSAR, properties, openTelemetrySdk);
+            catalog = scs.open(oxiaUrl, CatalogType.KAFKA, properties, openTelemetrySdk);
 
             producerStateOxiaClientFuture = new OxiaServiceUrl(config.getUrsaOxiaServiceUrl()).client();
             producerStateOxiaClient = producerStateOxiaClientFuture.get(
@@ -302,7 +302,7 @@ final class LakestreamStorageHolder implements Closeable {
         String normalizedBackendType = normalizeBackendType(config.getBackendType());
         properties.setProperty("backendStorageType", normalizedBackendType);
         properties.setProperty("storagePath", config.getStoragePath());
-        properties.setProperty("oxiaPulsarStorageUrl", config.getUrsaOxiaServiceUrl().toString());
+        properties.setProperty(OXIA_STORAGE_URL_PROP, config.getUrsaOxiaServiceUrl());
         properties.setProperty("writeBufferFlushIntervalMs", String.valueOf(config.getWriteBufferFlushIntervalMs()));
         properties.setProperty("writeBufferSize", String.valueOf(config.getWriteBufferSize()));
         properties.setProperty("writeBufferFlushSize", String.valueOf(config.getWriteBufferFlushSize()));
@@ -317,49 +317,25 @@ final class LakestreamStorageHolder implements Closeable {
         if (isS3Backend(normalizedBackendType)) {
             setIfNotEmpty(config.getS3AccessKey(), v -> properties.setProperty("s3AccessKeyId", v));
             setIfNotEmpty(config.getS3SecretKey(), v -> properties.setProperty("s3SecretAccessKey", v));
+            setIfNotEmpty(config.getS3SessionToken(), v -> properties.setProperty("s3SessionToken", v));
+            if (config.getS3PathStyleAccess() != null) {
+                properties.setProperty("s3PathStyleAccess", String.valueOf(config.getS3PathStyleAccess()));
+            }
             // Deprecated fields, keep for compatibility with older configs.
             setIfNotEmpty(config.getS3Bucket(), v -> properties.setProperty("s3Bucket", v));
             setIfNotEmpty(config.getStoragePath(), v -> properties.setProperty("s3Prefix", v));
             setIfNotEmpty(config.getS3Region(), v -> properties.setProperty("s3Region", v));
         }
 
-        String externalReaderFactoryClass = firstNonBlank(
+        String externalReaderFactoryClass = normalizeExternalReaderFactoryClass(firstNonBlank(
                 config.getConfiguredExternalReaderFactoryClass(),
                 System.getProperty(LEGACY_SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP),
-                UrsaStorageConfig.NOOP_EXTERNAL_READER_FACTORY_CLASS);
+                UrsaStorageConfig.NOOP_EXTERNAL_READER_FACTORY_CLASS));
         properties.setProperty(EXTERNAL_READER_FACTORY_CLASS_PROP, externalReaderFactoryClass);
         if (!UrsaStorageConfig.NOOP_EXTERNAL_READER_FACTORY_CLASS.equals(externalReaderFactoryClass)) {
-            // Required by LakehouseReaderFactory / KSNSchemaRegistry.
-            String kopSchemaRegistryUrl = firstNonBlank(
-                    config.getKopSchemaRegistryUrl(),
-                    System.getProperty(KOP_SCHEMA_REGISTRY_URL_PROP),
-                    null);
-            if (kopSchemaRegistryUrl != null) {
-                properties.setProperty(KOP_SCHEMA_REGISTRY_URL_PROP, kopSchemaRegistryUrl);
-            }
-
-            String kopSchemaRegistryHttpHeaderAuthorizationFile = firstNonBlank(
-                    config.getKopSchemaRegistryHttpHeaderAuthorizationFile(),
-                    System.getProperty(KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP),
-                    null);
-            if (kopSchemaRegistryHttpHeaderAuthorizationFile != null) {
-                properties.setProperty(
-                        KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_PROP,
-                        kopSchemaRegistryHttpHeaderAuthorizationFile);
-            } else {
-                String kopSchemaRegistryHttpHeaderAuthorization = firstNonBlank(
-                        config.getKopSchemaRegistryHttpHeaderAuthorization(),
-                        System.getProperty(KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP),
-                        null);
-                if (kopSchemaRegistryHttpHeaderAuthorization != null) {
-                    properties.setProperty(
-                            KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_PROP,
-                            kopSchemaRegistryHttpHeaderAuthorization);
-                }
-            }
-
             if (isRemoteBackend(normalizedBackendType)) {
-                properties.setProperty("compactionBackendStorageType", normalizedBackendType);
+                properties.setProperty(
+                        "compactionBackendStorageType", compactionBackendType(normalizedBackendType));
                 properties.setProperty("compactionBucket", config.getCompactionBucket());
                 properties.setProperty("compactionPrefix", config.getCompactionPrefix());
                 properties.setProperty("compactionBucketRegion", config.getS3Region());
@@ -375,6 +351,13 @@ final class LakestreamStorageHolder implements Closeable {
 
     private static boolean isS3Backend(String normalizedBackendType) {
         return "S3".equals(normalizedBackendType);
+    }
+
+    private static String compactionBackendType(String normalizedBackendType) {
+        // Ursa uses the Azure Blob SDK for WAL objects, while Hadoop 3.5 only supports
+        // the ABFS connector for compacted Parquet files. Both can address an HNS-enabled
+        // Azure storage account, but they intentionally use different backend identifiers.
+        return "AZUREBLOB".equals(normalizedBackendType) ? "AZUREDFS" : normalizedBackendType;
     }
 
     private static String normalizeBackendType(String backendType) {
@@ -401,10 +384,16 @@ final class LakestreamStorageHolder implements Closeable {
         return defaultValue;
     }
 
+    private static String normalizeExternalReaderFactoryClass(String className) {
+        return LEGACY_LAKEHOUSE_READER_FACTORY_CLASS.equals(className)
+                ? KAFKA_LAKEHOUSE_READER_FACTORY_CLASS
+                : className;
+    }
+
     static StreamIdentifier streamIdentifier(String topic) {
         return StreamIdentifier.of(
-                KafkaManagedLedgerNaming.TENANT + "/" + KafkaManagedLedgerNaming.NAMESPACE,
-                KafkaManagedLedgerNaming.DOMAIN + "/" + topic);
+                KafkaLogNaming.TENANT + "/" + KafkaLogNaming.NAMESPACE,
+                KafkaLogNaming.DOMAIN + "/" + topic);
     }
 
     private static void closeStreamQuietly(Stream stream) {
@@ -418,6 +407,19 @@ final class LakestreamStorageHolder implements Closeable {
         try {
             log.close();
         } catch (Exception ignored) {
+        }
+    }
+
+    private static CompletableFuture<Void> deleteLogAndClose(Log log) {
+        try {
+            CompletableFuture<Void> deleteFuture = log.delete();
+            if (deleteFuture == null) {
+                throw new IllegalStateException("Log.delete returned null future");
+            }
+            return deleteFuture.whenComplete((ignored, error) -> closeLogQuietly(log));
+        } catch (Throwable deleteError) {
+            closeLogQuietly(log);
+            return CompletableFuture.failedFuture(deleteError);
         }
     }
 

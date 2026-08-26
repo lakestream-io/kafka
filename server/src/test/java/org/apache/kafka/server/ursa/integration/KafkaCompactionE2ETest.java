@@ -63,7 +63,6 @@ import io.streamnative.lakestream.api.Position;
 import io.streamnative.oxia.testcontainers.OxiaContainer;
 import io.streamnative.ursa.storage.StorageApi;
 import io.streamnative.ursa.storage.UrsaStorage;
-import io.streamnative.ursa.storage.impl.PulsarStorageConfig;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -72,7 +71,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>This test:
  * <ol>
- *   <li>Writes Kafka records to a topic with Ursa storage + ManagedLedger enabled</li>
+ *   <li>Writes Kafka records to a topic with Ursa diskless storage enabled</li>
  *   <li>Starts an external compactor container to compact WAL data to Parquet</li>
  *   <li>Verifies entry indexes show FileType.PARQUET after compaction</li>
  *   <li>Verifies Parquet files exist on disk</li>
@@ -85,7 +84,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     private static final int NUM_RECORDS = 100;
     private static final String S3_BUCKET = "kafka-ursa-storage";
     private static final String EXTERNAL_READER_FACTORY_CLASS =
-            "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory";
+            "io.streamnative.ursa.kafka.reader.KafkaLakehouseReaderFactory";
 
     private static final String COMPACTOR_IMAGE_ENV = "URSA_COMPACTOR_IMAGE";
     private static final String SN_LICENSE_FILE_ENV = "SN_LICENSE_FILE";
@@ -97,7 +96,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     private static URI s3Endpoint;
     private static KafkaClusterTestKit cluster;
     private static String s3Prefix;
-    private static PulsarStorageConfig pulsarConfig;
+    private static Properties compactionStorageConfig;
     private static AsyncOxiaClient verificationClient;
     private static String schemaRegistryBaseUrl;
 
@@ -145,8 +144,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         awaitSchemaRegistryReady(schemaRegistryBaseUrl);
         log.info("Schema registry started at: {}", schemaRegistryBaseUrl);
 
-        // Create PulsarStorageConfig for compaction verification
-        pulsarConfig = createCompactionConfig(
+        compactionStorageConfig = createCompactionConfig(
                 oxiaContainer.getServiceAddress(),
                 s3Endpoint,
                 localStackContainer.getRegion(),
@@ -184,7 +182,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
 
         createTopicWithUrsaStorage(topicName);
         writeRecords(cluster.bootstrapServers(), topicName);
-        waitForManagedLedgerMetadata(topicName);
+        waitForLegacyLogMetadata(topicName);
 
         String compactorImage = System.getenv(COMPACTOR_IMAGE_ENV);
         try (GenericContainer<?> compactor = startCompactorContainer(
@@ -218,21 +216,22 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         log.info("Successfully wrote {} records to topic {}", NUM_RECORDS, topicName);
     }
 
-    private void waitForManagedLedgerMetadata(String topicName) {
-        String managedLedgerPath = "/managed-ledgers/public/default/persistent/" + topicName + "-partition-0";
+    private void waitForLegacyLogMetadata(String topicName) {
+        // Persisted compatibility path consumed by the external compactor.
+        String legacyLogMetadataPath = "/managed-ledgers/public/default/persistent/" + topicName + "-partition-0";
         Awaitility.await()
                 .atMost(30, TimeUnit.SECONDS)
                 .pollInterval(1, TimeUnit.SECONDS)
-                .until(() -> checkManagedLedgerExists(managedLedgerPath));
-        log.info("ManagedLedger metadata verified in Oxia at path: {}", managedLedgerPath);
+                .until(() -> checkLegacyLogMetadataExists(legacyLogMetadataPath));
+        log.info("Legacy-compatible log metadata verified in Oxia at path: {}", legacyLogMetadataPath);
     }
 
-    private boolean checkManagedLedgerExists(String path) {
+    private boolean checkLegacyLogMetadataExists(String path) {
         try {
             GetResult result = verificationClient.get(path).get(5, TimeUnit.SECONDS);
             return result != null && result.value() != null;
         } catch (Exception e) {
-            log.debug("ManagedLedger metadata not yet available: {}", e.getMessage());
+            log.debug("Legacy-compatible log metadata not yet available: {}", e.getMessage());
             return false;
         }
     }
@@ -251,7 +250,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     private void verifyReadsUseParquetIndexes(String topicName) throws Exception {
         String streamKey = "public/default/persistent/" + topicName + "-partition-0";
 
-        try (UrsaStorage ursaStorage = new UrsaStorage(pulsarConfig, OpenTelemetry.noop())) {
+        try (UrsaStorage ursaStorage = new UrsaStorage(compactionStorageConfig, OpenTelemetry.noop())) {
             StorageApi storageApi = ursaStorage.getDefaultStorageApi();
 
             long streamId = storageApi.getStreamIdByKey(streamKey).get(30, TimeUnit.SECONDS);
@@ -290,7 +289,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         log.info("Parquet objects verified in S3 bucket={}, prefix={}", S3_BUCKET, s3Prefix);
     }
 
-    private static PulsarStorageConfig createCompactionConfig(
+    private static Properties createCompactionConfig(
             String oxiaServiceAddress,
             URI s3Endpoint,
             String region,
@@ -298,38 +297,32 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
             String prefix) {
         String oxiaUrl = "oxia://" + oxiaServiceAddress + "/" + ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
 
-        Properties props = new Properties();
+        Properties properties = new Properties();
+        properties.setProperty("oxiaStorageUrl", oxiaUrl);
+        properties.setProperty("metadataStoreUrl", oxiaUrl);
+        properties.setProperty("backendStorageType", "S3");
+        properties.setProperty("bucket", bucket);
+        properties.setProperty("prefix", prefix);
+        properties.setProperty("cloudStorageEndpoint", s3Endpoint.toString());
+        properties.setProperty("region", region);
+        properties.setProperty("s3AccessKeyId", "test");
+        properties.setProperty("s3SecretAccessKey", "test");
+        properties.setProperty("dataSourceForCompaction", "URSA");
+        properties.setProperty("compactedFileSizeLimit", String.valueOf(10 * 1024));
+        properties.setProperty("tailCompactDataVisibilityIntervalInSeconds", "5");
+        properties.setProperty("refreshLocalTopicInternalInSeconds", "5");
+        properties.setProperty("compactedThreadNum", "2");
+        properties.setProperty("publishThreadNum", "2");
+        properties.setProperty("commitThreadNum", "2");
+        properties.setProperty("writeBufferSize", String.valueOf(256 * 1024));
+        properties.setProperty("writeBufferFlushIntervalMs", "100");
+        properties.setProperty("metastoreRequestRateLimitPerSecond", "500");
         // Make parquet (s3a://...) resolvable for v2 parquet readers.
-        props.setProperty("compactionBackendStorageType", "S3");
-        props.setProperty("compactionBucket", bucket);
-        props.setProperty("compactionPrefix", prefix);
-        props.setProperty("cloudStorageEndpoint", s3Endpoint.toString());
-        props.setProperty("compactionBucketRegion", region);
-
-        return PulsarStorageConfig.builder()
-                .oxiaPulsarStorageUrl(oxiaUrl)
-                .metadataStoreUrl(oxiaUrl)
-                .backendStorageType("S3")
-                .bucket(bucket)
-                .prefix(prefix)
-                .cloudStorageEndpoint(s3Endpoint.toString())
-                .region(region)
-                .s3AccessKeyId("test")
-                .s3SecretAccessKey("test")
-                .dataSourceForCompaction("URSA")
-                // Fast compaction for tests
-                .compactedFileSizeLimit(10 * 1024) // 10KB - small for fast tests
-                .tailCompactDataVisibilityIntervalInSeconds(5)
-                .refreshLocalTopicInternalInSeconds(5)
-                .compactedThreadNum(2)
-                .publishThreadNum(2)
-                .commitThreadNum(2)
-                // Write buffer settings
-                .writeBufferSize(256 * 1024)
-                .writeBufferFlushIntervalMs(100)
-                .metastoreRequestRateLimitPerSecond(500)
-                .properties(props)
-                .build();
+        properties.setProperty("compactionBackendStorageType", "S3");
+        properties.setProperty("compactionBucket", bucket);
+        properties.setProperty("compactionPrefix", prefix);
+        properties.setProperty("compactionBucketRegion", region);
+        return properties;
     }
 
     private static GenericContainer<?> startCompactorContainer(
@@ -439,7 +432,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
 
     private static KafkaClusterTestKit createCluster(String oxiaServiceAddress, URI s3Endpoint,
                                               LocalStackContainer localStackContainer, String s3Prefix) throws Exception {
-        log.info("Creating cluster with S3 Ursa storage + managed-ledger enabled, Oxia at: {}, S3 endpoint: {}, prefix: {}",
+        log.info("Creating cluster with S3 Ursa diskless storage enabled, Oxia at: {}, S3 endpoint: {}, prefix: {}",
                 oxiaServiceAddress, s3Endpoint, s3Prefix);
 
         return enableBrokerRequestPipelining(new KafkaClusterTestKit.Builder(
@@ -459,7 +452,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_S3_REGION_CONFIG, localStackContainer.getRegion())
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG,
                         EXTERNAL_READER_FACTORY_CLASS)
-                .setConfigProp(ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_CONFIG, schemaRegistryBaseUrl)
                 .setConfigProp("offsets.topic.replication.factor", "1")
                 .setConfigProp("transaction.state.log.replication.factor", "1")
                 .setConfigProp("transaction.state.log.min.isr", "1")

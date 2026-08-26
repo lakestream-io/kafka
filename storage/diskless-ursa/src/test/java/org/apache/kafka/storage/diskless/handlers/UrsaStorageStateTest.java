@@ -414,8 +414,8 @@ class UrsaStorageStateTest {
                 .thenReturn(CompletableFuture.completedFuture(null));
         when(catalog.setStreamProperties(identifier, latestConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        String managedLedgerName = KafkaManagedLedgerNaming.managedLedgerName(tp);
-        when(catalog.createLog(managedLedgerName, LogId.of(17L))).thenReturn(logInstance);
+        String logName = KafkaLogNaming.logName(tp);
+        when(catalog.createLog(logName, LogId.of(17L))).thenReturn(logInstance);
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
         try (UrsaStorageState state = new UrsaStorageState(
@@ -437,7 +437,7 @@ class UrsaStorageStateTest {
             updateFuture.get();
             verify(catalog, times(1)).setStreamProperties(identifier, initialConfig);
             verify(catalog, times(1)).setStreamProperties(identifier, latestConfig);
-            verify(catalog).createLog(managedLedgerName, LogId.of(17L));
+            verify(catalog).createLog(logName, LogId.of(17L));
         }
     }
 

@@ -86,7 +86,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * End-to-end integration tests for Ursa Storage using real Kafka producer and consumer.
  * Uses KafkaClusterTestKit to spin up a test Kafka cluster with Ursa storage mode
- * using ManagedLedger with embedded Oxia for persistent storage tests.
+ * using Lakestream logs with embedded Oxia for persistent storage tests.
  *
  * <p>Tests are organized into nested classes by functionality for better isolation
  * and parallel execution capability.
@@ -740,23 +740,23 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
     /**
      * Oxia metadata verification tests.
-     * Tests that ManagedLedger and partitioned topic metadata are correctly stored in Oxia.
+     * Tests that legacy-compatible log metadata and partitioned topic metadata are correctly stored in Oxia.
      */
     @Nested
     @DisplayName("Oxia Metadata Tests")
     class OxiaMetadataTests {
 
         @Test
-        @DisplayName("ManagedLedger metadata created under /managed-ledgers prefix")
-        void testManagedLedgerMetadataCreatedUnderManagedLedgersPrefix() throws Exception {
-            String topicName = uniqueTopicName("managed-ledger-metadata-topic");
+        @DisplayName("Log metadata created under the legacy /managed-ledgers compatibility prefix")
+        void testLogMetadataCreatedUnderLegacyCompatibilityPrefix() throws Exception {
+            String topicName = uniqueTopicName("legacy-log-metadata-topic");
 
             createDisklessTopic(cluster, topicName);
             produceRecords(cluster.bootstrapServers(), topicName, 10);
             consumeAndVerifyRecords(cluster.bootstrapServers(), topicName, 10);
 
-            assertManagedLedgerMetadataExistsInOxia(topicName);
-            log.info("ManagedLedger metadata test passed for topic {}", topicName);
+            assertLegacyLogMetadataExistsInOxia(topicName);
+            log.info("Legacy-compatible log metadata test passed for topic {}", topicName);
         }
 
         @Test
@@ -771,11 +771,11 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             Map<Integer, Long> streamIds = new HashMap<>();
             for (int partition = 0; partition < numPartitions; partition++) {
                 produceRecords(cluster.bootstrapServers(), topicName, partition, 1);
-                assertManagedLedgerMetadataExistsInOxia(topicName, partition);
+                assertLegacyLogMetadataExistsInOxia(topicName, partition);
             }
             try (AsyncOxiaClient oxiaClient = createOxiaClient()) {
                 for (int partition = 0; partition < numPartitions; partition++) {
-                    streamIds.put(partition, managedLedgerStreamId(oxiaClient, topicName, partition));
+                    streamIds.put(partition, logStreamId(oxiaClient, topicName, partition));
                 }
             }
 
@@ -796,11 +796,11 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
 
             assertPartitionedTopicMetadataDeletedFromOxia(topicName);
-            assertManagedLedgerMetadataDeletedFromOxia(topicName, numPartitions);
+            assertLegacyLogMetadataDeletedFromOxia(topicName, numPartitions);
             assertProducerStateSnapshotsDeletedFromOxia(topicId, numPartitions);
             try (AsyncOxiaClient oxiaClient = createOxiaClient()) {
                 for (int partition = 0; partition < numPartitions; partition++) {
-                    assertManagedLedgerStreamDeletedFromOxia(
+                    assertLogStreamDeletedFromOxia(
                             oxiaClient,
                             topicName,
                             partition,
@@ -813,8 +813,8 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
         @Test
         @Timeout(value = 600, unit = TimeUnit.SECONDS)
-        @DisplayName("Bulk diskless topic deletion cleans managed-ledger metadata and stream data")
-        void testBulkTopicDeletionCleansManagedLedgerStreams() throws Exception {
+        @DisplayName("Bulk diskless topic deletion cleans legacy log metadata and stream data")
+        void testBulkTopicDeletionCleansLogStreams() throws Exception {
             int topicCount = 100;
             int partitionsPerTopic = 10;
             List<String> topicNames = createBulkDisklessTopics(topicCount, partitionsPerTopic);
@@ -823,7 +823,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
             Map<TopicPartition, Long> streamIds;
             try (AsyncOxiaClient oxiaClient = createOxiaClient()) {
-                streamIds = captureManagedLedgerStreamIds(oxiaClient, topicNames, partitionsPerTopic);
+                streamIds = captureLogStreamIds(oxiaClient, topicNames, partitionsPerTopic);
             }
 
             try (Admin admin = cluster.admin()) {
@@ -835,12 +835,12 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private void assertManagedLedgerMetadataExistsInOxia(String topicName) throws Exception {
-            assertManagedLedgerMetadataExistsInOxia(topicName, 0);
+        private void assertLegacyLogMetadataExistsInOxia(String topicName) throws Exception {
+            assertLegacyLogMetadataExistsInOxia(topicName, 0);
         }
 
-        private void assertManagedLedgerMetadataExistsInOxia(String topicName, int partition) throws Exception {
-            assertOxiaKeyExists(managedLedgerMetadataPath(topicName, partition), "ManagedLedgerMetadata");
+        private void assertLegacyLogMetadataExistsInOxia(String topicName, int partition) throws Exception {
+            assertOxiaKeyExists(legacyLogMetadataPath(topicName, partition), "LegacyLogMetadata");
         }
 
         private void assertPartitionedTopicMetadataExistsInOxia(String topicName, int expectedPartitions)
@@ -878,9 +878,9 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private void assertManagedLedgerMetadataDeletedFromOxia(String topicName, int partitions) throws Exception {
+        private void assertLegacyLogMetadataDeletedFromOxia(String topicName, int partitions) throws Exception {
             try (AsyncOxiaClient client = createOxiaClient()) {
-                assertManagedLedgerMetadataDeletedFromOxia(client, topicName, partitions);
+                assertLegacyLogMetadataDeletedFromOxia(client, topicName, partitions);
             }
         }
 
@@ -970,7 +970,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             return topicNames;
         }
 
-        private Map<TopicPartition, Long> captureManagedLedgerStreamIds(
+        private Map<TopicPartition, Long> captureLogStreamIds(
                 AsyncOxiaClient client,
                 List<String> topicNames,
                 int partitions
@@ -979,7 +979,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             for (String topicName : topicNames) {
                 for (int partition = 0; partition < partitions; partition++) {
                     TopicPartition topicPartition = new TopicPartition(topicName, partition);
-                    streamIds.put(topicPartition, managedLedgerStreamId(client, topicName, partition));
+                    streamIds.put(topicPartition, logStreamId(client, topicName, partition));
                 }
             }
             return streamIds;
@@ -998,7 +998,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                 } catch (Exception e) {
                     return false;
                 }
-            }, 120_000, 500, () -> "Timed out waiting for bulk managed-ledger cleanup for " + topicCount + " topics");
+            }, 120_000, 500, () -> "Timed out waiting for bulk log cleanup for " + topicCount + " topics");
         }
 
         private boolean areBulkTopicsDeleted(
@@ -1013,10 +1013,10 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                 }
                 for (int partition = 0; partition < partitionsPerTopic; partition++) {
                     TopicPartition topicPartition = new TopicPartition(topicName, partition);
-                    if (!isOxiaKeyDeleted(client, managedLedgerMetadataPath(topicName, partition))) {
+                    if (!isOxiaKeyDeleted(client, legacyLogMetadataPath(topicName, partition))) {
                         return false;
                     }
-                    if (!isManagedLedgerStreamDeletedFromOxia(
+                    if (!isLogStreamDeletedFromOxia(
                             client,
                             topicName,
                             partition,
@@ -1028,9 +1028,9 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             return true;
         }
 
-        private long managedLedgerStreamId(AsyncOxiaClient client, String topicName, int partition) throws Exception {
+        private long logStreamId(AsyncOxiaClient client, String topicName, int partition) throws Exception {
             GetResult result = client.get(
-                    StorageFormat.STREAM_ID_GENERATOR_PATH + "/" + managedLedgerName(topicName, partition),
+                    StorageFormat.STREAM_ID_GENERATOR_PATH + "/" + logName(topicName, partition),
                     Set.of(GetOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH))
             ).get(10, TimeUnit.SECONDS);
             assertNotNull(result, "Stream id should exist for " + topicName + "-" + partition);
@@ -1042,17 +1042,17 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             assertOxiaKeyDeleted(client, key, "PartitionedTopicMetadata");
         }
 
-        private void assertManagedLedgerMetadataDeletedFromOxia(
+        private void assertLegacyLogMetadataDeletedFromOxia(
                 AsyncOxiaClient client,
                 String topicName,
                 int partitions
         ) throws Exception {
             for (int partition = 0; partition < partitions; partition++) {
-                assertOxiaKeyDeleted(client, managedLedgerMetadataPath(topicName, partition), "ManagedLedgerMetadata");
+                assertOxiaKeyDeleted(client, legacyLogMetadataPath(topicName, partition), "LegacyLogMetadata");
             }
         }
 
-        private void assertManagedLedgerStreamDeletedFromOxia(
+        private void assertLogStreamDeletedFromOxia(
                 AsyncOxiaClient client,
                 String topicName,
                 int partition,
@@ -1060,14 +1060,14 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         ) throws Exception {
             TestUtils.waitForCondition(() -> {
                 try {
-                    return isManagedLedgerStreamDeletedFromOxia(client, topicName, partition, streamId);
+                    return isLogStreamDeletedFromOxia(client, topicName, partition, streamId);
                 } catch (Exception e) {
                     return false;
                 }
             }, 30_000, 100, () -> "Timed out waiting for stream cleanup for " + topicName + "-" + partition);
         }
 
-        private boolean isManagedLedgerStreamDeletedFromOxia(
+        private boolean isLogStreamDeletedFromOxia(
                 AsyncOxiaClient client,
                 String topicName,
                 int partition,
@@ -1082,7 +1082,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
 
             GetResult streamIdResult = client.get(
-                    StorageFormat.STREAM_ID_GENERATOR_PATH + "/" + managedLedgerName(topicName, partition),
+                    StorageFormat.STREAM_ID_GENERATOR_PATH + "/" + logName(topicName, partition),
                     Set.of(GetOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH))
             ).get(10, TimeUnit.SECONDS);
             return streamIdResult == null || streamIdResult.value() == null;
@@ -1114,11 +1114,12 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             return result == null || result.value() == null;
         }
 
-        private String managedLedgerMetadataPath(String topicName, int partition) {
-            return "/managed-ledgers/" + managedLedgerName(topicName, partition);
+        private String legacyLogMetadataPath(String topicName, int partition) {
+            // Persisted compatibility path: changing it would orphan existing log metadata.
+            return "/managed-ledgers/" + logName(topicName, partition);
         }
 
-        private String managedLedgerName(String topicName, int partition) {
+        private String logName(String topicName, int partition) {
             return "public/default/persistent/" + topicName + "-partition-" + partition;
         }
     }
@@ -1133,15 +1134,19 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
         var initializedMethod = partitionLog.getClass().getDeclaredMethod("initialized");
         initializedMethod.setAccessible(true);
-        Object managedLedgerFuture = initializedMethod.invoke(partitionLog);
-        Object managedLedger = ((CompletableFuture<?>) managedLedgerFuture)
+        Object logFuture = initializedMethod.invoke(partitionLog);
+        Object logInstance = ((CompletableFuture<?>) logFuture)
                 .get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        CompletableFuture<Void> trimFuture = new CompletableFuture<>();
-        var trimMethod = managedLedger.getClass()
-                .getMethod("trimConsumedLedgersInBackground", CompletableFuture.class);
-        trimMethod.invoke(managedLedger, trimFuture);
-        trimFuture.get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        Class<?> logClass = Class.forName(
+                "io.streamnative.lakestream.api.Log",
+                true,
+                logInstance.getClass().getClassLoader());
+        var trimMethod = state.getClass()
+                .getDeclaredMethod("maybeApplyRetention", logClass, long.class, long.class);
+        trimMethod.setAccessible(true);
+        Object trimFuture = trimMethod.invoke(state, logInstance, 1L, -1L);
+        ((CompletableFuture<?>) trimFuture).get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     private static Object unwrapUrsaStorageState(Object ursaStateOrEngine) throws Exception {
@@ -1167,13 +1172,26 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
     @SuppressWarnings("unchecked")
     private static Map<String, String> getUrsaTopicConfig(Object ursaStateOrEngine, String topicName) throws Exception {
         Object state = unwrapUrsaStorageState(ursaStateOrEngine);
-        Field holderField = state.getClass().getDeclaredField("managedLedgerFactoryHolder");
+        Field holderField = state.getClass().getDeclaredField("lakestreamStorageHolder");
         holderField.setAccessible(true);
         Object holder = holderField.get(state);
 
-        var topicConfigMethod = holder.getClass().getDeclaredMethod("dummyTopicConfig", String.class);
-        topicConfigMethod.setAccessible(true);
-        String managedLedgerName = "public/default/persistent/" + topicName + "-partition-0";
-        return (Map<String, String>) topicConfigMethod.invoke(holder, managedLedgerName);
+        var catalogMethod = holder.getClass().getDeclaredMethod("catalog");
+        catalogMethod.setAccessible(true);
+        Object catalog = catalogMethod.invoke(holder);
+
+        var identifierMethod = holder.getClass().getDeclaredMethod("streamIdentifier", String.class);
+        identifierMethod.setAccessible(true);
+        Object identifier = identifierMethod.invoke(null, topicName);
+
+        var loadStreamMethod = catalog.getClass().getMethod("loadStream", identifier.getClass());
+        Object stream = ((CompletableFuture<?>) loadStreamMethod.invoke(catalog, identifier))
+                .get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        try {
+            var propertiesMethod = stream.getClass().getMethod("properties");
+            return Map.copyOf((Map<String, String>) propertiesMethod.invoke(stream));
+        } finally {
+            ((AutoCloseable) stream).close();
+        }
     }
 }

@@ -501,7 +501,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     }
 
     CompletableFuture<Log> openLog(TopicIdPartition tp) {
-        String name = KafkaManagedLedgerNaming.managedLedgerName(tp);
+        String name = KafkaLogNaming.logName(tp);
         Map<String, String> suppliedTopicConfig = topicConfigSupplier != null
                 ? topicConfigSupplier.apply(tp.topic())
                 : null;

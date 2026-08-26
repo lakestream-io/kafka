@@ -293,7 +293,7 @@ Test coverage includes:
 6. Multi-zone integration behavior:
    - cross-zone bootstrap with zone-correct routing
    - multiple producers and consumers using different zones
-   - expected managed-ledger state only on the relevant zone owners
+   - expected partition-log state only on the relevant zone owners
 
 7. Failover behavior:
    - automatic fallback when in-zone brokers are unavailable

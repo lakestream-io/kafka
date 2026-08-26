@@ -18,6 +18,7 @@ package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.config.types.Password;
 import org.apache.kafka.server.config.ServerLogConfigs;
+import org.apache.kafka.storage.internals.log.LogConfig;
 
 import org.junit.jupiter.api.Test;
 
@@ -46,6 +47,53 @@ class UrsaStorageConfigTest {
     }
 
     @Test
+    void testCatalogOxiaServiceUrlDefaults() throws Exception {
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of());
+
+        assertEquals(ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_DEFAULT,
+            config.getCatalogOxiaServiceUrl());
+    }
+
+    @Test
+    void testCatalogOxiaServiceUrlUsesPrimaryConfig() throws Exception {
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
+            ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://catalog:6648/kafka"
+        ));
+
+        assertEquals("oxia://catalog:6648/kafka", config.getCatalogOxiaServiceUrl());
+    }
+
+    @Test
+    void testCatalogOxiaServiceUrlSupportsLegacyAlias() throws Exception {
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
+            ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://legacy:6648/kafka"
+        ));
+
+        assertEquals("oxia://legacy:6648/kafka", config.getCatalogOxiaServiceUrl());
+    }
+
+    @Test
+    void testCatalogOxiaServiceUrlSupportsLegacyAliasAfterConfigParsing() throws Exception {
+        LogConfig parsedConfig = new LogConfig(Map.of(
+            ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://legacy:6648/kafka"
+        ));
+
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(parsedConfig.originals());
+
+        assertEquals("oxia://legacy:6648/kafka", config.getCatalogOxiaServiceUrl());
+    }
+
+    @Test
+    void testCatalogOxiaServiceUrlPrimaryConfigTakesPrecedenceOverLegacyAlias() throws Exception {
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
+            ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://catalog:6648/kafka",
+            ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://legacy:6648/kafka"
+        ));
+
+        assertEquals("oxia://catalog:6648/kafka", config.getCatalogOxiaServiceUrl());
+    }
+
+    @Test
     void testSnapshotConfigOverrides() throws Exception {
         UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
             ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_CONFIG, "1234",
@@ -63,39 +111,32 @@ class UrsaStorageConfigTest {
         assertEquals(ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DEFAULT,
             config.getExternalReaderFactoryClass());
         assertNull(config.getConfiguredExternalReaderFactoryClass());
-        assertNull(config.getKopSchemaRegistryUrl());
-        assertNull(config.getKopSchemaRegistryHttpHeaderAuthorization());
-        assertNull(config.getKopSchemaRegistryHttpHeaderAuthorizationFile());
+        assertNull(config.getS3SessionToken());
+        assertNull(config.getS3PathStyleAccess());
+    }
+
+    @Test
+    void testS3ReaderOptionsPreserveExplicitValues() throws Exception {
+        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
+            ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_CONFIG, new Password("session-token"),
+            ServerLogConfigs.URSA_STORAGE_S3_PATH_STYLE_ACCESS_CONFIG, "true"
+        ));
+
+        assertEquals("session-token", config.getS3SessionToken());
+        assertEquals(Boolean.TRUE, config.getS3PathStyleAccess());
     }
 
     @Test
     void testExternalReaderOverrides() throws Exception {
         UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
             ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG,
-                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory",
-            ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_CONFIG, "http://example:8001",
-            ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_CONFIG, "Bearer token",
-            ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_CONFIG,
-                "/mnt/secrets/token"
+                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory"
         ));
 
         assertEquals("io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory",
             config.getExternalReaderFactoryClass());
         assertEquals("io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory",
             config.getConfiguredExternalReaderFactoryClass());
-        assertEquals("http://example:8001", config.getKopSchemaRegistryUrl());
-        assertEquals("Bearer token", config.getKopSchemaRegistryHttpHeaderAuthorization());
-        assertEquals("/mnt/secrets/token", config.getKopSchemaRegistryHttpHeaderAuthorizationFile());
-    }
-
-    @Test
-    void testExternalReaderAuthorizationPasswordValueIsUnwrapped() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
-            ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_CONFIG,
-                new Password("Bearer token")
-        ));
-
-        assertEquals("Bearer token", config.getKopSchemaRegistryHttpHeaderAuthorization());
     }
 
     private static String backendType(String backendType) throws Exception {

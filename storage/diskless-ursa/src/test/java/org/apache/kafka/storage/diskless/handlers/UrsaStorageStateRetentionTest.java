@@ -59,9 +59,9 @@ class UrsaStorageStateRetentionTest {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("retention-test-topic", 0));
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Log logInstance = mock(Log.class);
-        when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
+        when(catalog.generateStreamId(Optional.of(KafkaLogNaming.logName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(1L)))
                 .thenReturn(logInstance);
 
         try (UrsaStorageState state = newState(catalog)) {
@@ -185,9 +185,9 @@ class UrsaStorageStateRetentionTest {
         Log logInstance = mock(Log.class);
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
-        when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
+        when(catalog.generateStreamId(Optional.of(KafkaLogNaming.logName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(1L)))
                 .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset())
@@ -230,7 +230,7 @@ class UrsaStorageStateRetentionTest {
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
 
-        when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
+        when(catalog.generateStreamId(Optional.of(KafkaLogNaming.logName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
         when(catalog.registerExternalPartition(identifier, 0, 1L, Map.of()))
                 .thenReturn(CompletableFuture.completedFuture(null));
@@ -239,7 +239,7 @@ class UrsaStorageStateRetentionTest {
         when(stream.properties()).thenReturn(Map.of());
         when(catalog.setStreamProperties(identifier, updatedConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(1L)))
                 .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
@@ -277,7 +277,7 @@ class UrsaStorageStateRetentionTest {
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
 
-        when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
+        when(catalog.generateStreamId(Optional.of(KafkaLogNaming.logName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
         when(catalog.registerExternalPartition(identifier, 0, 1L, Map.of()))
                 .thenReturn(CompletableFuture.completedFuture(null));
@@ -286,7 +286,7 @@ class UrsaStorageStateRetentionTest {
                 .thenReturn(CompletableFuture.failedFuture(new RuntimeException("catalog unavailable")));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
-        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(1L)))
                 .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
@@ -332,9 +332,9 @@ class UrsaStorageStateRetentionTest {
             }
         };
 
-        when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
+        when(catalog.generateStreamId(Optional.of(KafkaLogNaming.logName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(1L)))
                 .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
@@ -383,9 +383,9 @@ class UrsaStorageStateRetentionTest {
         LogOffset lastOffset = mockOffset(42L);
         CompletableFuture<Long> trimOffset = new CompletableFuture<>();
 
-        when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
+        when(catalog.generateStreamId(Optional.of(KafkaLogNaming.logName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+        when(catalog.createLog(KafkaLogNaming.logName(tp), LogId.of(1L)))
                 .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));

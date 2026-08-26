@@ -914,7 +914,10 @@ class KafkaConfigTest {
 
         // Ursa storage configs: many are plain strings, so do not treat "not_a_number" as invalid.
         case ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG => // ignore string
-        case ServerLogConfigs.PULSAR_OXIA_SERVICE_URL_CONFIG => // ignore string
+        case ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG => // ignore string
+        case ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_CONFIG => // ignore password string
+        case ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG => // ignore string
+        case ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG => // ignore string
         case ServerLogConfigs.INTERCEPTOR_CLASS_NAME_CONFIG => // ignore string
         case ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_WAL_DIRECTORY_CONFIG => // ignore string
@@ -928,10 +931,6 @@ class KafkaConfigTest {
         case ServerLogConfigs.URSA_STORAGE_S3_BUCKET_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_S3_REGION_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG => // ignore string
-        case ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_URL_CONFIG => // ignore string
-        case ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_CONFIG => // ignore string
-        case ServerLogConfigs.URSA_STORAGE_KOP_SCHEMA_REGISTRY_HTTP_HEADER_AUTHORIZATION_FILE_CONFIG => // ignore string
-
         case CleanerConfig.LOG_CLEANER_IO_MAX_BYTES_PER_SECOND_PROP => assertPropertyInvalid(baseProperties, name, "not_a_number")
         case CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_SIZE_PROP => assertPropertyInvalid(baseProperties, name, "not_a_number", "1024")
         case CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_LOAD_FACTOR_PROP => assertPropertyInvalid(baseProperties, name, "not_a_number")
