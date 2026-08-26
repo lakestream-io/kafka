@@ -2789,7 +2789,6 @@ project(':storage:storage-diskless-api') {
     implementation project(':server-common')
     implementation project(':storage')
     implementation project(':storage:storage-api')
-    implementation libs.jacksonDatabind
     implementation libs.slf4jApi
 
     testImplementation project(':clients').sourceSets.test.output
@@ -2842,6 +2841,7 @@ project(':storage:storage-diskless-ursa') {
       exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
     }
     implementation "io.github.oxia-db:oxia-client-api:$oxiaClientVersion"
+    runtimeOnly "io.github.oxia-db:oxia-client:$oxiaClientVersion"
     implementation 'io.netty:netty-buffer:4.1.131.Final'
 
     testImplementation project(':clients').sourceSets.test.output

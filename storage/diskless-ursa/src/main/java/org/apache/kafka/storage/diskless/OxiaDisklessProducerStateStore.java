@@ -16,34 +16,38 @@
  */
 package org.apache.kafka.storage.diskless;
 
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
+import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
+
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import io.oxia.client.api.AsyncOxiaClient;
 
-public final class OxiaDisklessMetadataStore implements DisklessMetadataStore {
+/** Oxia-backed persistence operations for Kafka-owned producer-state snapshots. */
+public final class OxiaDisklessProducerStateStore implements DisklessProducerStateStore {
     private static final long CONNECT_TIMEOUT_SECONDS = 10;
+
     private final AsyncOxiaClient client;
 
-    /**
-     * Create the Oxia based metadata store.
-     *
-     * @param url the format of "oxia://host:port[/namespace]". If namespace is not provided, "default" will
-     *                       be used.
-     * @throws IllegalArgumentException if the URL format is invalid.
-     */
-    public OxiaDisklessMetadataStore(String url) throws Exception {
-        this.client = new OxiaServiceUrl(url).client().get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    public OxiaDisklessProducerStateStore(UrsaStorageConfig config) throws Exception {
+        Objects.requireNonNull(config, "config must not be null");
+        this.client = new OxiaServiceUrl(config.getUrsaOxiaServiceUrl())
+                .client()
+                .get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    OxiaDisklessProducerStateStore(AsyncOxiaClient client) {
+        this.client = Objects.requireNonNull(client, "client must not be null");
     }
 
     @Override
-    public CompletableFuture<Void> put(String key, byte[] value) {
-        return client.put(key, value).thenApply(ignored -> null);
-    }
-
-    @Override
-    public CompletableFuture<Void> delete(String key) {
-        return client.delete(key).thenApply(ignored -> null);
+    public CompletableFuture<Void> deleteTopicSnapshots(Uuid topicId) {
+        Objects.requireNonNull(topicId, "topicId must not be null");
+        String prefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId.toString());
+        return client.deleteRange(prefix, prefix + '\uffff');
     }
 
     @Override

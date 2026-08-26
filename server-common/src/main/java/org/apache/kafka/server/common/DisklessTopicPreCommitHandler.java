@@ -21,25 +21,25 @@ import org.apache.kafka.common.Uuid;
 import java.util.Map;
 
 /**
- * Handler for pre-commit Oxia writes during diskless topic creation.
+ * Handler for pre-commit storage registration during diskless topic creation.
  *
- * <p>Implementations write to Oxia BEFORE KRaft commit so that failures
+ * <p>Implementations register the topic with the diskless storage system before KRaft commit so that failures
  * can be surfaced to the user as topic creation errors.
  *
- * <p>Topic deletion cleanup is handled post-commit by {@code UrsaPartitionedTopicsPublisher},
- * because deleting Oxia metadata before KRaft commit risks inconsistency if KRaft deletion
- * fails after Oxia metadata is already removed.
+ * <p>Topic deletion cleanup is handled by a post-commit metadata publisher,
+ * because unregistering storage metadata before KRaft commit risks inconsistency if KRaft deletion
+ * fails after the storage metadata is already removed.
  */
 public interface DisklessTopicPreCommitHandler {
 
     /**
-     * Write diskless topic metadata to Oxia before KRaft commit.
+     * Register diskless topic metadata with the storage system before KRaft commit.
      *
      * @param topicName  the topic name
      * @param topicId    the Kafka topic incarnation ID
      * @param partitions the number of partitions
      * @param configs    the topic creation configs
-     * @throws Exception if the Oxia write fails; the topic creation will be rejected
+     * @throws Exception if storage registration fails; the topic creation will be rejected
      */
     void preCommitCreateTopic(
         String topicName,

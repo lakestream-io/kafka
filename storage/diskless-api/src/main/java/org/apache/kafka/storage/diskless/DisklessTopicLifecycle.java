@@ -16,11 +16,27 @@
  */
 package org.apache.kafka.storage.diskless;
 
+import org.apache.kafka.common.Uuid;
+
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
-public interface DisklessMetadataStore extends AutoCloseable {
+/**
+ * Storage-neutral lifecycle operations for Kafka topics whose data is managed by a diskless
+ * storage implementation.
+ *
+ * <p>The implementation owns its catalog schema and metadata-store layout. Kafka supplies only
+ * topic identity, partition count, and topic properties.
+ */
+public interface DisklessTopicLifecycle extends AutoCloseable {
 
-    CompletableFuture<Void> put(String key, byte[] value);
+    /** Register a logical diskless topic without creating its physical partition logs. */
+    CompletableFuture<Void> registerTopic(
+            String topicName,
+            Uuid topicId,
+            int partitions,
+            Map<String, String> properties);
 
-    CompletableFuture<Void> delete(String key);
+    /** Unregister the logical topic after its Kafka metadata has been deleted. */
+    CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId);
 }

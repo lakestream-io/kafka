@@ -58,7 +58,6 @@ class DisklessStorageEngineLoaderTest {
     private static final String SHARED_RESOURCE = "shared-resource.txt";
     private static final String PLUGIN_RESOURCE = "plugin-only-resource.txt";
     private static final String TCCL_ENGINE_CLASS = "plugin.TcclDisklessStorageEngine";
-    private static final String TCCL_METADATA_STORE_CLASS = "plugin.TcclDisklessMetadataStore";
 
     @TempDir
     Path tempDir;
@@ -160,21 +159,6 @@ class DisklessStorageEngineLoaderTest {
     }
 
     @Test
-    void testDisklessMetadataStoreLoaderReleasesClassLoaderWhenClassInitializationThrowsError() throws Exception {
-        Path childDir = Files.createDirectory(tempDir.resolve("metadata-error"));
-        URL[] urls = DisklessMetadataStoreLoader.classPathUrls(childDir.toString());
-        ClassLoader parent = DisklessMetadataStoreLoader.class.getClassLoader();
-
-        assertThrows(ExceptionInInitializerError.class, () ->
-                DisklessMetadataStoreLoader.load(
-                        "oxia://localhost/default",
-                        childDir.toString(),
-                        FailingMetadataStore.class.getName()));
-
-        assertClassLoaderLeaseReleased(urls, parent);
-    }
-
-    @Test
     void testLeasedDisklessStorageEngineReleasesClassLoaderAfterDelegateClose() throws Exception {
         Path childDir = Files.createDirectory(tempDir.resolve("child"));
         URL[] urls = new URL[] {childDir.toUri().toURL()};
@@ -219,26 +203,6 @@ class DisklessStorageEngineLoaderTest {
     }
 
     @Test
-    void testLeasedDisklessMetadataStoreReleasesClassLoaderAfterDelegateClose() throws Exception {
-        Path childDir = Files.createDirectory(tempDir.resolve("child"));
-        URL[] urls = new URL[] {childDir.toUri().toURL()};
-        ClassLoader parent = DisklessStorageEngineLoaderTest.class.getClassLoader();
-        DisklessClassLoaderRegistry.Lease lease = DisklessClassLoaderRegistry.acquire(urls, parent);
-        ClassLoader firstLoader = lease.classLoader();
-        CloseTrackingDisklessMetadataStore delegate = new CloseTrackingDisklessMetadataStore();
-
-        new LeasedDisklessMetadataStore(delegate, lease).close();
-        assertTrue(delegate.closed.get());
-
-        DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-        try {
-            assertNotSame(firstLoader, nextLease.classLoader());
-        } finally {
-            nextLease.close();
-        }
-    }
-
-    @Test
     void testDisklessRuntimeUsesPluginContextClassLoaderEndToEnd() throws Exception {
         Path pluginDir = compileTcclPlugin();
 
@@ -260,13 +224,6 @@ class DisklessStorageEngineLoaderTest {
             engine.cleanupNonOwnedProducerStates(null, Set.of(), false);
         }
 
-        try (DisklessMetadataStore store = DisklessMetadataStoreLoader.load(
-                "oxia://localhost/default",
-                pluginDir.toString(),
-                TCCL_METADATA_STORE_CLASS)) {
-            store.put("key", new byte[0]).get();
-            store.delete("key").get();
-        }
     }
 
     private Path writeResource(String directoryName, String resourceName, String value) throws Exception {
@@ -292,7 +249,6 @@ class DisklessStorageEngineLoaderTest {
         Path sourceDir = Files.createDirectories(pluginDir.resolve("plugin"));
         Files.writeString(pluginDir.resolve(PLUGIN_RESOURCE), "visible-to-plugin-tccl");
         Files.writeString(sourceDir.resolve("TcclDisklessStorageEngine.java"), tcclEngineSource());
-        Files.writeString(sourceDir.resolve("TcclDisklessMetadataStore.java"), tcclMetadataStoreSource());
 
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         assertNotNull(compiler);
@@ -304,8 +260,7 @@ class DisklessStorageEngineLoaderTest {
                 System.getProperty("java.class.path"),
                 "-d",
                 pluginDir.toString(),
-                sourceDir.resolve("TcclDisklessStorageEngine.java").toString(),
-                sourceDir.resolve("TcclDisklessMetadataStore.java").toString());
+                sourceDir.resolve("TcclDisklessStorageEngine.java").toString());
         assertEquals(0, result);
         return pluginDir;
     }
@@ -417,46 +372,6 @@ class DisklessStorageEngineLoaderTest {
                 """.formatted(PLUGIN_RESOURCE);
     }
 
-    private String tcclMetadataStoreSource() {
-        return """
-                package plugin;
-
-                import org.apache.kafka.storage.diskless.DisklessMetadataStore;
-
-                import java.util.concurrent.CompletableFuture;
-
-                public final class TcclDisklessMetadataStore implements DisklessMetadataStore {
-                    public TcclDisklessMetadataStore(String url) {
-                        requirePluginResource("constructor");
-                    }
-
-                    @Override
-                    public CompletableFuture<Void> put(String key, byte[] value) {
-                        requirePluginResource("put");
-                        return CompletableFuture.completedFuture(null);
-                    }
-
-                    @Override
-                    public CompletableFuture<Void> delete(String key) {
-                        requirePluginResource("delete");
-                        return CompletableFuture.completedFuture(null);
-                    }
-
-                    @Override
-                    public void close() {
-                        requirePluginResource("close");
-                    }
-
-                    private static void requirePluginResource(String operation) {
-                        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
-                        if (classLoader == null || classLoader.getResource("%s") == null) {
-                            throw new IllegalStateException("Missing plugin TCCL resource during " + operation);
-                        }
-                    }
-                }
-                """.formatted(PLUGIN_RESOURCE);
-    }
-
     private UrsaStorageConfig ursaConfig(Path classPath) throws Exception {
         return UrsaStorageConfig.fromConfigs(Map.of(
                 ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG,
@@ -535,25 +450,6 @@ class DisklessStorageEngineLoaderTest {
         }
     }
 
-    private static final class CloseTrackingDisklessMetadataStore implements DisklessMetadataStore {
-        private final AtomicBoolean closed = new AtomicBoolean(false);
-
-        @Override
-        public CompletableFuture<Void> put(String key, byte[] value) {
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public CompletableFuture<Void> delete(String key) {
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public void close() {
-            closed.set(true);
-        }
-    }
-
     private static final class FailingEngine {
         static {
             fail();
@@ -564,13 +460,4 @@ class DisklessStorageEngineLoaderTest {
         }
     }
 
-    private static final class FailingMetadataStore {
-        static {
-            fail();
-        }
-
-        private static void fail() {
-            throw new ExceptionInInitializerError("boom");
-        }
-    }
 }

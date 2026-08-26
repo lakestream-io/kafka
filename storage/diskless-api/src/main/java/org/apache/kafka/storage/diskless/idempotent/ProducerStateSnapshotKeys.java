@@ -29,7 +29,12 @@ public final class ProducerStateSnapshotKeys {
     }
 
     public static String snapshotKey(String topicId, int partition) {
-        return SNAPSHOT_PREFIX + topicId + "-" + partition;
+        return topicSnapshotPrefix(topicId) + partition;
+    }
+
+    /** Prefix shared by every unzoned and zoned snapshot for one exact topic incarnation. */
+    public static String topicSnapshotPrefix(String topicId) {
+        return SNAPSHOT_PREFIX + topicId + "-";
     }
 
     public static String snapshotKey(String topicId, int partition, String zone) {

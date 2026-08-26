@@ -20,7 +20,7 @@ package kafka.server
 import kafka.network.SocketServer
 import kafka.raft.KafkaRaftManager
 import kafka.server.QuotaFactory.QuotaManagers
-import kafka.server.metadata.{ClientQuotaMetadataManager, DynamicConfigPublisher, KRaftMetadataCachePublisher, UrsaPartitionedTopicsPublisher}
+import kafka.server.metadata.{ClientQuotaMetadataManager, DisklessTopicLifecyclePublisher, DynamicConfigPublisher, KRaftMetadataCachePublisher}
 
 import scala.collection.immutable
 import kafka.utils.Logging
@@ -52,7 +52,7 @@ import org.apache.kafka.server.policy.{AlterConfigPolicy, CreateTopicPolicy}
 import org.apache.kafka.server.util.{Deadline, FutureUtils}
 import org.apache.kafka.server.NodeToControllerChannelManagerImpl
 import org.apache.kafka.server.RaftControllerNodeProvider
-import org.apache.kafka.storage.diskless.{DisklessMetadataStoreLoader, UrsaPartitionedTopicsMetadataSync}
+import org.apache.kafka.storage.diskless.{DisklessProducerStateStore, DisklessProducerStateStoreLoader, DisklessTopicLifecycle, DisklessTopicLifecycleLoader}
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig
 
 import java.util
@@ -103,7 +103,8 @@ class ControllerServer(
   var clientQuotaMetadataManager: ClientQuotaMetadataManager = _
   var controllerApis: ControllerApis = _
   var controllerApisHandlerPool: KafkaRequestHandlerPool = _
-  var ursaOxiaSync: UrsaPartitionedTopicsMetadataSync = _
+  var disklessTopicLifecycle: DisklessTopicLifecycle = _
+  var disklessProducerStateStore: DisklessProducerStateStore = _
   def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
   val metadataPublishers: util.List[MetadataPublisher] = new util.ArrayList[MetadataPublisher]()
   @volatile var metadataCache : KRaftMetadataCache = _
@@ -267,13 +268,20 @@ class ControllerServer(
           setDisklessTopicPreCommitHandler({
             if (config.ursaStorageEnable) {
               val ursaConfig = UrsaStorageConfig.fromConfigs(config.originals().asInstanceOf[util.Map[String, _]])
-              ursaOxiaSync = new UrsaPartitionedTopicsMetadataSync(
-                (msg: String, cause: Throwable) => sharedServer.metadataPublishingFaultHandler.handleFault(msg, cause),
-                DisklessMetadataStoreLoader.load(ursaConfig.getCatalogOxiaServiceUrl, ursaConfig.getClassPath))
-              Optional.of[DisklessTopicPreCommitHandler](
-                (topicName: String, topicId: Uuid, partitions: Int, configs: util.Map[String, String]) => {
-                ursaOxiaSync.upsertPartitionedTopicMetadataSync(topicName, topicId, partitions, configs, 3000)
-              })
+              disklessTopicLifecycle = DisklessTopicLifecycleLoader.load(ursaConfig)
+              try {
+                disklessProducerStateStore = DisklessProducerStateStoreLoader.load(ursaConfig)
+                Optional.of[DisklessTopicPreCommitHandler](
+                  (topicName: String, topicId: Uuid, partitions: Int, configs: util.Map[String, String]) => {
+                    disklessTopicLifecycle.registerTopic(topicName, topicId, partitions, configs)
+                      .get(3000, TimeUnit.MILLISECONDS)
+                  })
+              } catch {
+                case error: Throwable =>
+                  Utils.closeQuietly(disklessTopicLifecycle, "diskless topic lifecycle")
+                  disklessTopicLifecycle = null
+                  throw error
+              }
             } else {
               Optional.empty[DisklessTopicPreCommitHandler]()
             }
@@ -348,11 +356,13 @@ class ControllerServer(
         ),
         "controller"))
 
-      // Mirror diskless topic lifecycle into Oxia for downstream topic discovery.
+      // Unregister deleted diskless topics and clean up Kafka-owned producer state.
       if (config.ursaStorageEnable) {
-        metadataPublishers.add(new UrsaPartitionedTopicsPublisher(
+        metadataPublishers.add(new DisklessTopicLifecyclePublisher(
           config.nodeId,
-          ursaOxiaSync,
+          disklessTopicLifecycle,
+          disklessProducerStateStore,
+          (msg: String, cause: Throwable) => sharedServer.metadataPublishingFaultHandler.handleFault(msg, cause),
         ))
       }
 
@@ -503,8 +513,10 @@ class ControllerServer(
         Utils.swallow(this.logger.underlying, () => quotaManagers.shutdown())
       Utils.closeQuietly(controller, "controller")
       Utils.closeQuietly(quorumControllerMetrics, "quorum controller metrics")
-      Utils.closeQuietly(ursaOxiaSync, "ursa oxia sync")
-      ursaOxiaSync = null
+      Utils.closeQuietly(disklessProducerStateStore, "diskless producer-state store")
+      disklessProducerStateStore = null
+      Utils.closeQuietly(disklessTopicLifecycle, "diskless topic lifecycle")
+      disklessTopicLifecycle = null
       authorizerPlugin.foreach(Utils.closeQuietly(_, "authorizer plugin"))
       createTopicPolicy.foreach(policy => Utils.closeQuietly(policy, "create topic policy"))
       alterConfigPolicy.foreach(policy => Utils.closeQuietly(policy, "alter config policy"))

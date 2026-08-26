@@ -26,36 +26,46 @@ import org.apache.kafka.image.TopicsDelta;
 import org.apache.kafka.image.loader.LoaderManifest;
 import org.apache.kafka.image.publisher.MetadataPublisher;
 import org.apache.kafka.raft.LeaderAndEpoch;
-import org.apache.kafka.storage.diskless.UrsaPartitionedTopicsMetadataSync;
+import org.apache.kafka.storage.diskless.DisklessProducerStateStore;
+import org.apache.kafka.storage.diskless.DisklessTopicLifecycle;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 
 /**
- * Controller-side metadata publisher which mirrors diskless topic lifecycle
- * into Oxia keys used by ursa-storage.
+ * Active-controller publisher for post-commit diskless topic cleanup.
  *
- * <p>Topic creation metadata is written pre-commit by
- * {@code DisklessTopicPreCommitHandler}. This publisher handles post-commit
- * topic deletion cleanup.
+ * <p>Topic registration is performed by {@code DisklessTopicPreCommitHandler}. Once KRaft topic
+ * deletion is committed, this publisher independently unregisters the storage catalog entry and
+ * removes Kafka-owned producer-state snapshots. Both operations are best effort.
  */
-public final class UrsaPartitionedTopicsPublisher implements MetadataPublisher {
+public final class DisklessTopicLifecyclePublisher implements MetadataPublisher {
 
     private final int nodeId;
     private final AtomicBoolean isActiveController = new AtomicBoolean(false);
-    private final UrsaPartitionedTopicsMetadataSync sync;
+    private final DisklessTopicLifecycle topicLifecycle;
+    private final DisklessProducerStateStore producerStateStore;
+    private final BiConsumer<String, Throwable> faultHandler;
+    private CompletableFuture<Void> lastOp = CompletableFuture.completedFuture(null);
 
-    public UrsaPartitionedTopicsPublisher(
+    public DisklessTopicLifecyclePublisher(
             int nodeId,
-            UrsaPartitionedTopicsMetadataSync sync) {
+            DisklessTopicLifecycle topicLifecycle,
+            DisklessProducerStateStore producerStateStore,
+            BiConsumer<String, Throwable> faultHandler) {
         this.nodeId = nodeId;
-        this.sync = Objects.requireNonNull(sync, "sync must not be null");
+        this.topicLifecycle = Objects.requireNonNull(topicLifecycle, "topicLifecycle must not be null");
+        this.producerStateStore = Objects.requireNonNull(producerStateStore, "producerStateStore must not be null");
+        this.faultHandler = Objects.requireNonNull(faultHandler, "faultHandler must not be null");
     }
 
     @Override
     public String name() {
-        return "UrsaPartitionedTopicsPublisher id=" + nodeId;
+        return "DisklessTopicLifecyclePublisher id=" + nodeId;
     }
 
     @Override
@@ -86,13 +96,46 @@ public final class UrsaPartitionedTopicsPublisher implements MetadataPublisher {
             if (!isDisklessTopic(oldImage, topicName)) {
                 continue;
             }
-            int partitions = oldTopicImage.partitions().size();
-            sync.deleteTopicMetadata(topicName, topicId, partitions, context);
+            enqueue(
+                    "unregister diskless topic " + topicName + " (" + topicId + ")",
+                    context,
+                    () -> topicLifecycle.unregisterTopic(topicName, topicId));
+            enqueue(
+                    "delete producer-state snapshots for topic " + topicName + " (" + topicId + ")",
+                    context,
+                    () -> producerStateStore.deleteTopicSnapshots(topicId));
         }
     }
 
     @Override
     public void close() {
+    }
+
+    private synchronized void enqueue(
+            String opName,
+            String context,
+            Supplier<CompletableFuture<Void>> operation) {
+        lastOp = lastOp.handle((ignored, previousError) -> null)
+                .thenCompose(ignored -> invokeBestEffort(opName, context, operation));
+    }
+
+    private CompletableFuture<Void> invokeBestEffort(
+            String opName,
+            String context,
+            Supplier<CompletableFuture<Void>> operation) {
+        try {
+            CompletableFuture<Void> future = Objects.requireNonNull(
+                    operation.get(), "Diskless cleanup operation returned null future");
+            return future.handle((ignored, error) -> {
+                if (error != null) {
+                    faultHandler.accept("Failed to " + opName + " in " + context, error);
+                }
+                return null;
+            });
+        } catch (Throwable error) {
+            faultHandler.accept("Failed to " + opName + " in " + context, error);
+            return CompletableFuture.completedFuture(null);
+        }
     }
 
     private boolean isDisklessTopic(MetadataImage image, String topicName) {

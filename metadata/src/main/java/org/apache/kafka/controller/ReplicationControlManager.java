@@ -343,7 +343,7 @@ public class ReplicationControlManager {
     private final boolean disklessStorageSystemEnabled;
 
     /**
-     * Optional handler for pre-commit Oxia writes during diskless topic lifecycle.
+     * Optional handler for pre-commit storage registration during diskless topic lifecycle.
      */
     private final Optional<DisklessTopicPreCommitHandler> disklessTopicPreCommitHandler;
 
@@ -884,7 +884,7 @@ public class ReplicationControlManager {
                     topic.name(), topicId, numPartitions, creationConfigs);
             } catch (Exception e) {
                 return new ApiError(Errors.UNKNOWN_SERVER_ERROR,
-                    "Failed to write diskless topic metadata to Oxia: " + e.getMessage());
+                    "Failed to register diskless topic with the storage system: " + e.getMessage());
             }
         }
         CreatableTopicResult result = new CreatableTopicResult().

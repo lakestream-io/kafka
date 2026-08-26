@@ -26,10 +26,7 @@ import java.util.Map;
  */
 public class UrsaStorageConfig {
     private final boolean enabled;
-    /**
-     * The metadata store URL used by the Lakestream catalog and
-     * {@link org.apache.kafka.storage.diskless.UrsaPartitionedTopicsMetadataSync}.
-     */
+    /** The metadata store URL used by the Lakestream catalog. */
     private final String catalogOxiaServiceUrl;
 
     // The metadata store URL used for Ursa storage, e.g. the offset generation

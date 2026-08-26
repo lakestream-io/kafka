@@ -3762,7 +3762,7 @@ public class ReplicationControlManagerTest {
         DisklessTopicPreCommitHandler handler = new DisklessTopicPreCommitHandler() {
             @Override
             public void preCommitCreateTopic(String t, Uuid topicId, int p, Map<String, String> c) throws Exception {
-                if (failCreate.get()) throw new RuntimeException("Oxia unavailable");
+                if (failCreate.get()) throw new RuntimeException("storage catalog unavailable");
             }
         };
         ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().
@@ -3774,7 +3774,7 @@ public class ReplicationControlManagerTest {
         ControllerResult<CreateTopicsResponseData> result = createDisklessTopic(ctx, "diskless-topic", 2);
         CreatableTopicResult topicResult = result.response().topics().find("diskless-topic");
         assertEquals(Errors.UNKNOWN_SERVER_ERROR.code(), topicResult.errorCode());
-        assertTrue(topicResult.errorMessage().contains("Oxia unavailable"));
+        assertTrue(topicResult.errorMessage().contains("storage catalog unavailable"));
 
         // Now allow create to succeed, then verify delete works without pre-commit handler
         failCreate.set(false);

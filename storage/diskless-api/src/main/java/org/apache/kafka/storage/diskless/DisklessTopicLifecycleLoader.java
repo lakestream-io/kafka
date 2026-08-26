@@ -18,41 +18,46 @@ package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.server.util.KafkaPluginClassPaths;
+import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
 
 import java.lang.reflect.Constructor;
 import java.net.URL;
 
-public final class DisklessMetadataStoreLoader {
+/** Loads the diskless topic lifecycle implementation from the isolated storage runtime. */
+public final class DisklessTopicLifecycleLoader {
 
     private static final String DEFAULT_URSA_STORAGE_DIR = "ursa-storage";
-    private static final String OXIA_STORE_CLASS =
-            "org.apache.kafka.storage.diskless.OxiaDisklessMetadataStore";
+    private static final String URSA_TOPIC_LIFECYCLE_CLASS =
+            "org.apache.kafka.storage.diskless.handlers.UrsaDisklessTopicLifecycle";
 
-    private DisklessMetadataStoreLoader() {
+    private DisklessTopicLifecycleLoader() {
     }
 
-    public static DisklessMetadataStore load(String url, String classPath) {
-        return load(url, classPath, OXIA_STORE_CLASS);
+    public static DisklessTopicLifecycle load(UrsaStorageConfig config) {
+        return load(config, URSA_TOPIC_LIFECYCLE_CLASS);
     }
 
-    static DisklessMetadataStore load(String url, String classPath, String storeClassName) {
+    static DisklessTopicLifecycle load(UrsaStorageConfig config, String lifecycleClassName) {
         try {
-            ClassLoader parent = DisklessMetadataStoreLoader.class.getClassLoader();
-            URL[] urls = classPathUrls(classPath);
+            ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
+            URL[] urls = classPathUrls(config.getClassPath());
             DisklessClassLoaderRegistry.Lease classLoaderLease = DisklessClassLoaderRegistry.acquire(urls, parent);
             try {
-                DisklessMetadataStore store = DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
-                    Class<?> storeClass = Class.forName(storeClassName, true, classLoaderLease.classLoader());
-                    Constructor<?> constructor = storeClass.getConstructor(String.class);
-                    return (DisklessMetadataStore) constructor.newInstance(url);
-                });
-                return new LeasedDisklessMetadataStore(store, classLoaderLease);
+                DisklessTopicLifecycle lifecycle = DisklessClassLoaderContext.call(
+                        classLoaderLease.classLoader(),
+                        () -> {
+                            Class<?> lifecycleClass = Class.forName(
+                                    lifecycleClassName, true, classLoaderLease.classLoader());
+                            Constructor<?> constructor = lifecycleClass.getConstructor(UrsaStorageConfig.class);
+                            return (DisklessTopicLifecycle) constructor.newInstance(config);
+                        });
+                return new LeasedDisklessTopicLifecycle(lifecycle, classLoaderLease);
             } catch (Throwable t) {
                 DisklessClassLoaderRegistry.closeLeaseOnFailure(classLoaderLease, t);
                 throw rethrow(t);
             }
         } catch (Exception e) {
-            throw new KafkaException("Failed to load Oxia store", e);
+            throw new KafkaException("Failed to load diskless topic lifecycle", e);
         }
     }
 
@@ -60,7 +65,7 @@ public final class DisklessMetadataStoreLoader {
         String classPath = KafkaPluginClassPaths.configuredOrDefault(
                 configuredClassPath,
                 DEFAULT_URSA_STORAGE_DIR,
-                DisklessMetadataStoreLoader.class);
+                DisklessTopicLifecycleLoader.class);
         return KafkaPluginClassPaths.toUrls(classPath);
     }
 
@@ -71,6 +76,6 @@ public final class DisklessMetadataStoreLoader {
         if (t instanceof Error error) {
             throw error;
         }
-        return new KafkaException("Failed to load Oxia store", t);
+        return new KafkaException("Failed to load diskless topic lifecycle", t);
     }
 }

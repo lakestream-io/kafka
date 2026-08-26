@@ -17,28 +17,24 @@
 package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Uuid;
 
 import java.util.concurrent.CompletableFuture;
 
-final class LeasedDisklessMetadataStore implements DisklessMetadataStore {
-    private final DisklessMetadataStore delegate;
+final class LeasedDisklessProducerStateStore implements DisklessProducerStateStore {
+    private final DisklessProducerStateStore delegate;
     private final DisklessClassLoaderRegistry.Lease classLoaderLease;
 
-    LeasedDisklessMetadataStore(
-            DisklessMetadataStore delegate,
+    LeasedDisklessProducerStateStore(
+            DisklessProducerStateStore delegate,
             DisklessClassLoaderRegistry.Lease classLoaderLease) {
         this.delegate = delegate;
         this.classLoaderLease = classLoaderLease;
     }
 
     @Override
-    public CompletableFuture<Void> put(String key, byte[] value) {
-        return callWithClassLoader(() -> delegate.put(key, value));
-    }
-
-    @Override
-    public CompletableFuture<Void> delete(String key) {
-        return callWithClassLoader(() -> delegate.delete(key));
+    public CompletableFuture<Void> deleteTopicSnapshots(Uuid topicId) {
+        return callWithClassLoader(() -> delegate.deleteTopicSnapshots(topicId));
     }
 
     @Override
@@ -59,7 +55,7 @@ final class LeasedDisklessMetadataStore implements DisklessMetadataStore {
         } catch (RuntimeException | Error e) {
             throw e;
         } catch (Exception e) {
-            throw new KafkaException("Failed to invoke Ursa diskless metadata store", e);
+            throw new KafkaException("Failed to invoke diskless producer-state store", e);
         }
     }
 }
