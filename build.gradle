@@ -1651,6 +1651,9 @@ project(':core:core-sdt-ursa') {
     implementation("io.streamnative:ursa-storage-core:$ursaStorageVersion") {
       transitive = false
     }
+    implementation "io.streamnative:lakestream-api:$ursaStorageVersion"
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.21.5'
+    implementation 'com.fasterxml.jackson.module:jackson-module-parameter-names:2.21.5'
     implementation "io.github.oxia-db:oxia-client-api:$oxiaClientVersion"
     runtimeOnly "io.github.oxia-db:oxia-client:$oxiaClientVersion"
     runtimeOnly "org.apache.dubbo:hessian-lite:$hessianLiteVersion"

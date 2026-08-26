@@ -447,11 +447,18 @@ public class UrsaSDTInterceptorE2ETest {
 
     private List<CompactStreamTask> tasksForTopic(String topicName)
             throws Exception {
-        var tasks = taskManager.getFirstNTasksOfTopic(10).get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        var tasksInTopic = tasks.get(topicName);
-        if (tasksInTopic == null) {
-            return Collections.emptyList();
+        var tasksInTopic = new ArrayList<CompactStreamTask>();
+        var packagedTasks = taskManager.getAllTasks().get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        for (var packagedTask : packagedTasks) {
+            for (var subTask : packagedTask.getSubTasks()) {
+                var task = taskManager.getCompactStreamTask(subTask)
+                    .get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (task != null && topicName.equals(task.getTopic())) {
+                    tasksInTopic.add(task);
+                }
+            }
         }
-        return new ArrayList<>(tasksInTopic);
+        Collections.sort(tasksInTopic);
+        return tasksInTopic;
     }
 }
