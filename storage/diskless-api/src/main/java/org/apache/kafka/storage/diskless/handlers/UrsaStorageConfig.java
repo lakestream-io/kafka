@@ -25,9 +25,6 @@ import java.util.Map;
  * Configuration for Ursa storage integration using Lakestream.
  */
 public class UrsaStorageConfig {
-    public static final String NOOP_EXTERNAL_READER_FACTORY_CLASS =
-            ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DEFAULT;
-
     private final boolean enabled;
     /**
      * The metadata store URL used by the Lakestream catalog and
@@ -52,7 +49,6 @@ public class UrsaStorageConfig {
     private final String s3Bucket;
     private final String compactionBucket;
     private final String s3Region;
-    private final String externalReaderFactoryClass;
     private final long producerStateSnapshotIntervalMs;
     private final int producerStateSnapshotRecordThreshold;
     private final String classPath;
@@ -75,7 +71,6 @@ public class UrsaStorageConfig {
                               String s3Bucket,
                               String compactionBucket,
                               String s3Region,
-                              String externalReaderFactoryClass,
                               long producerStateSnapshotIntervalMs,
                               int producerStateSnapshotRecordThreshold,
                               String classPath) {
@@ -97,7 +92,6 @@ public class UrsaStorageConfig {
         this.s3Bucket = s3Bucket;
         this.compactionBucket = compactionBucket;
         this.s3Region = s3Region;
-        this.externalReaderFactoryClass = externalReaderFactoryClass;
         this.producerStateSnapshotIntervalMs = producerStateSnapshotIntervalMs;
         this.producerStateSnapshotRecordThreshold = producerStateSnapshotRecordThreshold;
         this.classPath = classPath;
@@ -170,9 +164,6 @@ public class UrsaStorageConfig {
         String s3Region = getStringConfig(configs, ServerLogConfigs.URSA_STORAGE_S3_REGION_CONFIG,
                 ServerLogConfigs.URSA_STORAGE_S3_REGION_DEFAULT);
 
-        String externalReaderFactoryClass = getOptionalStringConfig(configs,
-                ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG);
-
         long producerStateSnapshotIntervalMs = getLongConfig(configs,
                 ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_CONFIG,
                 ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_DEFAULT);
@@ -186,7 +177,7 @@ public class UrsaStorageConfig {
                 backendType, storagePath, compactionPrefix,
                 writeBufferFlushIntervalMs, writeBufferSize, writeBufferFlushSize,
                 s3Endpoint, s3AccessKey, s3SecretKey, s3SessionToken, s3PathStyleAccess,
-                s3Bucket, compactionBucket, s3Region, externalReaderFactoryClass,
+                s3Bucket, compactionBucket, s3Region,
                 producerStateSnapshotIntervalMs, producerStateSnapshotRecordThreshold, classPath
         );
     }
@@ -296,14 +287,6 @@ public class UrsaStorageConfig {
 
     public String getS3Region() {
         return s3Region;
-    }
-
-    public String getExternalReaderFactoryClass() {
-        return externalReaderFactoryClass != null ? externalReaderFactoryClass : NOOP_EXTERNAL_READER_FACTORY_CLASS;
-    }
-
-    public String getConfiguredExternalReaderFactoryClass() {
-        return externalReaderFactoryClass;
     }
 
     public long getProducerStateSnapshotIntervalMs() {

@@ -29,6 +29,7 @@ import org.apache.kafka.server.storage.log.FetchPartitionData;
 import org.apache.kafka.storage.diskless.DisklessLogMetadata;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionRequest;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
+import org.apache.kafka.storage.diskless.LogEntryUtils;
 import org.apache.kafka.storage.diskless.handlers.RecordAnalyzer.RecordAnalysisResult;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateManager;
 
@@ -60,7 +61,6 @@ import io.streamnative.lakestream.api.LogCursor;
 import io.streamnative.lakestream.api.LogEntry;
 import io.streamnative.lakestream.api.LogEntryHeader;
 import io.streamnative.lakestream.api.LogOffset;
-import io.streamnative.ursa.storage.OwnedResultFutures;
 
 final class UrsaPartitionLog {
 
@@ -929,17 +929,7 @@ final class UrsaPartitionLog {
     }
 
     private Throwable closeLogEntries(List<LogEntry> entries, Throwable precedingError) {
-        try {
-            OwnedResultFutures.closeLogEntries(entries);
-        } catch (Throwable closeError) {
-            if (precedingError == null) {
-                return closeError;
-            }
-            if (precedingError != closeError) {
-                precedingError.addSuppressed(closeError);
-            }
-        }
-        return precedingError;
+        return LogEntryUtils.closeAll(entries, precedingError);
     }
 
     private static <T> void completeFromSource(

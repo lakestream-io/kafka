@@ -19,74 +19,50 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.storage.diskless.OxiaServiceUrl;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
-import io.opentelemetry.sdk.OpenTelemetrySdk;
-import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
 import io.oxia.client.api.AsyncOxiaClient;
-import io.oxia.client.api.options.DeleteOption;
 import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogId;
 import io.streamnative.lakestream.api.Stream;
+import io.streamnative.lakestream.api.StreamCatalog;
+import io.streamnative.lakestream.api.StreamCatalogLoader;
 import io.streamnative.lakestream.api.StreamIdentifier;
-import io.streamnative.ursa.lakestream.impl.IndexedStreamCatalog;
-import io.streamnative.ursa.lakestream.impl.StreamCatalogService;
-
-import static io.streamnative.ursa.storage.impl.StorageFormat.STREAM_ID_GENERATOR_PATH;
 
 /**
- * Holds an {@link IndexedStreamCatalog} instance for Kafka diskless storage.
- *
- * <p>Uses {@link StreamCatalogService} to bootstrap the full lakestream stack:
- * UrsaStorage, StorageApi, LogStorage, LogStateManager, EntryIndexCache, and OxiaClient.
+ * Holds a {@link StreamCatalog} instance for Kafka diskless storage.
  */
 final class LakestreamStorageHolder implements Closeable {
 
     private static final long OXIA_CONNECT_TIMEOUT_SECONDS = 10;
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-
-    public static final String EXTERNAL_READER_FACTORY_CLASS_PROP = "externalReaderFactoryClass";
-    public static final String LEGACY_SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP =
-            "ursa.externalReaderFactoryClass";
-    static final String KAFKA_LAKEHOUSE_READER_FACTORY_CLASS =
-            "io.streamnative.ursa.kafka.reader.KafkaLakehouseReaderFactory";
-    static final String LEGACY_LAKEHOUSE_READER_FACTORY_CLASS =
-            "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory";
     private static final String OXIA_STORAGE_URL_PROP = "oxiaStorageUrl";
-    private static final String SERVICE_NAME = "kafka-diskless-storage";
 
-    private final IndexedStreamCatalog catalog;
+    private final StreamCatalog catalog;
     private final AsyncOxiaClient producerStateOxiaClient;
-    private final OpenTelemetrySdk openTelemetrySdk;
     private final ConcurrentHashMap<StreamIdentifier, TopicOperations> topicOperations = new ConcurrentHashMap<>();
     private final Set<StreamIdentifier> deletedTopicStreams = ConcurrentHashMap.newKeySet();
 
     LakestreamStorageHolder(
-            IndexedStreamCatalog catalog,
-            AsyncOxiaClient producerStateOxiaClient,
-            OpenTelemetrySdk openTelemetrySdk) {
+            StreamCatalog catalog,
+            AsyncOxiaClient producerStateOxiaClient) {
         this.catalog = catalog;
         this.producerStateOxiaClient = producerStateOxiaClient;
-        this.openTelemetrySdk = openTelemetrySdk;
     }
 
-    IndexedStreamCatalog catalog() {
+    StreamCatalog catalog() {
         return catalog;
     }
 
@@ -94,29 +70,25 @@ final class LakestreamStorageHolder implements Closeable {
         return producerStateOxiaClient;
     }
 
-    CompletableFuture<Void> registerPartition(TopicIdPartition tp, long streamId, Map<String, String> topicConfig) {
+    CompletableFuture<Log> openPartition(TopicIdPartition tp, Map<String, String> topicConfig) {
         StreamIdentifier identifier = streamIdentifier(tp);
         if (deletedTopicStreams.contains(identifier)) {
             return CompletableFuture.failedFuture(
                     new IllegalStateException("Kafka topic incarnation is already deleted: " + tp));
         }
         Map<String, String> suppliedConfig = topicConfig != null ? Map.copyOf(topicConfig) : Map.of();
-        return enqueueTopicOperation(identifier, operations -> operations.enqueueRegistration(
+        return enqueueTopicOperation(identifier, operations -> operations.enqueueOpen(
                 suppliedConfig,
                 currentConfig -> {
                     if (deletedTopicStreams.contains(identifier)) {
                         return CompletableFuture.failedFuture(
                                 new IllegalStateException("Kafka topic incarnation is already deleted: " + tp));
                     }
-                    return catalog.registerExternalPartition(
-                                    identifier,
-                                    tp.partition(),
-                                    streamId,
-                                    currentConfig)
-                            // registerExternalPartition only updates properties while growing the partition count.
-                            // Replace them explicitly so a config event racing this open cannot be overwritten by
-                            // the snapshot captured when openLog started.
-                            .thenCompose(ignored -> replaceTopicConfig(identifier, currentConfig));
+                    return catalog.openExternalPartition(identifier, tp.partition(), currentConfig)
+                            // Opening an external partition only updates properties while growing the partition
+                            // count. Replace them explicitly so a config event racing this open cannot be
+                            // overwritten by the snapshot captured when openLog started.
+                            .thenCompose(log -> replaceTopicConfigAndReturnLog(identifier, currentConfig, log));
                 }))
                 .future();
     }
@@ -141,7 +113,7 @@ final class LakestreamStorageHolder implements Closeable {
     CompletableFuture<Void> asyncDeleteTopicConfig(TopicIdPartition topicIdPartition) {
         StreamIdentifier identifier = streamIdentifier(topicIdPartition);
         deletedTopicStreams.add(identifier);
-        TopicOperation deletion = enqueueTopicOperation(
+        TopicOperation<Void> deletion = enqueueTopicOperation(
                 identifier,
                 operations -> operations.enqueueDeletion(() -> replaceTopicConfig(identifier, Map.of())));
         deletion.future().whenComplete((ignored, error) -> {
@@ -152,9 +124,9 @@ final class LakestreamStorageHolder implements Closeable {
         return deletion.future();
     }
 
-    private TopicOperation enqueueTopicOperation(
+    private <T> TopicOperation<T> enqueueTopicOperation(
             StreamIdentifier identifier,
-            Function<TopicOperations, QueuedOperation> enqueue) {
+            Function<TopicOperations, QueuedOperation<T>> enqueue) {
         while (true) {
             TopicOperations operations = topicOperations.computeIfAbsent(identifier, ignored -> new TopicOperations());
             synchronized (operations) {
@@ -164,13 +136,13 @@ final class LakestreamStorageHolder implements Closeable {
                 if (topicOperations.get(identifier) != operations) {
                     continue;
                 }
-                QueuedOperation queued = enqueue.apply(operations);
-                return new TopicOperation(operations, queued.sequence(), queued.future());
+                QueuedOperation<T> queued = enqueue.apply(operations);
+                return new TopicOperation<>(operations, queued.sequence(), queued.future());
             }
         }
     }
 
-    private void evictTopicOperations(StreamIdentifier identifier, TopicOperation deletion) {
+    private void evictTopicOperations(StreamIdentifier identifier, TopicOperation<Void> deletion) {
         TopicOperations operations = deletion.operations();
         synchronized (operations) {
             // Keep the state when another operation for this exact UUID-qualified stream was
@@ -192,8 +164,12 @@ final class LakestreamStorageHolder implements Closeable {
                 return CompletableFuture.completedFuture(null);
             }
             return catalog.loadStream(identifier).thenCompose(stream -> {
-                Map<String, String> existing = Map.copyOf(stream.properties());
-                closeStreamQuietly(stream);
+                final Map<String, String> existing;
+                try {
+                    existing = Map.copyOf(stream.properties());
+                } finally {
+                    closeStreamQuietly(stream);
+                }
                 List<String> staleKeys = existing.keySet().stream()
                         .filter(key -> !topicConfig.containsKey(key))
                         .toList();
@@ -207,6 +183,37 @@ final class LakestreamStorageHolder implements Closeable {
         });
     }
 
+    private CompletableFuture<Log> replaceTopicConfigAndReturnLog(
+            StreamIdentifier identifier,
+            Map<String, String> topicConfig,
+            Log log) {
+        if (log == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("StreamCatalog.openExternalPartition returned null log"));
+        }
+        final CompletableFuture<Void> replaceFuture;
+        try {
+            replaceFuture = replaceTopicConfig(identifier, topicConfig);
+        } catch (Throwable error) {
+            closeLogAfterFailure(log, error);
+            return CompletableFuture.failedFuture(error);
+        }
+        if (replaceFuture == null) {
+            IllegalStateException error = new IllegalStateException("replaceTopicConfig returned null future");
+            closeLogAfterFailure(log, error);
+            return CompletableFuture.failedFuture(error);
+        }
+        return replaceFuture.handle((ignored, error) -> {
+            if (error != null) {
+                Throwable failure = error instanceof CompletionException
+                        && error.getCause() != null ? error.getCause() : error;
+                closeLogAfterFailure(log, failure);
+                throw new CompletionException(failure);
+            }
+            return log;
+        });
+    }
+
     CompletableFuture<Void> deletePartitionData(TopicIdPartition tp) {
         StreamIdentifier identifier = streamIdentifier(tp);
         // Fence this exact topic incarnation before queuing deletion. A lazy open that was
@@ -215,63 +222,26 @@ final class LakestreamStorageHolder implements Closeable {
         deletedTopicStreams.add(identifier);
         return enqueueTopicOperation(
                 identifier,
-                operations -> operations.enqueueCleanup(() -> deletePartitionDataNow(tp)))
+                operations -> operations.enqueueCleanup(
+                        () -> catalog.deleteExternalPartition(identifier, tp.partition())))
                 .future();
     }
 
-    private CompletableFuture<Void> deletePartitionDataNow(TopicIdPartition tp) {
-        String logName = KafkaLogNaming.logName(tp);
-        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
-        return catalog.getOxiaClient().get(metadataPath).thenCompose(metadata -> {
-            CompletableFuture<Void> deleteLogFuture;
-            if (metadata == null || metadata.value().length == 0) {
-                deleteLogFuture = CompletableFuture.completedFuture(null);
-            } else {
-                try {
-                    JsonNode root = OBJECT_MAPPER.readTree(metadata.value());
-                    JsonNode streamIdNode = root.get("streamId");
-                    if (streamIdNode == null || streamIdNode.asLong(-1L) < 0) {
-                        deleteLogFuture = CompletableFuture.completedFuture(null);
-                    } else {
-                        Log log = catalog.createLog(logName, LogId.of(streamIdNode.asLong()));
-                        deleteLogFuture = deleteLogAndClose(log);
-                    }
-                } catch (IOException e) {
-                    deleteLogFuture = CompletableFuture.failedFuture(e);
-                }
-            }
-
-            return deleteLogFuture
-                    .thenCompose(ignored -> catalog.getOxiaClient().delete(metadataPath))
-                    // Delete catalog metadata before the keyed stream-ID mapping. If cleanup is
-                    // interrupted between the two, recreation reuses the same now-empty stream ID
-                    // instead of registering a new ID while stale catalog metadata points at the old one.
-                    .thenCompose(ignored -> producerStateOxiaClient.delete(
-                            STREAM_ID_GENERATOR_PATH + "/" + logName,
-                            Set.of(DeleteOption.PartitionKey(STREAM_ID_GENERATOR_PATH))))
-                    .thenApply(ignored -> null);
-        });
-    }
-
     static LakestreamStorageHolder create(UrsaStorageConfig config) throws Exception {
-        IndexedStreamCatalog catalog = null;
+        StreamCatalog catalog = null;
         AsyncOxiaClient producerStateOxiaClient = null;
         CompletableFuture<AsyncOxiaClient> producerStateOxiaClientFuture = null;
-        OpenTelemetrySdk openTelemetrySdk = null;
         try {
-            openTelemetrySdk = createOpenTelemetrySdk();
             String oxiaUrl = config.getCatalogOxiaServiceUrl();
             Properties properties = buildStorageProperties(config);
-            properties.setProperty("storageTier", "default");
 
-            StreamCatalogService scs = new StreamCatalogService();
-            catalog = scs.open(oxiaUrl, properties, openTelemetrySdk);
+            catalog = StreamCatalogLoader.open(oxiaUrl, properties);
 
             producerStateOxiaClientFuture = new OxiaServiceUrl(config.getUrsaOxiaServiceUrl()).client();
             producerStateOxiaClient = producerStateOxiaClientFuture.get(
                     OXIA_CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-            return new LakestreamStorageHolder(catalog, producerStateOxiaClient, openTelemetrySdk);
+            return new LakestreamStorageHolder(catalog, producerStateOxiaClient);
         } catch (Exception e) {
             try {
                 if (catalog != null) {
@@ -280,9 +250,6 @@ final class LakestreamStorageHolder implements Closeable {
             } catch (Exception ignored) {
             }
             closeOxiaClientAfterFailedCreate(producerStateOxiaClient, producerStateOxiaClientFuture, e);
-            if (openTelemetrySdk != null) {
-                openTelemetrySdk.close();
-            }
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
@@ -308,27 +275,6 @@ final class LakestreamStorageHolder implements Closeable {
                 }
             });
         }
-    }
-
-    static OpenTelemetrySdk createOpenTelemetrySdk() {
-        return AutoConfiguredOpenTelemetrySdk.builder()
-                .addPropertiesSupplier(LakestreamStorageHolder::buildOpenTelemetryProperties)
-                .build()
-                .getOpenTelemetrySdk();
-    }
-
-    static Map<String, String> buildOpenTelemetryProperties() {
-        Map<String, String> props = new HashMap<>();
-        props.put("otel.service.name", SERVICE_NAME);
-        props.put("otel.metrics.exporter", "none");
-        props.put("otel.traces.exporter", "none");
-        props.put("otel.logs.exporter", "none");
-        for (String name : System.getProperties().stringPropertyNames()) {
-            if (name.startsWith("otel.")) {
-                props.put(name, System.getProperty(name));
-            }
-        }
-        return props;
     }
 
     static Properties buildStorageProperties(UrsaStorageConfig config) {
@@ -361,21 +307,8 @@ final class LakestreamStorageHolder implements Closeable {
             setIfNotEmpty(config.getS3Region(), v -> properties.setProperty("s3Region", v));
         }
 
-        String externalReaderFactoryClass = normalizeExternalReaderFactoryClass(firstNonBlank(
-                config.getConfiguredExternalReaderFactoryClass(),
-                System.getProperty(LEGACY_SYSTEM_EXTERNAL_READER_FACTORY_CLASS_PROP),
-                UrsaStorageConfig.NOOP_EXTERNAL_READER_FACTORY_CLASS));
-        properties.setProperty(EXTERNAL_READER_FACTORY_CLASS_PROP, externalReaderFactoryClass);
-        if (!UrsaStorageConfig.NOOP_EXTERNAL_READER_FACTORY_CLASS.equals(externalReaderFactoryClass)) {
-            if (isRemoteBackend(normalizedBackendType)) {
-                properties.setProperty(
-                        "compactionBackendStorageType", compactionBackendType(normalizedBackendType));
-                properties.setProperty("compactionBucket", config.getCompactionBucket());
-                properties.setProperty("compactionPrefix", config.getCompactionPrefix());
-                properties.setProperty("compactionBucketRegion", config.getS3Region());
-                setIfNotEmpty(config.getS3Endpoint(), v -> properties.setProperty("cloudStorageEndpoint", v));
-            }
-        }
+        setIfNotEmpty(config.getCompactionBucket(), v -> properties.setProperty("compactionBucket", v));
+        setIfNotEmpty(config.getCompactionPrefix(), v -> properties.setProperty("compactionPrefix", v));
         return properties;
     }
 
@@ -387,13 +320,6 @@ final class LakestreamStorageHolder implements Closeable {
         return "S3".equals(normalizedBackendType);
     }
 
-    private static String compactionBackendType(String normalizedBackendType) {
-        // Ursa uses the Azure Blob SDK for WAL objects, while Hadoop 3.5 only supports
-        // the ABFS connector for compacted Parquet files. Both can address an HNS-enabled
-        // Azure storage account, but they intentionally use different backend identifiers.
-        return "AZUREBLOB".equals(normalizedBackendType) ? "AZUREDFS" : normalizedBackendType;
-    }
-
     private static String normalizeBackendType(String backendType) {
         String normalizedBackendType = backendType.toUpperCase(Locale.ROOT);
         if ("AZURE_BLOB".equals(normalizedBackendType) || "AZUREBLOB".equals(normalizedBackendType)) {
@@ -402,26 +328,10 @@ final class LakestreamStorageHolder implements Closeable {
         return normalizedBackendType;
     }
 
-    private static void setIfNotEmpty(String value, java.util.function.Consumer<String> setter) {
+    private static void setIfNotEmpty(String value, Consumer<String> setter) {
         if (value != null && !value.isEmpty()) {
             setter.accept(value);
         }
-    }
-
-    private static String firstNonBlank(String first, String second, String defaultValue) {
-        if (first != null && !first.isBlank()) {
-            return first;
-        }
-        if (second != null && !second.isBlank()) {
-            return second;
-        }
-        return defaultValue;
-    }
-
-    private static String normalizeExternalReaderFactoryClass(String className) {
-        return LEGACY_LAKEHOUSE_READER_FACTORY_CLASS.equals(className)
-                ? KAFKA_LAKEHOUSE_READER_FACTORY_CLASS
-                : className;
     }
 
     static StreamIdentifier streamIdentifier(TopicIdPartition tp) {
@@ -435,23 +345,13 @@ final class LakestreamStorageHolder implements Closeable {
         }
     }
 
-    private static void closeLogQuietly(Log log) {
+    private static void closeLogAfterFailure(Log log, Throwable failure) {
         try {
             log.close();
-        } catch (Exception ignored) {
-        }
-    }
-
-    private static CompletableFuture<Void> deleteLogAndClose(Log log) {
-        try {
-            CompletableFuture<Void> deleteFuture = log.delete();
-            if (deleteFuture == null) {
-                throw new IllegalStateException("Log.delete returned null future");
+        } catch (Throwable closeError) {
+            if (failure != closeError) {
+                failure.addSuppressed(closeError);
             }
-            return deleteFuture.whenComplete((ignored, error) -> closeLogQuietly(log));
-        } catch (Throwable deleteError) {
-            closeLogQuietly(log);
-            return CompletableFuture.failedFuture(deleteError);
         }
     }
 
@@ -460,9 +360,9 @@ final class LakestreamStorageHolder implements Closeable {
         private volatile Map<String, String> latestTopicConfig;
         private long sequence;
 
-        synchronized QueuedOperation enqueueRegistration(
+        synchronized QueuedOperation<Log> enqueueOpen(
                 Map<String, String> suppliedConfig,
-                Function<Map<String, String>, CompletableFuture<Void>> operation) {
+                Function<Map<String, String>, CompletableFuture<Log>> operation) {
             if (latestTopicConfig == null) {
                 latestTopicConfig = suppliedConfig;
             }
@@ -470,28 +370,28 @@ final class LakestreamStorageHolder implements Closeable {
                     latestTopicConfig != null ? latestTopicConfig : suppliedConfig));
         }
 
-        synchronized QueuedOperation enqueueConfigUpdate(
+        synchronized QueuedOperation<Void> enqueueConfigUpdate(
                 Map<String, String> topicConfig,
                 Supplier<CompletableFuture<Void>> operation) {
             latestTopicConfig = topicConfig;
             return enqueue(operation);
         }
 
-        synchronized QueuedOperation enqueueDeletion(Supplier<CompletableFuture<Void>> operation) {
+        synchronized QueuedOperation<Void> enqueueDeletion(Supplier<CompletableFuture<Void>> operation) {
             latestTopicConfig = null;
             return enqueue(operation);
         }
 
-        synchronized QueuedOperation enqueueCleanup(Supplier<CompletableFuture<Void>> operation) {
+        synchronized QueuedOperation<Void> enqueueCleanup(Supplier<CompletableFuture<Void>> operation) {
             return enqueue(operation);
         }
 
-        private QueuedOperation enqueue(Supplier<CompletableFuture<Void>> operation) {
+        private <T> QueuedOperation<T> enqueue(Supplier<CompletableFuture<T>> operation) {
             long operationSequence = ++sequence;
-            CompletableFuture<Void> next = tail.handle((ignored, previousError) -> null)
+            CompletableFuture<T> next = tail.handle((ignored, previousError) -> null)
                     .thenCompose(ignored -> operation.get());
-            tail = next;
-            return new QueuedOperation(operationSequence, next);
+            tail = next.thenApply(ignored -> null);
+            return new QueuedOperation<>(operationSequence, next);
         }
 
         synchronized boolean isLatest(long operationSequence) {
@@ -499,13 +399,13 @@ final class LakestreamStorageHolder implements Closeable {
         }
     }
 
-    private record QueuedOperation(long sequence, CompletableFuture<Void> future) {
+    private record QueuedOperation<T>(long sequence, CompletableFuture<T> future) {
     }
 
-    private record TopicOperation(
+    private record TopicOperation<T>(
             TopicOperations operations,
             long sequence,
-            CompletableFuture<Void> future) {
+            CompletableFuture<T> future) {
     }
 
     @Override
@@ -523,13 +423,6 @@ final class LakestreamStorageHolder implements Closeable {
         try {
             if (producerStateOxiaClient != null) {
                 producerStateOxiaClient.close();
-            }
-        } catch (Exception e) {
-            failures.add(e);
-        }
-        try {
-            if (openTelemetrySdk != null) {
-                openTelemetrySdk.close();
             }
         } catch (Exception e) {
             failures.add(e);

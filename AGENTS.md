@@ -138,7 +138,9 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 ## Critical Patterns
 
 ### Ursa Dependencies
-Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` and `core:core-sdt-ursa` runtimes, not in `storage` or `core`. Kafka runtime artifacts must depend only on the protocol-neutral Ursa APIs and the dedicated Kafka lakehouse reader.
+Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` and `core:core-sdt-ursa` runtimes, not in `storage` or `core`.
+
+The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.streamnative.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state metadata and the controller's existing diskless metadata-store adapter.
 
 Release tarballs package those isolated runtime jars under `./ursa-storage/`. Kafka, Scala, SLF4J, Log4j, and other platform jars are provided by `./libs/` and should not be duplicated into `./ursa-storage/` unless the dependency is intentionally private to the Ursa runtime. The `KafkaPluginClassLoader` loads plugin-private classes child-first while keeping Kafka/logging/Scala API packages parent-first.
 

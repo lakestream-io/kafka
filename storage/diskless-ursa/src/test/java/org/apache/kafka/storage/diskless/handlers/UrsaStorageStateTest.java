@@ -41,8 +41,8 @@ import io.streamnative.lakestream.api.Log;
 import io.streamnative.lakestream.api.LogId;
 import io.streamnative.lakestream.api.LogOffset;
 import io.streamnative.lakestream.api.Stream;
+import io.streamnative.lakestream.api.StreamCatalog;
 import io.streamnative.lakestream.api.StreamIdentifier;
-import io.streamnative.ursa.lakestream.impl.IndexedStreamCatalog;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -51,8 +51,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -68,7 +67,7 @@ class UrsaStorageStateTest {
     void testCleanupPartitionClosesLogAndClearsProducerState() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
         ProducerStateManager producerStateManager = mockProducerStateManager();
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        StreamCatalog catalog = mock(StreamCatalog.class);
         Log log1 = mockLog(5L, 41L, 1, 500L, 100, 1_400L, 200);
         Log log2 = mockLog(5L, 41L, 1, 500L, 100, 1_400L, 200);
         CountDownLatch closeLatch = new CountDownLatch(1);
@@ -78,10 +77,8 @@ class UrsaStorageStateTest {
         }).when(log1).close();
 
         AtomicInteger openCount = new AtomicInteger();
-        when(catalog.generateStreamId(any())).thenAnswer(invocation ->
-                CompletableFuture.completedFuture((long) openCount.incrementAndGet()));
-        when(catalog.createLog(anyString(), any(LogId.class))).thenAnswer(invocation ->
-                invocation.<LogId>getArgument(1).equals(LogId.of(1L)) ? log1 : log2);
+        when(catalog.openExternalPartition(any(), anyInt(), any())).thenAnswer(invocation ->
+                CompletableFuture.completedFuture(openCount.incrementAndGet() == 1 ? log1 : log2));
 
         try (UrsaStorageState state = newState(catalog)) {
             UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
@@ -89,24 +86,24 @@ class UrsaStorageStateTest {
 
             assertTrue(state.cleanupPartition(tp));
             verify(producerStateManager).cleanup(false);
-            verify(catalog).generateStreamId(any());
+            verify(catalog).openExternalPartition(any(), anyInt(), any());
             assertTrue(closeLatch.await(5, TimeUnit.SECONDS));
             assertNull(state.partitionLog(tp));
 
             state.getOrCreatePartitionLog(tp);
-            verify(catalog, times(2)).generateStreamId(any());
+            verify(catalog, times(2)).openExternalPartition(any(), anyInt(), any());
             assertNotNull(state.partitionLog(tp));
         }
     }
 
     @Test
     void testCleanupPartitionNoopWhenNoState() throws Exception {
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        StreamCatalog catalog = mock(StreamCatalog.class);
         try (UrsaStorageState state = newState(catalog)) {
             TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
 
             assertFalse(state.cleanupPartition(tp));
-            verify(catalog, never()).generateStreamId(any());
+            verify(catalog, never()).openExternalPartition(any(), anyInt(), any());
         }
     }
 
@@ -115,14 +112,14 @@ class UrsaStorageStateTest {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metadata-topic", 2));
         Log logInstance = mockLog(5L, 41L, 3, 500L, 100, 1_400L, 200);
         when(logInstance.id()).thenReturn(LogId.of(73L));
-        IndexedStreamCatalog catalog = mockCatalogWithLog(logInstance);
+        StreamCatalog catalog = mockCatalogWithLog(logInstance);
 
         try (UrsaStorageState state = newState(catalog)) {
             var metadata = state.logMetadata(tp).join().orElseThrow();
             assertEquals(73L, metadata.streamId());
             assertEquals(44L, metadata.highWatermark());
             assertNotNull(state.partitionLog(tp));
-            verify(catalog).generateStreamId(any());
+            verify(catalog).openExternalPartition(any(), anyInt(), any());
         }
     }
 
@@ -131,7 +128,7 @@ class UrsaStorageStateTest {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 1));
         ProducerStateManager noZoneManager = mockProducerStateManager();
         ProducerStateManager zoneAManager = mockProducerStateManager();
-        IndexedStreamCatalog catalog = mockCatalogWithLog(mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
+        StreamCatalog catalog = mockCatalogWithLog(mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
 
         try (UrsaStorageState state = newState(catalog)) {
             UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
@@ -151,39 +148,37 @@ class UrsaStorageStateTest {
     @Test
     void testFailedLogOpenEvictsPartitionLogAndAllowsRetry() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("retry-topic", 0));
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
-        CompletableFuture<Long> firstStreamId = new CompletableFuture<>();
+        StreamCatalog catalog = mock(StreamCatalog.class);
+        CompletableFuture<Log> firstOpen = new CompletableFuture<>();
         Log secondLog = mockLog(10L, 10L, 1, 100L, 20, 100L, 20);
         AtomicInteger openCount = new AtomicInteger();
-        when(catalog.generateStreamId(any())).thenAnswer(invocation ->
+        when(catalog.openExternalPartition(any(), anyInt(), any())).thenAnswer(invocation ->
                 openCount.getAndIncrement() == 0
-                        ? firstStreamId
-                        : CompletableFuture.completedFuture(2L));
-        when(catalog.createLog(anyString(), eq(LogId.of(2L)))).thenReturn(secondLog);
+                        ? firstOpen
+                        : CompletableFuture.completedFuture(secondLog));
 
         try (UrsaStorageState state = newState(catalog)) {
             UrsaPartitionLog first = state.getOrCreatePartitionLog(tp);
             assertSame(first, state.partitionLog(tp));
 
-            firstStreamId.completeExceptionally(new RuntimeException("open failed"));
+            firstOpen.completeExceptionally(new RuntimeException("open failed"));
             assertNull(state.partitionLog(tp));
 
             UrsaPartitionLog second = state.getOrCreatePartitionLog(tp);
             assertNotNull(second);
             assertSame(second, state.partitionLog(tp));
-            verify(catalog, times(2)).generateStreamId(any());
+            verify(catalog, times(2)).openExternalPartition(any(), anyInt(), any());
         }
     }
 
     @Test
     void testImmediatelyFailedLogOpenIsNotCached() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("immediate-retry-topic", 0));
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        StreamCatalog catalog = mock(StreamCatalog.class);
         Log secondLog = mockLog(10L, 10L, 1, 100L, 20, 100L, 20);
-        when(catalog.generateStreamId(any()))
+        when(catalog.openExternalPartition(any(), anyInt(), any()))
                 .thenReturn(CompletableFuture.failedFuture(new RuntimeException("open failed")))
-                .thenReturn(CompletableFuture.completedFuture(2L));
-        when(catalog.createLog(anyString(), eq(LogId.of(2L)))).thenReturn(secondLog);
+                .thenReturn(CompletableFuture.completedFuture(secondLog));
 
         try (UrsaStorageState state = newState(catalog)) {
             UrsaPartitionLog failed = state.getOrCreatePartitionLog(tp);
@@ -194,14 +189,14 @@ class UrsaStorageStateTest {
             assertNotNull(retried);
             assertFalse(retried.initializationFailed());
             assertSame(retried, state.partitionLog(tp));
-            verify(catalog, times(2)).generateStreamId(any());
+            verify(catalog, times(2)).openExternalPartition(any(), anyInt(), any());
         }
     }
 
     @Test
     void testDisklessLogMetricsRegisteredAfterLogOpen() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metric-open-topic", 0));
-        IndexedStreamCatalog catalog = mockCatalogWithLog(
+        StreamCatalog catalog = mockCatalogWithLog(
                 mockLog(5L, 41L, 1, 500L, 100, 1_400L, 200));
 
         try (UrsaStorageState state = newState(catalog)) {
@@ -223,12 +218,12 @@ class UrsaStorageStateTest {
     @Test
     void testDisklessLogMetricsDoNotBlockOnPendingOffsetRefresh() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metric-pending-topic", 0));
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        StreamCatalog catalog = mock(StreamCatalog.class);
         Log logInstance = mock(Log.class);
         CompletableFuture<LogOffset> firstOffset = new CompletableFuture<>();
         CompletableFuture<LogOffset> lastOffset = new CompletableFuture<>();
-        when(catalog.generateStreamId(any())).thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(anyString(), eq(LogId.of(1L)))).thenReturn(logInstance);
+        when(catalog.openExternalPartition(any(), anyInt(), any()))
+                .thenReturn(CompletableFuture.completedFuture(logInstance));
         when(logInstance.getFirstOffset()).thenReturn(firstOffset);
         when(logInstance.getLastOffset()).thenReturn(lastOffset);
 
@@ -252,7 +247,7 @@ class UrsaStorageStateTest {
     @Test
     void testDisklessLogMetricsRemovedOnCleanupPartition() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metric-cleanup-topic", 0));
-        IndexedStreamCatalog catalog = mockCatalogWithLog(
+        StreamCatalog catalog = mockCatalogWithLog(
                 mockLog(5L, 41L, 1, 500L, 100, 1_400L, 200));
 
         try (UrsaStorageState state = newState(catalog)) {
@@ -272,7 +267,7 @@ class UrsaStorageStateTest {
     @Test
     void testLogOpenInitializesPartitionLog() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("read-state-topic", 0));
-        IndexedStreamCatalog catalog = mockCatalogWithLog(
+        StreamCatalog catalog = mockCatalogWithLog(
                 mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
 
         try (UrsaStorageState state = newState(catalog)) {
@@ -282,7 +277,7 @@ class UrsaStorageStateTest {
 
             assertNotNull(partitionLog);
             assertSame(partitionLog, state.partitionLog(tp));
-            verify(catalog).generateStreamId(any());
+            verify(catalog).openExternalPartition(any(), anyInt(), any());
         }
     }
 
@@ -291,7 +286,7 @@ class UrsaStorageStateTest {
         TopicIdPartition tp = new TopicIdPartition(
                 Uuid.randomUuid(),
                 new TopicPartition("metric-cleanup-race-topic-" + Uuid.randomUuid(), 0));
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        StreamCatalog catalog = mock(StreamCatalog.class);
         Log firstLog = mockLog(10L, 10L, 1, 100L, 20, 100L, 20);
         Log secondLog = mockLog(10L, 10L, 1, 100L, 20, 100L, 20);
         CountDownLatch firstCloseLatch = new CountDownLatch(1);
@@ -301,13 +296,11 @@ class UrsaStorageStateTest {
         }).when(firstLog).close();
 
         AtomicInteger openCount = new AtomicInteger();
-        CompletableFuture<Long> firstStreamIdFuture = new CompletableFuture<>();
-        when(catalog.generateStreamId(any())).thenAnswer(invocation ->
+        CompletableFuture<Log> firstOpenFuture = new CompletableFuture<>();
+        when(catalog.openExternalPartition(any(), anyInt(), any())).thenAnswer(invocation ->
                 openCount.getAndIncrement() == 0
-                        ? firstStreamIdFuture
-                        : CompletableFuture.completedFuture(2L));
-        when(catalog.createLog(anyString(), any(LogId.class))).thenAnswer(invocation ->
-                invocation.<LogId>getArgument(1).equals(LogId.of(1L)) ? firstLog : secondLog);
+                        ? firstOpenFuture
+                        : CompletableFuture.completedFuture(secondLog));
 
         try (UrsaStorageState state = newState(catalog)) {
             state.getOrCreatePartitionLog(tp);
@@ -317,7 +310,7 @@ class UrsaStorageStateTest {
             assertNull(jmxGaugeLongValue(LogMetricNames.LOG_START_OFFSET, tp.topicPartition()));
             assertNull(jmxGaugeLongValue(LogMetricNames.LOG_END_OFFSET, tp.topicPartition()));
 
-            firstStreamIdFuture.complete(1L);
+            firstOpenFuture.complete(firstLog);
             assertTrue(firstCloseLatch.await(5, TimeUnit.SECONDS));
             assertNull(jmxGaugeLongValue(LogMetricNames.SIZE, tp.topicPartition()));
             assertNull(jmxGaugeLongValue(LogMetricNames.LOG_START_OFFSET, tp.topicPartition()));
@@ -325,7 +318,7 @@ class UrsaStorageStateTest {
 
             state.getOrCreatePartitionLog(tp);
 
-            verify(catalog, times(2)).generateStreamId(any());
+            verify(catalog, times(2)).openExternalPartition(any(), anyInt(), any());
             assertEquals(20L, jmxGaugeLongValue(LogMetricNames.SIZE, tp.topicPartition()));
         }
     }
@@ -334,7 +327,7 @@ class UrsaStorageStateTest {
     void testDisklessLogMetricsRemovedOnStateClose() throws Exception {
         TopicIdPartition tp0 = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metric-close-topic", 0));
         TopicIdPartition tp1 = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metric-close-topic", 1));
-        IndexedStreamCatalog catalog = mockCatalogWithLog(
+        StreamCatalog catalog = mockCatalogWithLog(
                 mockLog(10L, 10L, 1, 100L, 20, 100L, 20));
         UrsaStorageState state = newState(catalog);
 
@@ -362,7 +355,7 @@ class UrsaStorageStateTest {
         externalMetricsGroup.newGauge(LogMetricNames.SIZE, () -> 777L, tags);
         externalMetricsGroup.newGauge(LogMetricNames.LOG_START_OFFSET, () -> 11L, tags);
         externalMetricsGroup.newGauge(LogMetricNames.LOG_END_OFFSET, () -> 22L, tags);
-        IndexedStreamCatalog catalog = mockCatalogWithLog(
+        StreamCatalog catalog = mockCatalogWithLog(
                 mockLog(5L, 41L, 1, 500L, 100, 1_400L, 200));
 
         try (UrsaStorageState state = newState(catalog)) {
@@ -393,7 +386,7 @@ class UrsaStorageStateTest {
         externalMetricsGroup.newGauge(LogMetricNames.SIZE, () -> 777L, tags);
         externalMetricsGroup.newGauge(LogMetricNames.LOG_START_OFFSET, () -> 11L, tags);
         externalMetricsGroup.newGauge(LogMetricNames.LOG_END_OFFSET, () -> 22L, tags);
-        IndexedStreamCatalog catalog = mockCatalogWithLog(
+        StreamCatalog catalog = mockCatalogWithLog(
                 mockLog(5L, 41L, 1, 500L, 100, 1_400L, 200));
 
         try (UrsaStorageState state = newState(catalog)) {
@@ -412,17 +405,16 @@ class UrsaStorageStateTest {
 
     @Test
     void testOpenLogDoesNotOverwriteRacingTopicConfigUpdate() throws Exception {
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        StreamCatalog catalog = mock(StreamCatalog.class);
         Stream stream = mock(Stream.class);
         Log logInstance = mock(Log.class);
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("config-race-topic", 0));
         StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> initialConfig = Map.of("retention.ms", "1000");
         Map<String, String> latestConfig = Map.of("retention.ms", "2000");
-        CompletableFuture<Void> registration = new CompletableFuture<>();
+        CompletableFuture<Log> opening = new CompletableFuture<>();
 
-        when(catalog.generateStreamId(any())).thenReturn(CompletableFuture.completedFuture(17L));
-        when(catalog.registerExternalPartition(identifier, 0, 17L, initialConfig)).thenReturn(registration);
+        when(catalog.openExternalPartition(identifier, 0, initialConfig)).thenReturn(opening);
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(true));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
@@ -430,10 +422,7 @@ class UrsaStorageStateTest {
                 .thenReturn(CompletableFuture.completedFuture(null));
         when(catalog.setStreamProperties(identifier, latestConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        String logName = KafkaLogNaming.logName(tp);
-        when(catalog.createLog(logName, LogId.of(17L))).thenReturn(logInstance);
-
-        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null);
         try (UrsaStorageState state = new UrsaStorageState(
                 Time.SYSTEM,
                 1,
@@ -447,17 +436,17 @@ class UrsaStorageStateTest {
 
             assertFalse(openFuture.isDone());
             assertFalse(updateFuture.isDone());
-            registration.complete(null);
+            opening.complete(logInstance);
 
             assertSame(logInstance, openFuture.get());
             updateFuture.get();
             verify(catalog, times(1)).setStreamProperties(identifier, initialConfig);
             verify(catalog, times(1)).setStreamProperties(identifier, latestConfig);
-            verify(catalog).createLog(logName, LogId.of(17L));
+            verify(catalog).openExternalPartition(identifier, 0, initialConfig);
         }
     }
 
-    private static UrsaStorageState newState(IndexedStreamCatalog catalog) {
+    private static UrsaStorageState newState(StreamCatalog catalog) {
         return new UrsaStorageState(
                 Time.SYSTEM,
                 1,
@@ -466,10 +455,10 @@ class UrsaStorageStateTest {
                 catalog);
     }
 
-    private static IndexedStreamCatalog mockCatalogWithLog(Log logInstance) {
-        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
-        when(catalog.generateStreamId(any())).thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(anyString(), any(LogId.class))).thenReturn(logInstance);
+    private static StreamCatalog mockCatalogWithLog(Log logInstance) {
+        StreamCatalog catalog = mock(StreamCatalog.class);
+        when(catalog.openExternalPartition(any(), anyInt(), any()))
+                .thenReturn(CompletableFuture.completedFuture(logInstance));
         return catalog;
     }
 

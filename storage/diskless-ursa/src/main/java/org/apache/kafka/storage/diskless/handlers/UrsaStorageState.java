@@ -49,8 +49,7 @@ import java.util.function.Supplier;
 
 import io.oxia.client.api.AsyncOxiaClient;
 import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogId;
-import io.streamnative.ursa.lakestream.impl.IndexedStreamCatalog;
+import io.streamnative.lakestream.api.StreamCatalog;
 
 /**
  * Shared state container for Ursa storage components.
@@ -70,7 +69,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final ConcurrentHashMap<TopicIdPartition, UrsaPartitionLog> partitionLogs = new ConcurrentHashMap<>();
 
     private final LakestreamStorageHolder lakestreamStorageHolder;
-    private final IndexedStreamCatalog catalog;
+    private final StreamCatalog catalog;
     private final Supplier<AsyncOxiaClient> oxiaClientSupplier;
     private final ScheduledExecutorService producerStateScheduler;
     private final ScheduledExecutorService retentionScheduler;
@@ -114,9 +113,9 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         LakestreamStorageHolder holder;
         try {
             holder = LakestreamStorageHolder.create(config);
-            log.info("Initialized IndexedStreamCatalog for Kafka diskless storage");
+            log.info("Initialized StreamCatalog for Kafka diskless storage");
         } catch (Exception e) {
-            throw new RuntimeException("Failed to initialize IndexedStreamCatalog", e);
+            throw new RuntimeException("Failed to initialize StreamCatalog", e);
         }
         this.lakestreamStorageHolder = holder;
         this.catalog = holder.catalog();
@@ -130,7 +129,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             int brokerId,
             UrsaStorageConfig config,
             BrokerTopicStats brokerTopicStats,
-            IndexedStreamCatalog catalog) {
+            StreamCatalog catalog) {
         this(time, brokerId, config, brokerTopicStats, catalog, Collections.emptyMap(), null);
     }
 
@@ -139,7 +138,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             int brokerId,
             UrsaStorageConfig config,
             BrokerTopicStats brokerTopicStats,
-            IndexedStreamCatalog catalog,
+            StreamCatalog catalog,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier) {
         this.time = Objects.requireNonNull(time, "time must not be null");
@@ -516,22 +515,21 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     }
 
     CompletableFuture<Log> openLog(TopicIdPartition tp) {
-        String name = KafkaLogNaming.logName(tp);
         Map<String, String> suppliedTopicConfig = topicConfigSupplier != null
                 ? topicConfigSupplier.apply(tp.topic())
                 : null;
         Map<String, String> topicConfig = suppliedTopicConfig != null ? Map.copyOf(suppliedTopicConfig) : Map.of();
 
-        return catalog.generateStreamId(Optional.of(name))
-                .thenCompose(streamId -> {
-                    CompletableFuture<Void> registration = lakestreamStorageHolder == null
-                            ? CompletableFuture.completedFuture(null)
-                            : lakestreamStorageHolder.registerPartition(tp, streamId, topicConfig);
-                    // registerPartition serializes registration with config events and exact-replaces
-                    // properties using the latest published snapshot. Re-applying topicConfig here
-                    // would let this open's stale snapshot overwrite a racing newer event.
-                    return registration.thenApply(ignored -> catalog.createLog(name, LogId.of(streamId)));
-                });
+        if (lakestreamStorageHolder != null) {
+            // The holder serializes opening with config events and exact-replaces properties using
+            // the latest published snapshot. Re-applying topicConfig here would let this open's stale
+            // snapshot overwrite a racing newer event.
+            return lakestreamStorageHolder.openPartition(tp, topicConfig);
+        }
+        return catalog.openExternalPartition(
+                LakestreamStorageHolder.streamIdentifier(tp),
+                tp.partition(),
+                topicConfig);
     }
 
 }

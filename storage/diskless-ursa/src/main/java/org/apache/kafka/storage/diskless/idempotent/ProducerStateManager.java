@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
+import org.apache.kafka.storage.diskless.LogEntryUtils;
 import org.apache.kafka.storage.diskless.handlers.KafkaRecordsPayload;
 
 import org.slf4j.Logger;
@@ -50,7 +51,6 @@ import io.oxia.client.api.AsyncOxiaClient;
 import io.streamnative.lakestream.api.Log;
 import io.streamnative.lakestream.api.LogCursor;
 import io.streamnative.lakestream.api.LogEntry;
-import io.streamnative.ursa.storage.OwnedResultFutures;
 
 /**
  * Per-partition producer state manager for diskless idempotent produce.
@@ -653,17 +653,7 @@ public class ProducerStateManager implements Closeable {
     }
 
     private static Throwable closeLogEntries(List<LogEntry> entries, Throwable precedingError) {
-        try {
-            OwnedResultFutures.closeLogEntries(entries);
-        } catch (Throwable closeError) {
-            if (precedingError == null) {
-                return closeError;
-            }
-            if (precedingError != closeError) {
-                precedingError.addSuppressed(closeError);
-            }
-        }
-        return precedingError;
+        return LogEntryUtils.closeAll(entries, precedingError);
     }
 
     private void scheduleNextReplayRead(LogCursor cursor,

@@ -929,7 +929,6 @@ class KafkaConfigTest {
         case ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_S3_BUCKET_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_S3_REGION_CONFIG => // ignore string
-        case ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG => // ignore string
         case CleanerConfig.LOG_CLEANER_IO_MAX_BYTES_PER_SECOND_PROP => assertPropertyInvalid(baseProperties, name, "not_a_number")
         case CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_SIZE_PROP => assertPropertyInvalid(baseProperties, name, "not_a_number", "1024")
         case CleanerConfig.LOG_CLEANER_DEDUPE_BUFFER_LOAD_FACTOR_PROP => assertPropertyInvalid(baseProperties, name, "not_a_number")

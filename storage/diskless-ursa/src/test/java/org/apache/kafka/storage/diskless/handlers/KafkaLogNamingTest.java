@@ -49,24 +49,13 @@ class KafkaLogNamingTest {
     }
 
     @Test
-    void testCatalogMetadataPath() {
-        Uuid topicId = Uuid.randomUuid();
-        TopicIdPartition tp = new TopicIdPartition(topicId, new TopicPartition("test-topic", 0));
-        assertEquals(
-                "/streams/default/test-topic-topic-id-" + topicId + "-partition-0",
-                KafkaLogNaming.logMetadataPath(tp)
-        );
-    }
-
-    @Test
-    void testSameNameRecreatedTopicUsesDifferentLogAndMetadataKeys() {
+    void testSameNameRecreatedTopicUsesDifferentStreamAndLogNames() {
         TopicPartition partition = new TopicPartition("recreated-topic", 0);
         TopicIdPartition deleted = new TopicIdPartition(Uuid.randomUuid(), partition);
         TopicIdPartition recreated = new TopicIdPartition(Uuid.randomUuid(), partition);
 
         assertNotEquals(KafkaLogNaming.streamName(deleted), KafkaLogNaming.streamName(recreated));
         assertNotEquals(KafkaLogNaming.logName(deleted), KafkaLogNaming.logName(recreated));
-        assertNotEquals(KafkaLogNaming.logMetadataPath(deleted), KafkaLogNaming.logMetadataPath(recreated));
     }
 
     @Test

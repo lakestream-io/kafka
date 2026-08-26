@@ -247,13 +247,6 @@ public class ServerLogConfigs {
     public static final String URSA_STORAGE_COMPACTION_BUCKET_DOC =
             "The object storage bucket or container name for Ursa compaction output.";
 
-    public static final String URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG =
-            "ursa.storage.external.reader.factory.class";
-    public static final String URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DEFAULT =
-            "io.streamnative.ursa.lakestream.reader.NoopCompactedObjectReaderFactory";
-    public static final String URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DOC =
-            "The compacted object reader factory class used by Lakestream readers.";
-
     public static final String URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS_CONFIG = "ursa.storage.write.buffer.flush.interval.ms";
     public static final long URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS_DEFAULT = 250L;
     public static final String URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS_DOC = "The interval in milliseconds for flushing the write buffer.";

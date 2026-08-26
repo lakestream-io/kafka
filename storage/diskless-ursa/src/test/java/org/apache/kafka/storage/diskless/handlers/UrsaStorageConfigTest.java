@@ -74,12 +74,9 @@ class UrsaStorageConfigTest {
     }
 
     @Test
-    void testExternalReaderDefaults() throws Exception {
+    void testOptionalS3OptionsDefaultToNull() throws Exception {
         UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of());
 
-        assertEquals(ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_DEFAULT,
-            config.getExternalReaderFactoryClass());
-        assertNull(config.getConfiguredExternalReaderFactoryClass());
         assertNull(config.getS3SessionToken());
         assertNull(config.getS3PathStyleAccess());
     }
@@ -93,19 +90,6 @@ class UrsaStorageConfigTest {
 
         assertEquals("session-token", config.getS3SessionToken());
         assertEquals(Boolean.TRUE, config.getS3PathStyleAccess());
-    }
-
-    @Test
-    void testExternalReaderOverrides() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
-            ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG,
-                "io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory"
-        ));
-
-        assertEquals("io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory",
-            config.getExternalReaderFactoryClass());
-        assertEquals("io.streamnative.ursa.lakehouse.reader.LakehouseReaderFactory",
-            config.getConfiguredExternalReaderFactoryClass());
     }
 
     private static String backendType(String backendType) throws Exception {

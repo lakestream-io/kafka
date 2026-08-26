@@ -151,6 +151,7 @@ ext {
     configuration.exclude group: 'io.streamnative', module: 'ursa-storage-core'
     configuration.exclude group: 'io.streamnative', module: 'ursa-storage-common'
     configuration.exclude group: 'io.streamnative', module: 'ursa-storage-lakehouse-kafka-reader'
+    configuration.exclude group: 'io.streamnative', module: 'ursa-storage-kafka-runtime'
     configuration.exclude group: 'io.streamnative', module: 'ursa-storage-lakestream'
     configuration.exclude group: 'io.streamnative', module: 'lakestream-api'
     configuration.exclude group: 'io.streamnative.oxia', module: 'oxia-testcontainers'
@@ -1144,16 +1145,16 @@ project(':server') {
     testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
     testImplementation 'org.testcontainers:localstack:1.21.4'
     testImplementation 'org.awaitility:awaitility:4.2.0'
+    testImplementation "io.streamnative:lakestream-api:$ursaStorageVersion"
     testImplementation("io.streamnative:ursa-storage-core:$ursaStorageVersion") {
       exclude group: 'io.confluent', module: 'kafka-schema-registry-client'
       exclude group: 'org.apache.kafka', module: 'kafka-clients'
     }
-    // Required at runtime for Kafka V2 parquet reads.
-    testRuntimeOnly("io.streamnative:ursa-storage-lakehouse-kafka-reader:$ursaStorageVersion") {
-      // Reuse the project's Kafka client classes to avoid version conflicts.
+    // Kafka compaction E2E opens the catalog through the same Lakestream provider used by brokers.
+    testRuntimeOnly("io.streamnative:ursa-storage-kafka-runtime:$ursaStorageVersion") {
       exclude group: 'org.apache.kafka', module: 'kafka-clients'
+      exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
     }
-
     testRuntimeOnly runtimeTestLibs
   }
 
@@ -2833,12 +2834,8 @@ project(':storage:storage-diskless-ursa') {
     implementation libs.jacksonDatabind
     implementation libs.metrics
     implementation libs.slf4jApi
-    implementation "io.streamnative:ursa-storage-core:$ursaStorageVersion"
     implementation "io.streamnative:lakestream-api:$ursaStorageVersion"
-    implementation "io.streamnative:ursa-storage-lakestream:$ursaStorageVersion"
-    // Required at runtime when `KafkaLakehouseReaderFactory` is configured
-    // (e.g. `docker-compose-localstack-compaction.yml`).
-    runtimeOnly("io.streamnative:ursa-storage-lakehouse-kafka-reader:$ursaStorageVersion") {
+    runtimeOnly("io.streamnative:ursa-storage-kafka-runtime:$ursaStorageVersion") {
       // Reuse the project's Kafka client classes to avoid version conflicts.
       exclude group: 'org.apache.kafka', module: 'kafka-clients'
       // Kafka still uses SLF4J 1.7; the SLF4J 2.x Log4j bridge requires SLF4JServiceProvider.
@@ -2846,8 +2843,6 @@ project(':storage:storage-diskless-ursa') {
     }
     implementation "io.github.oxia-db:oxia-client-api:$oxiaClientVersion"
     implementation 'io.netty:netty-buffer:4.1.131.Final'
-    implementation "io.opentelemetry:opentelemetry-sdk:$ursaOpenTelemetryVersion"
-    implementation "io.opentelemetry:opentelemetry-sdk-extension-autoconfigure:$ursaOpenTelemetryVersion"
 
     testImplementation project(':clients').sourceSets.test.output
     testImplementation libs.junitJupiter

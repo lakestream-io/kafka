@@ -460,7 +460,6 @@ No protocol changes required.
 | `ursa.storage.s3.endpoint` | string | `""` | Remote object storage endpoint URL. Reused as an endpoint override for GCS/Azure-compatible deployments |
 | `ursa.storage.s3.bucket` | string | `kafka-ursa-storage` | Remote object storage bucket or container name. Reused for GCS/Azure backends |
 | `ursa.storage.compaction.bucket` | string | `kafka-ursa-storage` | Remote object storage bucket or container name for compaction output |
-| `ursa.storage.external.reader.factory.class` | string | `io.streamnative.ursa.lakestream.reader.NoopCompactedObjectReaderFactory` | Compacted-object reader factory. Use `io.streamnative.ursa.kafka.reader.KafkaLakehouseReaderFactory` for Kafka V2 Parquet output. |
 | `ursa.storage.s3.region` | string | `us-east-1` | Remote object storage region when the selected backend uses one |
 | `ursa.storage.s3.access.key` | string | `""` | S3 access key |
 | `ursa.storage.s3.secret.key` | string | `""` | S3 secret key |
@@ -658,7 +657,7 @@ Diskless topics support **external compaction** via the Ursa compactor. In this 
 
 This external compaction is **not** Kafka key/value log compaction and does **not** change consumer semantics for diskless topics. Kafka-side K/V log compaction remains unsupported for diskless topics (see **Limitations** → **No K/V Compaction**).
 
-The broker-side Kafka-only reader supports the V2 `KAFKA_BATCHED_RAW_PARQUET` format produced by this integration. It fails fast for legacy V1 lakehouse indexes instead of loading the legacy generic materialization runtime into Kafka.
+The Ursa storage runtime reads the V2 `KAFKA_BATCHED_RAW_PARQUET` format behind the Lakestream API. Kafka broker code neither selects nor instantiates the compacted-object reader implementation. The runtime fails fast for legacy V1 lakehouse indexes.
 
 **Architecture**:
 ```

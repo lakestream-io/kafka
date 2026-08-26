@@ -58,13 +58,13 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.oxia.client.api.AsyncOxiaClient;
-import io.oxia.client.api.GetResult;
-import io.oxia.client.api.OxiaClientBuilder;
+import io.streamnative.lakestream.api.Log;
+import io.streamnative.lakestream.api.LogId;
+import io.streamnative.lakestream.api.Stream;
+import io.streamnative.lakestream.api.StreamCatalog;
+import io.streamnative.lakestream.api.StreamCatalogLoader;
+import io.streamnative.lakestream.api.StreamIdentifier;
 import io.streamnative.oxia.testcontainers.OxiaContainer;
-import io.streamnative.ursa.storage.StorageApi;
-import io.streamnative.ursa.storage.UrsaStorage;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -85,9 +85,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
 
     private static final int NUM_RECORDS = 100;
     private static final String S3_BUCKET = "kafka-ursa-storage";
-    private static final String EXTERNAL_READER_FACTORY_CLASS =
-            "io.streamnative.ursa.kafka.reader.KafkaLakehouseReaderFactory";
-
     private static final String COMPACTOR_IMAGE_ENV = "URSA_COMPACTOR_IMAGE";
     private static final String SN_LICENSE_FILE_ENV = "SN_LICENSE_FILE";
 
@@ -98,7 +95,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     private static KafkaClusterTestKit cluster;
     private static String s3Prefix;
     private static Properties compactionStorageConfig;
-    private static AsyncOxiaClient verificationClient;
 
     @BeforeAll
     static void startContainers() throws Exception {
@@ -141,11 +137,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 S3_BUCKET,
                 s3Prefix);
 
-        verificationClient = OxiaClientBuilder.create(oxiaContainer.getServiceAddress())
-                .namespace(ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT)
-                .asyncClient()
-                .get();
-
         cluster = createCluster(
                 oxiaContainer.getServiceAddress(), s3Endpoint, localStackContainer, s3Prefix);
         cluster.format();
@@ -156,7 +147,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
 
     @AfterAll
     static void stopContainers() {
-        closeQuietly(verificationClient, "verification client");
         closeQuietly(cluster, "Kafka cluster");
         closeQuietly(localStackContainer, "LocalStack container");
         closeQuietly(oxiaContainer, "Oxia container");
@@ -172,7 +162,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         createTopicWithUrsaStorage(topicName);
         Uuid topicId = topicId(topicName);
         writeRecords(cluster.bootstrapServers(), topicName);
-        waitForLogMetadata(topicName, topicId);
 
         String compactorImage = System.getenv(COMPACTOR_IMAGE_ENV);
         try (GenericContainer<?> compactor = startCompactorContainer(
@@ -206,25 +195,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         log.info("Successfully wrote {} records to topic {}", NUM_RECORDS, topicName);
     }
 
-    private void waitForLogMetadata(String topicName, Uuid topicId) {
-        String logMetadataPath = KafkaLogNaming.logMetadataPath(topicIdPartition(topicName, topicId));
-        Awaitility.await()
-                .atMost(30, TimeUnit.SECONDS)
-                .pollInterval(1, TimeUnit.SECONDS)
-                .until(() -> checkLogMetadataExists(logMetadataPath));
-        log.info("Catalog log metadata verified in Oxia at path: {}", logMetadataPath);
-    }
-
-    private boolean checkLogMetadataExists(String path) {
-        try {
-            GetResult result = verificationClient.get(path).get(5, TimeUnit.SECONDS);
-            return result != null && result.value() != null;
-        } catch (Exception e) {
-            log.debug("Catalog log metadata not yet available: {}", e.getMessage());
-            return false;
-        }
-    }
-
     private void waitForParquetCompaction(String topicName, Uuid topicId) {
         log.info("Waiting for compaction output to be visible (max 5 minutes)...");
         Awaitility.await()
@@ -237,29 +207,33 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     }
 
     private void verifyReadsUseParquetIndexes(String topicName, Uuid topicId) throws Exception {
-        String streamKey = KafkaLogNaming.logName(topicIdPartition(topicName, topicId));
+        TopicIdPartition topicIdPartition = topicIdPartition(topicName, topicId);
+        StreamIdentifier identifier = StreamIdentifier.of(
+                KafkaLogNaming.NAMESPACE,
+                KafkaLogNaming.streamName(topicIdPartition));
+        String catalogUri = compactionStorageConfig.getProperty("metadataStoreUrl");
 
-        try (UrsaStorage ursaStorage = new UrsaStorage(compactionStorageConfig, OpenTelemetry.noop())) {
-            StorageApi storageApi = ursaStorage.getDefaultStorageApi();
+        try (StreamCatalog catalog = StreamCatalogLoader.open(catalogUri, compactionStorageConfig);
+             Stream stream = catalog.loadStream(identifier).get(30, TimeUnit.SECONDS)) {
+            LogId logId = stream.layout().logIds().get(30, TimeUnit.SECONDS).get(topicIdPartition.partition());
+            Log partitionLog = stream.getLog(logId);
+            var lastEntry = partitionLog.getLastOffset().get(30, TimeUnit.SECONDS);
 
-            long streamId = storageApi.getStreamIdByKey(streamKey).get(30, TimeUnit.SECONDS);
-            var lastEntry = storageApi.getLastEntry(streamId).get(30, TimeUnit.SECONDS);
-
-            assertTrue(lastEntry.header().offset() >= 0,
+            assertTrue(lastEntry.offset() >= 0,
                     "Expected stream to have data, but last entry was NOT_FOUND");
 
-            long lastOffset = lastEntry.header().offset() + lastEntry.header().numberOfMessages();
-            var indexes = storageApi.readIndexes(streamId, 0, lastOffset, false).get(30, TimeUnit.SECONDS);
-            assertTrue(!indexes.isEmpty(), "Expected indexes to be present for streamId=" + streamId);
+            long lastOffset = lastEntry.offset() + lastEntry.numberOfRecords();
+            var indexes = partitionLog.readIndexRange(0, lastOffset).get(30, TimeUnit.SECONDS);
+            assertTrue(!indexes.isEmpty(), "Expected indexes to be present for logId=" + logId.id());
 
             var parquetIndexes = indexes.stream()
                     .filter(idx -> "PARQUET".equals(idx.position().fileType().name()))
                     .toList();
             assertTrue(!parquetIndexes.isEmpty(),
-                    "Expected at least one PARQUET index after compaction, streamId=" + streamId);
+                    "Expected at least one PARQUET index after compaction, logId=" + logId.id());
 
-            log.info("Verified PARQUET index usage: {} of {} indexes are PARQUET for streamId={}",
-                    parquetIndexes.size(), indexes.size(), streamId);
+            log.info("Verified PARQUET index usage: {} of {} indexes are PARQUET for logId={}",
+                    parquetIndexes.size(), indexes.size(), logId.id());
         }
     }
 
@@ -323,11 +297,8 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         properties.setProperty("writeBufferSize", String.valueOf(256 * 1024));
         properties.setProperty("writeBufferFlushIntervalMs", "100");
         properties.setProperty("metastoreRequestRateLimitPerSecond", "500");
-        // Make parquet (s3a://...) resolvable for v2 parquet readers.
-        properties.setProperty("compactionBackendStorageType", "S3");
         properties.setProperty("compactionBucket", bucket);
         properties.setProperty("compactionPrefix", prefix);
-        properties.setProperty("compactionBucketRegion", region);
         return properties;
     }
 
@@ -445,8 +416,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_S3_SECRET_KEY_CONFIG, "test")
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_S3_BUCKET_CONFIG, S3_BUCKET)
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_S3_REGION_CONFIG, localStackContainer.getRegion())
-                .setConfigProp(ServerLogConfigs.URSA_STORAGE_EXTERNAL_READER_FACTORY_CLASS_CONFIG,
-                        EXTERNAL_READER_FACTORY_CLASS)
                 .setConfigProp("offsets.topic.replication.factor", "1")
                 .setConfigProp("transaction.state.log.replication.factor", "1")
                 .setConfigProp("transaction.state.log.min.isr", "1")

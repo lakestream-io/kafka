@@ -27,7 +27,6 @@ import java.util.Objects;
 public final class KafkaLogNaming {
 
     public static final String NAMESPACE = "default";
-    public static final String CATALOG_METADATA_PREFIX = "/streams/";
 
     private KafkaLogNaming() {
     }
@@ -48,23 +47,14 @@ public final class KafkaLogNaming {
         return tp.topic() + "-topic-id-" + tp.topicId();
     }
 
-    /**
-     * Stable key passed to the Lakestream stream-ID generator for one topic incarnation and
-     * partition.
-     */
+    /** Stable physical partition name used by the existing SDT publication contract. */
     public static String logName(TopicIdPartition tp) {
         return NAMESPACE + "/" + partitionName(tp);
     }
 
-    /** Canonical local partition-name component; persisted identities use {@link #logName}. */
+    /** Physical partition-name component used by {@link #logName}. */
     public static String partitionName(TopicIdPartition tp) {
         return streamName(tp) + "-partition-" + tp.partition();
     }
 
-    /**
-     * Oxia catalog metadata key for the partition log.
-     */
-    public static String logMetadataPath(TopicIdPartition tp) {
-        return CATALOG_METADATA_PREFIX + logName(tp);
-    }
 }
