@@ -86,7 +86,7 @@ class UrsaPartitionedTopicsPublisherTest {
                 store);
     }
 
-    private static final String KEY_PREFIX = "/admin/partitioned-topics/public/default/persistent/";
+    private static final String KEY_PREFIX = "/admin/streams/default/";
 
     @Test
     void testDeltaIgnoredBeforeBecomingLeader() throws Exception {
@@ -143,7 +143,7 @@ class UrsaPartitionedTopicsPublisherTest {
         publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
-        String partitionedKey = KEY_PREFIX + disklessTopic;
+        String partitionedKey = KEY_PREFIX + disklessTopic + "-topic-id-" + topicId;
         org.apache.kafka.test.TestUtils.waitForCondition(
                 () -> store.deleteKeys.contains(partitionedKey),
                 5_000, "Expected delete for " + partitionedKey);

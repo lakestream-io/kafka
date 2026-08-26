@@ -111,6 +111,22 @@ class UrsaStorageStateTest {
     }
 
     @Test
+    void testLogMetadataUsesActualLakestreamIdAndEndExclusiveHighWatermark() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metadata-topic", 2));
+        Log logInstance = mockLog(5L, 41L, 3, 500L, 100, 1_400L, 200);
+        when(logInstance.id()).thenReturn(LogId.of(73L));
+        IndexedStreamCatalog catalog = mockCatalogWithLog(logInstance);
+
+        try (UrsaStorageState state = newState(catalog)) {
+            var metadata = state.logMetadata(tp).join().orElseThrow();
+            assertEquals(73L, metadata.streamId());
+            assertEquals(44L, metadata.highWatermark());
+            assertNotNull(state.partitionLog(tp));
+            verify(catalog).generateStreamId(any());
+        }
+    }
+
+    @Test
     void testCleanupNonOwnedProducerStatesRemovesOnlyStaleZones() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 1));
         ProducerStateManager noZoneManager = mockProducerStateManager();
@@ -400,7 +416,7 @@ class UrsaStorageStateTest {
         Stream stream = mock(Stream.class);
         Log logInstance = mock(Log.class);
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("config-race-topic", 0));
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp.topic());
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> initialConfig = Map.of("retention.ms", "1000");
         Map<String, String> latestConfig = Map.of("retention.ms", "2000");
         CompletableFuture<Void> registration = new CompletableFuture<>();
@@ -427,7 +443,7 @@ class UrsaStorageStateTest {
                 Map.of(),
                 ignored -> initialConfig)) {
             CompletableFuture<Log> openFuture = state.openLog(tp);
-            CompletableFuture<Void> updateFuture = state.updateTopicConfigAsync(tp.topic(), latestConfig);
+            CompletableFuture<Void> updateFuture = state.updateTopicConfigAsync(tp, latestConfig);
 
             assertFalse(openFuture.isDone());
             assertFalse(updateFuture.isDone());

@@ -271,8 +271,8 @@ class ControllerServer(
                 (msg: String, cause: Throwable) => sharedServer.metadataPublishingFaultHandler.handleFault(msg, cause),
                 DisklessMetadataStoreLoader.load(ursaConfig.getCatalogOxiaServiceUrl, ursaConfig.getClassPath))
               Optional.of[DisklessTopicPreCommitHandler](
-                (topicName: String, partitions: Int, configs: util.Map[String, String]) => {
-                ursaOxiaSync.upsertPartitionedTopicMetadataSync(topicName, partitions, configs, 3000)
+                (topicName: String, topicId: Uuid, partitions: Int, configs: util.Map[String, String]) => {
+                ursaOxiaSync.upsertPartitionedTopicMetadataSync(topicName, topicId, partitions, configs, 3000)
               })
             } else {
               Optional.empty[DisklessTopicPreCommitHandler]()

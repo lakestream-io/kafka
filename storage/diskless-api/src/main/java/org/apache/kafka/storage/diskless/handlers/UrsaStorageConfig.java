@@ -119,10 +119,8 @@ public class UrsaStorageConfig {
                 ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT);
         final var defaultOxiaServiceUrl = "oxia://" + oxiaServiceUrl + "/" + namespace;
 
-        final var catalogOxiaServiceUrl = getAliasedOxiaServiceUrlConfig(
-                configs,
-                ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG,
-                ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG,
+        final var catalogOxiaServiceUrl = getOxiaServiceUrlConfig(
+                configs, ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG,
                 defaultOxiaServiceUrl);
         final var ursaOxiaServiceUrl = getOxiaServiceUrlConfig(configs, ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG,
                 defaultOxiaServiceUrl);
@@ -229,18 +227,6 @@ public class UrsaStorageConfig {
 
     private static String getOxiaServiceUrlConfig(Map<String, ?> configs, String key, String defaultValue) {
         Object value = configs.get(key);
-        return value != null ? String.valueOf(value) : defaultValue;
-    }
-
-    private static String getAliasedOxiaServiceUrlConfig(
-            Map<String, ?> configs,
-            String primaryKey,
-            String legacyKey,
-            String defaultValue) {
-        Object value = configs.get(primaryKey);
-        if (value == null) {
-            value = configs.get(legacyKey);
-        }
         return value != null ? String.valueOf(value) : defaultValue;
     }
 

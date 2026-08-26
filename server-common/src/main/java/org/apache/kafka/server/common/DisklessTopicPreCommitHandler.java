@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.server.common;
 
+import org.apache.kafka.common.Uuid;
+
 import java.util.Map;
 
 /**
@@ -34,9 +36,15 @@ public interface DisklessTopicPreCommitHandler {
      * Write diskless topic metadata to Oxia before KRaft commit.
      *
      * @param topicName  the topic name
+     * @param topicId    the Kafka topic incarnation ID
      * @param partitions the number of partitions
      * @param configs    the topic creation configs
      * @throws Exception if the Oxia write fails; the topic creation will be rejected
      */
-    void preCommitCreateTopic(String topicName, int partitions, Map<String, String> configs) throws Exception;
+    void preCommitCreateTopic(
+        String topicName,
+        Uuid topicId,
+        int partitions,
+        Map<String, String> configs
+    ) throws Exception;
 }

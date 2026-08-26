@@ -87,7 +87,7 @@ public final class UrsaPartitionedTopicsPublisher implements MetadataPublisher {
                 continue;
             }
             int partitions = oldTopicImage.partitions().size();
-            sync.deleteTopicMetadata(topicName, topicId.toString(), partitions, context);
+            sync.deleteTopicMetadata(topicName, topicId, partitions, context);
         }
     }
 

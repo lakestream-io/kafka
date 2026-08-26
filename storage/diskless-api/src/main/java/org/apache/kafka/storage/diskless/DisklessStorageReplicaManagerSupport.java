@@ -18,6 +18,7 @@ package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.protocol.Errors;
@@ -48,6 +49,9 @@ import java.util.OptionalLong;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -67,6 +71,9 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
     private final DisklessBrokerSelector brokerSelector;
 
     private final DisklessStorageEngine engine;
+    private final ConcurrentHashMap<TopicIdPartition, OwnershipGeneration> ownershipGenerations =
+            new ConcurrentHashMap<>();
+    private final AtomicLong nextOwnershipGeneration = new AtomicLong();
 
     /**
      * Creates a disabled instance.
@@ -161,22 +168,29 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
      * This is called when topic configs change (e.g., alter configs).
      */
     public void updateTopicConfig(String topic, Properties config) {
-        if (!enabled || engine == null) {
+        if (!enabled || engine == null || topic == null || config == null) {
+            return;
+        }
+        Uuid topicId = metadataView.getTopicId(topic);
+        if (topicId == null || Uuid.ZERO_UUID.equals(topicId)) {
+            log.debug("Skip diskless config update for {} without a current topic ID", topic);
             return;
         }
         Map<String, String> configMap = new LinkedHashMap<>();
         config.forEach((k, v) -> configMap.put(k.toString(), v.toString()));
-        engine.updateTopicConfig(topic, configMap);
+        engine.updateTopicConfig(
+                new TopicIdPartition(topicId, new TopicPartition(topic, 0)),
+                configMap);
     }
 
     /**
      * Deletes the topic configuration after the topic has been deleted.
      */
-    public void deleteTopicConfig(String topic) {
-        if (!enabled || engine == null || topic == null) {
+    public void deleteTopicConfig(TopicIdPartition topicIdPartition) {
+        if (!enabled || engine == null || topicIdPartition == null) {
             return;
         }
-        engine.deleteTopicConfig(topic);
+        engine.deleteTopicConfig(topicIdPartition);
     }
 
     /**
@@ -186,16 +200,103 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
         return metadataView.isDisklessStorageTopic(topic);
     }
 
-    public boolean isCurrentDisklessOwner(TopicIdPartition topicIdPartition, String zone) {
+    /** Returns whether the supplied topic ID is still the current Kafka incarnation for its name. */
+    public boolean isCurrentTopicIncarnation(TopicIdPartition topicIdPartition) {
         if (!enabled || topicIdPartition == null) {
             return false;
         }
+        Uuid currentTopicId = metadataView.getTopicId(topicIdPartition.topic());
+        return currentTopicId != null && currentTopicId.equals(topicIdPartition.topicId());
+    }
 
+    public boolean isCurrentDisklessOwner(TopicIdPartition topicIdPartition, String zone) {
+        if (!enabled
+                || topicIdPartition == null
+                || !isCurrentTopicIncarnation(topicIdPartition)
+                || !metadataView.isDisklessStorageTopic(topicIdPartition.topic())) {
+            return false;
+        }
+
+        return isSelectedBrokerForZone(topicIdPartition, zone);
+    }
+
+    private boolean isSelectedBrokerForZone(TopicIdPartition topicIdPartition, String zone) {
         OptionalInt selected = brokerSelector.selectBrokerForZone(
                 topicIdPartition.topicId(),
                 topicIdPartition.partition(),
                 zone);
         return selected.isPresent() && selected.getAsInt() == brokerId;
+    }
+
+    /** Returns whether this broker owns the partition for at least one currently active client zone. */
+    public boolean isCurrentDisklessOwnerInAnyZone(TopicIdPartition topicIdPartition) {
+        return enabled
+                && topicIdPartition != null
+                && isCurrentTopicIncarnation(topicIdPartition)
+                && metadataView.isDisklessStorageTopic(topicIdPartition.topic())
+                && !ownedZones(topicIdPartition).isEmpty();
+    }
+
+    /**
+     * Returns a stable generation for the broker's current ownership interval, or {@code -1}
+     * when the broker is not a current owner. A later reacquisition receives a larger generation.
+     */
+    public long currentDisklessOwnershipGeneration(TopicIdPartition topicIdPartition) {
+        return claimDisklessOwnership(topicIdPartition).generation();
+    }
+
+    /**
+     * Returns the generation which authorizes classic publication for the current topic
+     * incarnation. Transitioning to classic storage fences an earlier diskless ownership
+     * interval before the classic append callback is delivered.
+     */
+    public long currentClassicPublisherGeneration(TopicIdPartition topicIdPartition) {
+        if (!enabled) {
+            return 0L;
+        }
+        if (topicIdPartition == null
+                || !isCurrentTopicIncarnation(topicIdPartition)
+                || metadataView.isDisklessStorageTopic(topicIdPartition.topic())) {
+            return -1L;
+        }
+        OwnershipGeneration ownership = ownershipGenerations.get(topicIdPartition);
+        if (ownership == null) {
+            // Pure classic partitions do not need persistent diskless ownership state, but
+            // still need an ordered token to outrank a late callback from a deleted diskless UUID.
+            return nextOwnershipGeneration.incrementAndGet();
+        }
+        long generation;
+        synchronized (ownership) {
+            if (ownershipGenerations.get(topicIdPartition) != ownership) {
+                return currentClassicPublisherGeneration(topicIdPartition);
+            }
+            if (ownership.owned) {
+                ownership.owned = false;
+                ownership.generation = nextOwnershipGeneration.incrementAndGet();
+            }
+            generation = ownership.generation;
+        }
+        return generation;
+    }
+
+    /** Returns whether the generation still denotes this broker's current ownership interval. */
+    public boolean isCurrentDisklessOwnershipGeneration(
+            TopicIdPartition topicIdPartition,
+            long generation) {
+        if (generation < 0 || !isCurrentDisklessOwnerInAnyZone(topicIdPartition)) {
+            return false;
+        }
+        OwnershipGeneration ownership = ownershipGenerations.get(topicIdPartition);
+        if (ownership == null) {
+            return false;
+        }
+        synchronized (ownership) {
+            return ownership.owned && ownership.generation == generation;
+        }
+    }
+
+    int ownershipGenerationCount() {
+        return ownershipGenerations.size();
     }
 
     public boolean hasTrackedPartitionsForTopic(String topic) {
@@ -223,6 +324,38 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             Set<TopicIdPartition> deletedPartitions,
             Consumer<String> onTopicMaybeEmptied
     ) {
+        reconcileTrackedPartitions(deletedPartitions, onTopicMaybeEmptied, ignored -> { });
+    }
+
+    public void reconcileTrackedPartitions(
+            Set<TopicIdPartition> deletedPartitions,
+            Consumer<String> onTopicMaybeEmptied,
+            Consumer<TopicIdPartition> onPartitionOwnershipLost
+    ) {
+        BiConsumer<TopicIdPartition, Long> ownershipLost = onPartitionOwnershipLost == null
+                ? (ignored, generation) -> { }
+                : (partition, generation) -> onPartitionOwnershipLost.accept(partition);
+        reconcileTrackedPartitions(deletedPartitions, onTopicMaybeEmptied, ownershipLost);
+    }
+
+    public void reconcileTrackedPartitions(
+            Set<TopicIdPartition> deletedPartitions,
+            Consumer<String> onTopicMaybeEmptied,
+            BiConsumer<TopicIdPartition, Long> onPartitionOwnershipLost
+    ) {
+        reconcileTrackedPartitions(
+                deletedPartitions,
+                onTopicMaybeEmptied,
+                onPartitionOwnershipLost,
+                Collections.emptySet());
+    }
+
+    public void reconcileTrackedPartitions(
+            Set<TopicIdPartition> deletedPartitions,
+            Consumer<String> onTopicMaybeEmptied,
+            BiConsumer<TopicIdPartition, Long> onPartitionOwnershipLost,
+            Set<TopicIdPartition> alreadyFencedOwnershipLosses
+    ) {
         Set<TopicIdPartition> partitionsToCheck = partitionsNeedingReconcile();
         Set<TopicIdPartition> permanentlyDeletedPartitions =
                 deletedPartitions != null ? deletedPartitions : Collections.emptySet();
@@ -231,6 +364,11 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
         }
 
         Consumer<String> topicMaybeEmptied = onTopicMaybeEmptied != null ? onTopicMaybeEmptied : ignored -> { };
+        BiConsumer<TopicIdPartition, Long> partitionOwnershipLost =
+                onPartitionOwnershipLost != null ? onPartitionOwnershipLost : (ignored, generation) -> { };
+        Set<TopicIdPartition> alreadyFenced = alreadyFencedOwnershipLosses != null
+                ? alreadyFencedOwnershipLosses
+                : Collections.emptySet();
         Set<TopicIdPartition> trackedPartitionsToCleanup = new LinkedHashSet<>();
         Set<TopicIdPartition> trackedPartitionsToDelete = new LinkedHashSet<>();
         Map<TopicIdPartition, Set<String>> retainedOwnedZones = new LinkedHashMap<>();
@@ -248,15 +386,69 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             }
         }
 
+        Set<TopicIdPartition> deletedPartitionsWithoutTrackedState =
+                deletedPartitionsWithoutTrackedState(partitionsToCheck, permanentlyDeletedPartitions);
+        Set<TopicIdPartition> partitionsLosingOwnership = new LinkedHashSet<>();
+        partitionsLosingOwnership.addAll(trackedPartitionsToCleanup);
+        partitionsLosingOwnership.addAll(trackedPartitionsToDelete);
+        partitionsLosingOwnership.addAll(deletedPartitionsWithoutTrackedState);
+        partitionsLosingOwnership.stream()
+                .filter(partition -> !alreadyFenced.contains(partition))
+                .forEach(partition ->
+                        partitionOwnershipLost.accept(partition, markOwnershipLost(partition)));
+
         // TODO: Since deleted partitions are only passed on the deletion delta,
         //  there may be no subsequent retries—leaving catalog metadata or stream data leaked.
         cleanupTrackedPartitions(trackedPartitionsToCleanup, topicMaybeEmptied);
         cleanupRetainedProducerStates(retainedOwnedZones);
         cleanupDeletedTrackedPartitions(trackedPartitionsToDelete, topicMaybeEmptied);
-
-        Set<TopicIdPartition> deletedPartitionsWithoutTrackedState =
-                deletedPartitionsWithoutTrackedState(partitionsToCheck, permanentlyDeletedPartitions);
         cleanupDeletedPartitionsWithoutTrackedState(deletedPartitionsWithoutTrackedState);
+    }
+
+    /**
+     * Reconciles the broker's publication ownership against the complete current set of
+     * diskless partitions. Unlike storage-state reconciliation, this also covers partitions
+     * that have not yet been opened on this broker.
+     */
+    public Set<TopicIdPartition> reconcilePublicationOwnership(
+            Set<TopicIdPartition> currentDisklessPartitions,
+            BiConsumer<TopicIdPartition, Long> onPartitionOwnershipLost,
+            BiConsumer<TopicIdPartition, Long> onPartitionOwnershipAcquired
+    ) {
+        if (!enabled) {
+            return Collections.emptySet();
+        }
+
+        Set<TopicIdPartition> currentPartitions = currentDisklessPartitions != null
+                ? Set.copyOf(currentDisklessPartitions)
+                : Collections.emptySet();
+        BiConsumer<TopicIdPartition, Long> ownershipLost = onPartitionOwnershipLost != null
+                ? onPartitionOwnershipLost
+                : (ignored, generation) -> { };
+        BiConsumer<TopicIdPartition, Long> ownershipAcquired = onPartitionOwnershipAcquired != null
+                ? onPartitionOwnershipAcquired
+                : (ignored, generation) -> { };
+
+        Map<TopicIdPartition, Long> lostOwnerships = new LinkedHashMap<>();
+        new LinkedHashMap<>(ownershipGenerations).forEach((partition, ownership) -> {
+            if (!currentPartitions.contains(partition) || !isCurrentDisklessOwnerInAnyZone(partition)) {
+                long generation = markOwnershipLostIfOwned(partition, ownership);
+                if (generation >= 0) {
+                    lostOwnerships.put(partition, generation);
+                }
+            }
+        });
+        lostOwnerships.forEach(ownershipLost);
+
+        Map<TopicIdPartition, Long> acquiredOwnerships = new LinkedHashMap<>();
+        for (TopicIdPartition partition : currentPartitions) {
+            OwnershipClaim claim = claimDisklessOwnership(partition);
+            if (claim.acquired()) {
+                acquiredOwnerships.put(partition, claim.generation());
+            }
+        }
+        acquiredOwnerships.forEach(ownershipAcquired);
+        return Collections.unmodifiableSet(new LinkedHashSet<>(lostOwnerships.keySet()));
     }
 
     private void cleanupTrackedPartitions(
@@ -373,6 +565,42 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
     }
 
     /**
+     * Returns the storage-native identity and durable end offset of an initialized diskless log.
+     */
+    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(TopicIdPartition topicIdPartition) {
+        if (!enabled || engine == null || topicIdPartition == null) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        return engine.logMetadata(topicIdPartition);
+    }
+
+    /**
+     * Returns log metadata only while the supplied publication ownership generation is current.
+     * The engine call stays under the ownership monitor so a concurrent ownership loss cannot
+     * finish its fence before a lazy log open becomes visible to subsequent cleanup.
+     */
+    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(
+            TopicIdPartition topicIdPartition,
+            long ownershipGeneration
+    ) {
+        if (!enabled || engine == null || topicIdPartition == null || ownershipGeneration < 0) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        OwnershipGeneration ownership = ownershipGenerations.get(topicIdPartition);
+        if (ownership == null) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        synchronized (ownership) {
+            if (ownershipGenerations.get(topicIdPartition) != ownership
+                    || !ownership.owned
+                    || ownership.generation != ownershipGeneration) {
+                return CompletableFuture.completedFuture(Optional.empty());
+            }
+            return engine.logMetadata(topicIdPartition);
+        }
+    }
+
+    /**
      * Handles fetch requests for diskless storage topics.
      */
     public CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> handleFetch(
@@ -380,15 +608,56 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos,
             String clientId) {
         String zone = brokerSelector.effectiveZone(clientId);
+        Map<TopicIdPartition, TopicIdPartition> requestToCanonical = new LinkedHashMap<>();
+        Map<TopicIdPartition, FetchRequest.PartitionData> canonicalFetchInfos = new LinkedHashMap<>();
+        fetchInfos.forEach((requestPartition, partitionData) -> {
+            TopicIdPartition canonicalPartition = canonicalFetchPartition(requestPartition);
+            requestToCanonical.put(requestPartition, canonicalPartition);
+            if (canonicalPartition != null) {
+                canonicalFetchInfos.put(canonicalPartition, partitionData);
+            }
+        });
+
         return handleWithOwnership(
-                fetchInfos,
+                canonicalFetchInfos,
                 "fetch",
                 ownedFetchInfos -> handleOwnedFetch(params, ownedFetchInfos),
                 (ignored, response) -> response,
                 ignored -> notLeaderFetchPartitionData(),
                 ignored -> unknownErrorFetchPartitionData(),
                 zone
-        );
+        ).thenApply(canonicalResponses -> {
+            Map<TopicIdPartition, FetchPartitionData> requestResponses = new LinkedHashMap<>();
+            requestToCanonical.forEach((requestPartition, canonicalPartition) -> {
+                FetchPartitionData response = canonicalPartition != null
+                        ? canonicalResponses.get(canonicalPartition)
+                        : null;
+                requestResponses.put(
+                        requestPartition,
+                        response != null ? response : notLeaderFetchPartitionData());
+            });
+            return requestResponses;
+        });
+    }
+
+    /**
+     * Fetch protocol versions before topic IDs use {@link Uuid#ZERO_UUID} in their internal
+     * request key. Resolve only that legacy sentinel to the current metadata image before
+     * ownership selection and storage access. A non-zero stale topic ID must not be rewritten to
+     * a newer incarnation.
+     */
+    private TopicIdPartition canonicalFetchPartition(TopicIdPartition requestPartition) {
+        if (requestPartition == null) {
+            return null;
+        }
+        if (!Uuid.ZERO_UUID.equals(requestPartition.topicId())) {
+            return requestPartition;
+        }
+        Uuid currentTopicId = metadataView.getTopicId(requestPartition.topic());
+        if (currentTopicId == null || Uuid.ZERO_UUID.equals(currentTopicId)) {
+            return null;
+        }
+        return new TopicIdPartition(currentTopicId, requestPartition.topicPartition());
     }
 
     /**
@@ -455,7 +724,10 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
     }
 
     private boolean deletePartitionDataInternal(TopicIdPartition tp) {
-        if (!enabled || tp == null || !isCurrentDisklessOwner(tp, DisklessClientZone.NO_ZONE) || engine == null) {
+        // Deletion targets an incarnation which is no longer current by definition. Keep the
+        // deterministic broker selection, but do not require current metadata as request routing
+        // does, or no broker would ever remove the deleted incarnation's persistent data.
+        if (!enabled || tp == null || !isSelectedBrokerForZone(tp, DisklessClientZone.NO_ZONE) || engine == null) {
             return true;
         }
         // TODO: Add retry for transient failures.
@@ -585,6 +857,78 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             partitions.addAll(engine.snapshotTrackedPartitions());
         }
         return partitions;
+    }
+
+    private OwnershipClaim claimDisklessOwnership(TopicIdPartition topicIdPartition) {
+        while (isCurrentDisklessOwnerInAnyZone(topicIdPartition)) {
+            OwnershipGeneration ownership = ownershipGenerations.computeIfAbsent(
+                    topicIdPartition, ignored -> new OwnershipGeneration());
+            synchronized (ownership) {
+                if (ownershipGenerations.get(topicIdPartition) != ownership) {
+                    continue;
+                }
+                if (!ownership.owned) {
+                    ownership.generation = nextOwnershipGeneration.incrementAndGet();
+                    ownership.owned = true;
+                    return new OwnershipClaim(ownership.generation, true);
+                }
+                return new OwnershipClaim(ownership.generation, false);
+            }
+        }
+        return OwnershipClaim.NOT_OWNER;
+    }
+
+    private long markOwnershipLostIfOwned(
+            TopicIdPartition topicIdPartition,
+            OwnershipGeneration ownership
+    ) {
+        synchronized (ownership) {
+            if (ownershipGenerations.get(topicIdPartition) != ownership) {
+                return -1L;
+            }
+            if (!ownership.owned) {
+                if (!isCurrentClassicTopicIncarnation(topicIdPartition)) {
+                    ownershipGenerations.remove(topicIdPartition, ownership);
+                }
+                return -1L;
+            }
+            ownership.owned = false;
+            ownership.generation = nextOwnershipGeneration.incrementAndGet();
+            long generation = ownership.generation;
+            if (!isCurrentClassicTopicIncarnation(topicIdPartition)) {
+                ownershipGenerations.remove(topicIdPartition, ownership);
+            }
+            return generation;
+        }
+    }
+
+    private long markOwnershipLost(TopicIdPartition topicIdPartition) {
+        OwnershipGeneration ownership = ownershipGenerations.computeIfAbsent(
+                topicIdPartition, ignored -> new OwnershipGeneration());
+        long generation;
+        synchronized (ownership) {
+            ownership.owned = false;
+            ownership.generation = nextOwnershipGeneration.incrementAndGet();
+            generation = ownership.generation;
+            if (!isCurrentClassicTopicIncarnation(topicIdPartition)) {
+                ownershipGenerations.remove(topicIdPartition, ownership);
+            }
+        }
+        return generation;
+    }
+
+    private boolean isCurrentClassicTopicIncarnation(TopicIdPartition topicIdPartition) {
+        return isCurrentTopicIncarnation(topicIdPartition)
+                && !metadataView.isDisklessStorageTopic(topicIdPartition.topic());
+    }
+
+    private static final class OwnershipGeneration {
+        private long generation;
+        private boolean owned;
+    }
+
+    private record OwnershipClaim(long generation, boolean acquired) {
+        private static final OwnershipClaim NOT_OWNER = new OwnershipClaim(-1L, false);
     }
 
     private boolean shouldCleanupTrackedPartition(TopicIdPartition trackedPartition) {

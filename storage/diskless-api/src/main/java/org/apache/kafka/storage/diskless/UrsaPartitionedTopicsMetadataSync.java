@@ -16,6 +16,9 @@
  */
 package org.apache.kafka.storage.diskless;
 
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 
@@ -36,7 +39,7 @@ import java.util.function.Supplier;
  */
 public final class UrsaPartitionedTopicsMetadataSync implements AutoCloseable {
 
-    private static final String PARTITIONED_TOPIC_PREFIX = "/admin/partitioned-topics/";
+    private static final String STREAM_CONFIG_PREFIX = "/admin/streams/";
 
     private final BiConsumer<String, Throwable> faultHandler;
     private final ObjectMapper objectMapper;
@@ -64,17 +67,21 @@ public final class UrsaPartitionedTopicsMetadataSync implements AutoCloseable {
      * <p>Catalog metadata and the underlying Ursa stream are deleted by the broker-side reconciliation path,
      * which still has enough context to perform a complete log deletion.
      *
-     * <p>Producer-state snapshot keys are only deleted when topicId is present.
+     * <p>The topic ID scopes both the stream config and producer-state snapshot keys to one Kafka
+     * topic incarnation, so deleting an old topic cannot affect a same-name recreation.
      */
-    public void deleteTopicMetadata(String topicName, String topicId, int partitions, String context) {
-        String partitionedKey = partitionedTopicMetadataPath(topicName);
+    public void deleteTopicMetadata(
+            String topicName,
+            Uuid topicId,
+            int partitions,
+            String context
+    ) {
+        String partitionedKey = partitionedTopicMetadataPath(topicName, topicId);
         enqueue("delete " + partitionedKey, context, () -> store.delete(partitionedKey));
         if (partitions >= 0) {
             for (int partition = 0; partition < partitions; partition++) {
-                if (topicId != null && !topicId.isBlank()) {
-                    String producerStateKey = ProducerStateSnapshotKeys.snapshotKey(topicId, partition);
-                    enqueue("delete " + producerStateKey, context, () -> store.delete(producerStateKey));
-                }
+                String producerStateKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), partition);
+                enqueue("delete " + producerStateKey, context, () -> store.delete(producerStateKey));
             }
         }
     }
@@ -83,10 +90,15 @@ public final class UrsaPartitionedTopicsMetadataSync implements AutoCloseable {
      * Synchronously upsert partitioned topic metadata to Oxia.
      * Used by the pre-commit handler to ensure Oxia write succeeds before KRaft commit.
      */
-    public void upsertPartitionedTopicMetadataSync(String topicName, int partitions,
-            Map<String, String> properties, long timeoutMs) throws Exception {
+    public void upsertPartitionedTopicMetadataSync(
+            String topicName,
+            Uuid topicId,
+            int partitions,
+            Map<String, String> properties,
+            long timeoutMs
+    ) throws Exception {
         byte[] payload = serializePartitionedTopicMetadata(partitions, properties);
-        String key = partitionedTopicMetadataPath(topicName);
+        String key = partitionedTopicMetadataPath(topicName, topicId);
         store.put(key, payload).get(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
@@ -113,11 +125,12 @@ public final class UrsaPartitionedTopicsMetadataSync implements AutoCloseable {
         return objectMapper.writeValueAsBytes(root);
     }
 
-    static String partitionedTopicMetadataPath(String topicName) {
-        return PARTITIONED_TOPIC_PREFIX
-                + KafkaLogNaming.TENANT + "/"
-                + KafkaLogNaming.NAMESPACE + "/"
-                + KafkaLogNaming.DOMAIN + "/"
-                + topicName;
+    static String partitionedTopicMetadataPath(String topicName, Uuid topicId) {
+        Objects.requireNonNull(topicName, "topicName must not be null");
+        Objects.requireNonNull(topicId, "topicId must not be null");
+        TopicIdPartition topicIdPartition = new TopicIdPartition(
+                topicId, new TopicPartition(topicName, 0));
+        return STREAM_CONFIG_PREFIX + KafkaLogNaming.NAMESPACE + "/"
+                + KafkaLogNaming.streamName(topicIdPartition);
     }
 }

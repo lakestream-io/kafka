@@ -45,8 +45,10 @@ import io.streamnative.ursa.lakestream.impl.IndexedStreamCatalog;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -202,10 +204,15 @@ class LakestreamStorageHolderTest {
     void testTopicConfigUpdateReplacesStaleStreamProperties() throws Exception {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Stream stream = mock(Stream.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier("test-topic");
+        TopicIdPartition tp = topicIdPartition("test-topic");
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> updatedConfig = Map.of("keep", "new", "added", "value");
 
-        when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(true));
+        when(catalog.registerExternalPartition(identifier, 0, 11L, Map.of()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.streamExists(identifier)).thenReturn(
+                CompletableFuture.completedFuture(false),
+                CompletableFuture.completedFuture(true));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of("keep", "old", "stale", "remove"));
         when(catalog.removeStreamProperties(identifier, List.of("stale")))
@@ -214,7 +221,8 @@ class LakestreamStorageHolderTest {
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
-        holder.asyncUpdateTopicConfig("test-topic", updatedConfig).get();
+        holder.registerPartition(tp, 11L, Map.of()).get();
+        holder.asyncUpdateTopicConfig(tp, updatedConfig).get();
 
         verify(stream).close();
         verify(catalog).removeStreamProperties(identifier, List.of("stale"));
@@ -225,16 +233,22 @@ class LakestreamStorageHolderTest {
     void testTopicConfigDeleteClearsPropertiesWithoutDroppingStreamMetadata() throws Exception {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Stream stream = mock(Stream.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier("test-topic");
+        TopicIdPartition tp = topicIdPartition("test-topic");
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
 
-        when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(true));
+        when(catalog.registerExternalPartition(identifier, 0, 11L, Map.of()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.streamExists(identifier)).thenReturn(
+                CompletableFuture.completedFuture(false),
+                CompletableFuture.completedFuture(true));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of("stale", "remove"));
         when(catalog.removeStreamProperties(identifier, List.of("stale")))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
-        holder.asyncDeleteTopicConfig("test-topic").get();
+        holder.registerPartition(tp, 11L, Map.of()).get();
+        holder.asyncDeleteTopicConfig(tp).get();
 
         verify(stream).close();
         verify(catalog).removeStreamProperties(identifier, List.of("stale"));
@@ -245,12 +259,13 @@ class LakestreamStorageHolderTest {
     @Test
     void testTopicConfigDeleteToleratesAlreadyMissingStream() throws Exception {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier("missing-topic");
+        TopicIdPartition tp = topicIdPartition("missing-topic");
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
 
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(false));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
-        holder.asyncDeleteTopicConfig("missing-topic").get();
+        holder.asyncDeleteTopicConfig(tp).get();
 
         verify(catalog, never()).loadStream(identifier);
         verify(catalog, never()).dropStream(identifier, false);
@@ -259,14 +274,19 @@ class LakestreamStorageHolderTest {
     @Test
     void testTopicConfigDeletePropagatesOtherCatalogFailures() {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier("failed-delete-topic");
+        TopicIdPartition tp = topicIdPartition("failed-delete-topic");
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
 
+        when(catalog.registerExternalPartition(identifier, 0, 11L, Map.of()))
+                .thenReturn(CompletableFuture.completedFuture(null));
         when(catalog.streamExists(identifier)).thenReturn(
+                CompletableFuture.completedFuture(false),
                 CompletableFuture.failedFuture(new RuntimeException("catalog unavailable")));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
+        holder.registerPartition(tp, 11L, Map.of()).join();
 
-        assertThrows(ExecutionException.class, () -> holder.asyncDeleteTopicConfig("failed-delete-topic").get());
+        assertThrows(ExecutionException.class, () -> holder.asyncDeleteTopicConfig(tp).get());
     }
 
     @Test
@@ -274,95 +294,140 @@ class LakestreamStorageHolderTest {
         String topic = "recreated-topic";
         Map<String, String> staleConfig = Map.of("stale", "old");
         Map<String, String> recreatedConfig = Map.of("retention.ms", "2000");
-        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition(topic, 0));
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(topic);
+        TopicPartition partition = new TopicPartition(topic, 0);
+        TopicIdPartition deletedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        TopicIdPartition recreatedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        StreamIdentifier deletedIdentifier = LakestreamStorageHolder.streamIdentifier(deletedTp);
+        StreamIdentifier recreatedIdentifier = LakestreamStorageHolder.streamIdentifier(recreatedTp);
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Stream deletedStream = mock(Stream.class);
         Stream recreatedStream = mock(Stream.class);
 
-        when(catalog.streamExists(identifier)).thenReturn(
-                CompletableFuture.completedFuture(false),
-                CompletableFuture.completedFuture(true),
-                CompletableFuture.completedFuture(true));
-        when(catalog.registerExternalPartition(identifier, 0, 29L, recreatedConfig))
+        when(catalog.registerExternalPartition(deletedIdentifier, 0, 19L, staleConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.loadStream(identifier)).thenReturn(
-                CompletableFuture.completedFuture(deletedStream),
-                CompletableFuture.completedFuture(recreatedStream));
+        when(catalog.streamExists(deletedIdentifier)).thenReturn(
+                CompletableFuture.completedFuture(false),
+                CompletableFuture.completedFuture(true));
+        when(catalog.registerExternalPartition(recreatedIdentifier, 0, 29L, recreatedConfig))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.streamExists(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(true));
+        when(catalog.loadStream(deletedIdentifier)).thenReturn(CompletableFuture.completedFuture(deletedStream));
+        when(catalog.loadStream(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(recreatedStream));
         when(deletedStream.properties()).thenReturn(staleConfig);
         when(recreatedStream.properties()).thenReturn(Map.of());
-        when(catalog.removeStreamProperties(identifier, List.of("stale")))
+        when(catalog.removeStreamProperties(deletedIdentifier, List.of("stale")))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.setStreamProperties(identifier, recreatedConfig))
+        when(catalog.setStreamProperties(recreatedIdentifier, recreatedConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
-        holder.asyncUpdateTopicConfig(topic, staleConfig).get();
-        holder.asyncDeleteTopicConfig(topic).get();
-        holder.registerPartition(tp, 29L, recreatedConfig).get();
+        holder.registerPartition(deletedTp, 19L, staleConfig).get();
+        holder.asyncDeleteTopicConfig(deletedTp).get();
+        holder.registerPartition(recreatedTp, 29L, recreatedConfig).get();
 
         InOrder inOrder = org.mockito.Mockito.inOrder(catalog);
-        inOrder.verify(catalog).removeStreamProperties(identifier, List.of("stale"));
-        inOrder.verify(catalog).registerExternalPartition(identifier, 0, 29L, recreatedConfig);
-        inOrder.verify(catalog).setStreamProperties(identifier, recreatedConfig);
-        verify(catalog, never()).registerExternalPartition(identifier, 0, 29L, staleConfig);
-        verify(catalog, never()).dropStream(identifier, false);
+        inOrder.verify(catalog).removeStreamProperties(deletedIdentifier, List.of("stale"));
+        inOrder.verify(catalog).registerExternalPartition(recreatedIdentifier, 0, 29L, recreatedConfig);
+        inOrder.verify(catalog).setStreamProperties(recreatedIdentifier, recreatedConfig);
+        verify(catalog, never()).registerExternalPartition(recreatedIdentifier, 0, 29L, staleConfig);
+        verify(catalog, never()).dropStream(deletedIdentifier, false);
+    }
+
+    @Test
+    void testLateOldIncarnationDeleteDoesNotClearRecreatedTopicConfig() throws Exception {
+        String topic = "late-delete-recreated-topic";
+        TopicPartition partition = new TopicPartition(topic, 0);
+        TopicIdPartition deletedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        TopicIdPartition recreatedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        StreamIdentifier deletedIdentifier = LakestreamStorageHolder.streamIdentifier(deletedTp);
+        StreamIdentifier recreatedIdentifier = LakestreamStorageHolder.streamIdentifier(recreatedTp);
+        Map<String, String> deletedConfig = Map.of("stale", "old");
+        Map<String, String> recreatedConfig = Map.of("retention.ms", "2000");
+        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        Stream deletedStream = mock(Stream.class);
+
+        when(catalog.registerExternalPartition(deletedIdentifier, 0, 17L, deletedConfig))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.registerExternalPartition(recreatedIdentifier, 0, 31L, recreatedConfig))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.streamExists(deletedIdentifier)).thenReturn(
+                CompletableFuture.completedFuture(false),
+                CompletableFuture.completedFuture(true));
+        when(catalog.streamExists(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(false));
+        when(catalog.loadStream(deletedIdentifier)).thenReturn(CompletableFuture.completedFuture(deletedStream));
+        when(deletedStream.properties()).thenReturn(deletedConfig);
+        when(catalog.removeStreamProperties(deletedIdentifier, List.of("stale")))
+                .thenReturn(CompletableFuture.completedFuture(null));
+
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
+        holder.registerPartition(deletedTp, 17L, deletedConfig).get();
+        holder.registerPartition(recreatedTp, 31L, recreatedConfig).get();
+
+        holder.asyncDeleteTopicConfig(deletedTp).get();
+
+        verify(catalog).removeStreamProperties(deletedIdentifier, List.of("stale"));
+        verify(catalog, never()).loadStream(recreatedIdentifier);
+        verify(catalog).registerExternalPartition(recreatedIdentifier, 0, 31L, recreatedConfig);
     }
 
     @Test
     void testDeleteKeepsQueueWhenConfigUpdateRacesSameNameRecreation() throws Exception {
         String topic = "racing-recreation-topic";
         Map<String, String> recreatedConfig = Map.of("retention.ms", "2000");
-        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition(topic, 0));
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(topic);
+        TopicPartition partition = new TopicPartition(topic, 0);
+        TopicIdPartition deletedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        TopicIdPartition recreatedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        StreamIdentifier deletedIdentifier = LakestreamStorageHolder.streamIdentifier(deletedTp);
+        StreamIdentifier recreatedIdentifier = LakestreamStorageHolder.streamIdentifier(recreatedTp);
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Stream stream = mock(Stream.class);
         CompletableFuture<Boolean> deleteStreamExistsFuture = new CompletableFuture<>();
-        CompletableFuture<Boolean> updateStreamExistsFuture = new CompletableFuture<>();
 
-        when(catalog.streamExists(identifier)).thenReturn(
-                deleteStreamExistsFuture,
-                updateStreamExistsFuture,
-                CompletableFuture.completedFuture(true));
-        when(catalog.registerExternalPartition(identifier, 0, 31L, recreatedConfig))
+        when(catalog.registerExternalPartition(deletedIdentifier, 0, 17L, Map.of()))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
+        when(catalog.streamExists(deletedIdentifier)).thenReturn(
+                CompletableFuture.completedFuture(false),
+                deleteStreamExistsFuture);
+        when(catalog.registerExternalPartition(recreatedIdentifier, 0, 31L, recreatedConfig))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.streamExists(recreatedIdentifier)).thenReturn(
+                CompletableFuture.completedFuture(false),
+                CompletableFuture.completedFuture(true));
+        when(catalog.loadStream(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
-        when(catalog.setStreamProperties(identifier, recreatedConfig))
+        when(catalog.setStreamProperties(recreatedIdentifier, recreatedConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
-        CompletableFuture<Void> deleteFuture = holder.asyncDeleteTopicConfig(topic);
-        CompletableFuture<Void> updateFuture = holder.asyncUpdateTopicConfig(topic, recreatedConfig);
+        holder.registerPartition(deletedTp, 17L, Map.of()).get();
+        CompletableFuture<Void> deleteFuture = holder.asyncDeleteTopicConfig(deletedTp);
+        CompletableFuture<Void> updateFuture = holder.asyncUpdateTopicConfig(recreatedTp, recreatedConfig);
 
         assertFalse(deleteFuture.isDone());
-        assertFalse(updateFuture.isDone());
+        assertTrue(updateFuture.isDone());
         deleteStreamExistsFuture.complete(false);
         deleteFuture.get();
-        assertFalse(updateFuture.isDone());
-
-        CompletableFuture<Void> registrationFuture = holder.registerPartition(tp, 31L, Map.of("stale", "snapshot"));
-        assertFalse(registrationFuture.isDone());
-        verify(catalog, never()).registerExternalPartition(identifier, 0, 31L, recreatedConfig);
-
-        updateStreamExistsFuture.complete(false);
         updateFuture.get();
+
+        CompletableFuture<Void> registrationFuture = holder.registerPartition(
+                recreatedTp, 31L, Map.of("stale", "snapshot"));
         registrationFuture.get();
 
         InOrder inOrder = org.mockito.Mockito.inOrder(catalog);
-        inOrder.verify(catalog).registerExternalPartition(identifier, 0, 31L, recreatedConfig);
-        inOrder.verify(catalog).setStreamProperties(identifier, recreatedConfig);
-        verify(catalog, never()).dropStream(identifier, false);
+        inOrder.verify(catalog).registerExternalPartition(recreatedIdentifier, 0, 31L, recreatedConfig);
+        inOrder.verify(catalog).setStreamProperties(recreatedIdentifier, recreatedConfig);
+        verify(catalog, never()).dropStream(deletedIdentifier, false);
     }
 
     @Test
     void testTopicConfigUpdateIsDeferredUntilAStreamExists() throws Exception {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier("not-opened-topic");
+        TopicIdPartition tp = topicIdPartition("not-opened-topic");
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(false));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
-        holder.asyncUpdateTopicConfig("not-opened-topic", Map.of("retention.ms", "1000")).get();
+        holder.asyncUpdateTopicConfig(tp, Map.of("retention.ms", "1000")).get();
 
         verify(catalog, never()).loadStream(identifier);
         verify(catalog, never()).setStreamProperties(identifier, Map.of("retention.ms", "1000"));
@@ -373,7 +438,7 @@ class LakestreamStorageHolderTest {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Stream stream = mock(Stream.class);
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("race-topic", 0));
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp.topic());
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> initialConfig = Map.of("retention.ms", "1000");
         Map<String, String> latestConfig = Map.of("retention.ms", "2000");
         CompletableFuture<Void> registration = new CompletableFuture<>();
@@ -389,7 +454,7 @@ class LakestreamStorageHolderTest {
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
         CompletableFuture<Void> openFuture = holder.registerPartition(tp, 17L, initialConfig);
-        CompletableFuture<Void> updateFuture = holder.asyncUpdateTopicConfig(tp.topic(), latestConfig);
+        CompletableFuture<Void> updateFuture = holder.asyncUpdateTopicConfig(tp, latestConfig);
 
         assertFalse(openFuture.isDone());
         assertFalse(updateFuture.isDone());
@@ -424,6 +489,44 @@ class LakestreamStorageHolderTest {
         InOrder deletionOrder = org.mockito.Mockito.inOrder(catalogOxiaClient, producerStateOxiaClient);
         deletionOrder.verify(catalogOxiaClient).delete(metadataPath);
         deletionOrder.verify(producerStateOxiaClient).delete(anyString(), anySet());
+    }
+
+    @Test
+    void testPartitionDeletionWaitsForRegistrationAndFencesLateOpen() throws Exception {
+        TopicIdPartition tp = topicIdPartition("delete-during-open-topic");
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
+        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        AsyncOxiaClient catalogOxiaClient = mock(AsyncOxiaClient.class);
+        AsyncOxiaClient producerStateOxiaClient = mock(AsyncOxiaClient.class);
+        CompletableFuture<Void> registration = new CompletableFuture<>();
+        String metadataPath = KafkaLogNaming.logMetadataPath(tp);
+
+        when(catalog.registerExternalPartition(identifier, 0, 41L, Map.of()))
+                .thenReturn(registration);
+        when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(false));
+        when(catalog.getOxiaClient()).thenReturn(catalogOxiaClient);
+        when(catalogOxiaClient.get(metadataPath)).thenReturn(CompletableFuture.completedFuture(null));
+        when(catalogOxiaClient.delete(metadataPath)).thenReturn(CompletableFuture.completedFuture(true));
+        when(producerStateOxiaClient.delete(anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(true));
+
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, producerStateOxiaClient, null);
+        CompletableFuture<Void> openFuture = holder.registerPartition(tp, 41L, Map.of());
+        CompletableFuture<Void> deleteFuture = holder.deletePartitionData(tp);
+
+        assertFalse(openFuture.isDone());
+        assertFalse(deleteFuture.isDone());
+        verify(catalogOxiaClient, never()).get(metadataPath);
+
+        registration.complete(null);
+        openFuture.get();
+        deleteFuture.get();
+
+        CompletableFuture<Void> lateOpen = holder.registerPartition(tp, 41L, Map.of());
+        assertThrows(ExecutionException.class, lateOpen::get);
+        verify(catalog).registerExternalPartition(identifier, 0, 41L, Map.of());
+        verify(catalogOxiaClient).delete(metadataPath);
+        assertTrue(deleteFuture.isDone());
     }
 
     @Test
@@ -529,6 +632,53 @@ class LakestreamStorageHolderTest {
     }
 
     @Test
+    void testFailedDeletionCannotAttachSameNameRecreationToOldStream() throws Exception {
+        String topic = "failed-deletion-recreation";
+        TopicPartition partition = new TopicPartition(topic, 0);
+        TopicIdPartition deletedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        TopicIdPartition recreatedTp = new TopicIdPartition(Uuid.randomUuid(), partition);
+        StreamIdentifier deletedIdentifier = LakestreamStorageHolder.streamIdentifier(deletedTp);
+        StreamIdentifier recreatedIdentifier = LakestreamStorageHolder.streamIdentifier(recreatedTp);
+        String deletedLogName = KafkaLogNaming.logName(deletedTp);
+        String recreatedLogName = KafkaLogNaming.logName(recreatedTp);
+
+        IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
+        AsyncOxiaClient catalogOxiaClient = mock(AsyncOxiaClient.class);
+        AsyncOxiaClient producerStateOxiaClient = mock(AsyncOxiaClient.class);
+        GetResult deletedMetadata = mock(GetResult.class);
+        Log deletedLog = mock(Log.class);
+        RuntimeException deleteError = new RuntimeException("delete failed");
+
+        when(catalog.registerExternalPartition(deletedIdentifier, 0, 42L, Map.of()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.registerExternalPartition(recreatedIdentifier, 0, 84L, Map.of()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.streamExists(deletedIdentifier)).thenReturn(CompletableFuture.completedFuture(false));
+        when(catalog.streamExists(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(false));
+        when(catalog.getOxiaClient()).thenReturn(catalogOxiaClient);
+        when(catalogOxiaClient.get(KafkaLogNaming.logMetadataPath(deletedTp)))
+                .thenReturn(CompletableFuture.completedFuture(deletedMetadata));
+        when(deletedMetadata.value()).thenReturn("{\"streamId\":42}".getBytes(StandardCharsets.UTF_8));
+        when(catalog.createLog(deletedLogName, LogId.of(42L))).thenReturn(deletedLog);
+        when(deletedLog.delete()).thenReturn(CompletableFuture.failedFuture(deleteError));
+
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, producerStateOxiaClient, null);
+        holder.registerPartition(deletedTp, 42L, Map.of()).get();
+        ExecutionException failure = assertThrows(
+                ExecutionException.class,
+                () -> holder.deletePartitionData(deletedTp).get());
+        assertSame(deleteError, failure.getCause());
+
+        holder.registerPartition(recreatedTp, 84L, Map.of()).get();
+
+        assertNotEquals(deletedIdentifier, recreatedIdentifier);
+        assertNotEquals(deletedLogName, recreatedLogName);
+        verify(catalog).registerExternalPartition(deletedIdentifier, 0, 42L, Map.of());
+        verify(catalog).registerExternalPartition(recreatedIdentifier, 0, 84L, Map.of());
+        verify(catalog, never()).registerExternalPartition(recreatedIdentifier, 0, 42L, Map.of());
+    }
+
+    @Test
     void testLateProducerStateOxiaClientIsClosedAfterCreateFailure() throws Exception {
         CompletableFuture<AsyncOxiaClient> clientFuture = new CompletableFuture<>();
         AsyncOxiaClient client = mock(AsyncOxiaClient.class);
@@ -584,5 +734,9 @@ class LakestreamStorageHolderTest {
         assertEquals("unused-region", properties.getProperty("compactionBucketRegion"));
         assertFalse(properties.containsKey("s3AccessKeyId"));
         assertFalse(properties.containsKey("s3SecretAccessKey"));
+    }
+
+    private static TopicIdPartition topicIdPartition(String topic) {
+        return new TopicIdPartition(Uuid.randomUuid(), new TopicPartition(topic, 0));
     }
 }

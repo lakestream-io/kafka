@@ -212,12 +212,6 @@ public class ServerLogConfigs {
     public static final String URSA_CATALOG_OXIA_SERVICE_URL_DOC = "The Oxia service URL for the Ursa log catalog. " +
             "The format should be 'oxia://host:port/[namespace]'. If the namespace is not provided, 'default' will be used.";
 
-    // Deprecated compatibility alias. New configurations should use ursa.catalog.oxia.service.url.
-    public static final String LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG = "pulsar.oxia.service.url";
-    public static final String LEGACY_CATALOG_OXIA_SERVICE_URL_DEFAULT = URSA_CATALOG_OXIA_SERVICE_URL_DEFAULT;
-    public static final String LEGACY_CATALOG_OXIA_SERVICE_URL_DOC =
-            "Deprecated alias for <code>ursa.catalog.oxia.service.url</code>.";
-
     public static final String URSA_OXIA_SERVICE_URL_CONFIG = "ursa.oxia.service.url";
     public static final String URSA_OXIA_SERVICE_URL_DEFAULT = "oxia://localhost:6648/default";
     public static final String URSA_OXIA_SERVICE_URL_DOC = "The Oxia service URL for Ursa storage metadata. " +

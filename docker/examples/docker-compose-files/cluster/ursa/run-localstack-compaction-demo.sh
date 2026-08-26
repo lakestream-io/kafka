@@ -28,7 +28,7 @@ trap cleanup EXIT
 
 docker compose -f "$base" up -d
 
-echo "Running schema (Avro) produce/consume demo..."
-docker compose -f "$base" -f "$demo" run --rm avro-consumer
+echo "Running raw Kafka produce/consume compaction demo..."
+docker compose -f "$base" -f "$demo" run --rm raw-consumer
 
 echo "Demo finished successfully."

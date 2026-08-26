@@ -877,16 +877,16 @@ public class ReplicationControlManager {
                 numPartitions, e.throttleTimeMs());
             return ApiError.fromThrowable(e);
         }
+        Uuid topicId = Uuid.randomUuid();
         if (disklessEnabled && !validateOnly && disklessTopicPreCommitHandler.isPresent()) {
             try {
                 disklessTopicPreCommitHandler.get().preCommitCreateTopic(
-                    topic.name(), numPartitions, creationConfigs);
+                    topic.name(), topicId, numPartitions, creationConfigs);
             } catch (Exception e) {
                 return new ApiError(Errors.UNKNOWN_SERVER_ERROR,
                     "Failed to write diskless topic metadata to Oxia: " + e.getMessage());
             }
         }
-        Uuid topicId = Uuid.randomUuid();
         CreatableTopicResult result = new CreatableTopicResult().
             setName(topic.name()).
             setTopicId(topicId).

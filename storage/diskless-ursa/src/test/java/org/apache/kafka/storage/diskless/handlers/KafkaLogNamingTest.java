@@ -23,32 +23,56 @@ import org.apache.kafka.common.Uuid;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class KafkaLogNamingTest {
 
     @Test
     void testLogName() {
-        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 2));
+        Uuid topicId = Uuid.randomUuid();
+        TopicIdPartition tp = new TopicIdPartition(topicId, new TopicPartition("test-topic", 2));
         assertEquals(
-                "public/default/persistent/test-topic-partition-2",
+                "default/test-topic-topic-id-" + topicId + "-partition-2",
                 KafkaLogNaming.logName(tp)
         );
     }
 
     @Test
-    void testLogNameFromTopicAndPartition() {
+    void testStreamNameIncludesTopicIncarnation() {
+        Uuid topicId = Uuid.randomUuid();
+        TopicIdPartition tp = new TopicIdPartition(topicId, new TopicPartition("test-topic", 0));
         assertEquals(
-                "public/default/persistent/test-topic-partition-0",
-                KafkaLogNaming.logName("test-topic", 0)
+                "test-topic-topic-id-" + topicId,
+                KafkaLogNaming.streamName(tp)
         );
     }
 
     @Test
-    void testLegacyCatalogMetadataPathIsStable() {
-        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
+    void testCatalogMetadataPath() {
+        Uuid topicId = Uuid.randomUuid();
+        TopicIdPartition tp = new TopicIdPartition(topicId, new TopicPartition("test-topic", 0));
         assertEquals(
-                "/managed-ledgers/public/default/persistent/test-topic-partition-0",
+                "/streams/default/test-topic-topic-id-" + topicId + "-partition-0",
                 KafkaLogNaming.logMetadataPath(tp)
         );
+    }
+
+    @Test
+    void testSameNameRecreatedTopicUsesDifferentLogAndMetadataKeys() {
+        TopicPartition partition = new TopicPartition("recreated-topic", 0);
+        TopicIdPartition deleted = new TopicIdPartition(Uuid.randomUuid(), partition);
+        TopicIdPartition recreated = new TopicIdPartition(Uuid.randomUuid(), partition);
+
+        assertNotEquals(KafkaLogNaming.streamName(deleted), KafkaLogNaming.streamName(recreated));
+        assertNotEquals(KafkaLogNaming.logName(deleted), KafkaLogNaming.logName(recreated));
+        assertNotEquals(KafkaLogNaming.logMetadataPath(deleted), KafkaLogNaming.logMetadataPath(recreated));
+    }
+
+    @Test
+    void testUnknownTopicIncarnationIsRejected() {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.ZERO_UUID, new TopicPartition("test-topic", 0));
+
+        assertThrows(IllegalArgumentException.class, () -> KafkaLogNaming.logName(tp));
     }
 }

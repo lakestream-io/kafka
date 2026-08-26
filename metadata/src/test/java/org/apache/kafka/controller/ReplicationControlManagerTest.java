@@ -126,6 +126,7 @@ import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -3725,10 +3726,12 @@ public class ReplicationControlManagerTest {
     @Test
     public void testPreCommitHandlerOnDisklessTopicCreateAndDelete() {
         AtomicBoolean createCalled = new AtomicBoolean(false);
+        AtomicReference<Uuid> preCommittedTopicId = new AtomicReference<>();
         DisklessTopicPreCommitHandler handler = new DisklessTopicPreCommitHandler() {
             @Override
-            public void preCommitCreateTopic(String t, int p, Map<String, String> c) {
+            public void preCommitCreateTopic(String t, Uuid topicId, int p, Map<String, String> c) {
                 createCalled.set(true);
+                preCommittedTopicId.set(topicId);
             }
         };
         ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().
@@ -3740,6 +3743,7 @@ public class ReplicationControlManagerTest {
         ControllerResult<CreateTopicsResponseData> result = createDisklessTopic(ctx, "diskless-topic", 2);
         assertEquals(NONE.code(), result.response().topics().find("diskless-topic").errorCode());
         assertTrue(createCalled.get());
+        assertEquals(result.response().topics().find("diskless-topic").topicId(), preCommittedTopicId.get());
         ctx.replay(result.records());
 
         // Non-diskless topic does not trigger handler
@@ -3757,7 +3761,7 @@ public class ReplicationControlManagerTest {
         AtomicBoolean failCreate = new AtomicBoolean(true);
         DisklessTopicPreCommitHandler handler = new DisklessTopicPreCommitHandler() {
             @Override
-            public void preCommitCreateTopic(String t, int p, Map<String, String> c) throws Exception {
+            public void preCommitCreateTopic(String t, Uuid topicId, int p, Map<String, String> c) throws Exception {
                 if (failCreate.get()) throw new RuntimeException("Oxia unavailable");
             }
         };
@@ -3788,7 +3792,7 @@ public class ReplicationControlManagerTest {
         AtomicBoolean createCalled = new AtomicBoolean(false);
         DisklessTopicPreCommitHandler handler = new DisklessTopicPreCommitHandler() {
             @Override
-            public void preCommitCreateTopic(String t, int p, Map<String, String> c) {
+            public void preCommitCreateTopic(String t, Uuid topicId, int p, Map<String, String> c) {
                 createCalled.set(true);
             }
         };

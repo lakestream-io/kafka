@@ -37,6 +37,7 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.BrokerState;
 import org.apache.kafka.server.config.ServerLogConfigs;
+import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterAll;
@@ -63,6 +64,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -740,23 +742,24 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
     /**
      * Oxia metadata verification tests.
-     * Tests that legacy-compatible log metadata and partitioned topic metadata are correctly stored in Oxia.
+     * Tests that catalog log metadata and stream config metadata are correctly stored in Oxia.
      */
     @Nested
     @DisplayName("Oxia Metadata Tests")
     class OxiaMetadataTests {
+        private final Map<String, Uuid> topicIds = new ConcurrentHashMap<>();
 
         @Test
-        @DisplayName("Log metadata created under the legacy /managed-ledgers compatibility prefix")
-        void testLogMetadataCreatedUnderLegacyCompatibilityPrefix() throws Exception {
-            String topicName = uniqueTopicName("legacy-log-metadata-topic");
+        @DisplayName("Log metadata created under the neutral /streams catalog prefix")
+        void testLogMetadataCreatedUnderCatalogPrefix() throws Exception {
+            String topicName = uniqueTopicName("log-metadata-topic");
 
             createDisklessTopic(cluster, topicName);
             produceRecords(cluster.bootstrapServers(), topicName, 10);
             consumeAndVerifyRecords(cluster.bootstrapServers(), topicName, 10);
 
-            assertLegacyLogMetadataExistsInOxia(topicName);
-            log.info("Legacy-compatible log metadata test passed for topic {}", topicName);
+            assertLogMetadataExistsInOxia(topicName);
+            log.info("Catalog log metadata test passed for topic {}", topicName);
         }
 
         @Test
@@ -771,7 +774,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             Map<Integer, Long> streamIds = new HashMap<>();
             for (int partition = 0; partition < numPartitions; partition++) {
                 produceRecords(cluster.bootstrapServers(), topicName, partition, 1);
-                assertLegacyLogMetadataExistsInOxia(topicName, partition);
+                assertLogMetadataExistsInOxia(topicName, partition);
             }
             try (AsyncOxiaClient oxiaClient = createOxiaClient()) {
                 for (int partition = 0; partition < numPartitions; partition++) {
@@ -796,7 +799,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
 
             assertPartitionedTopicMetadataDeletedFromOxia(topicName);
-            assertLegacyLogMetadataDeletedFromOxia(topicName, numPartitions);
+            assertLogMetadataDeletedFromOxia(topicName, numPartitions);
             assertProducerStateSnapshotsDeletedFromOxia(topicId, numPartitions);
             try (AsyncOxiaClient oxiaClient = createOxiaClient()) {
                 for (int partition = 0; partition < numPartitions; partition++) {
@@ -813,7 +816,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
         @Test
         @Timeout(value = 600, unit = TimeUnit.SECONDS)
-        @DisplayName("Bulk diskless topic deletion cleans legacy log metadata and stream data")
+        @DisplayName("Bulk diskless topic deletion cleans catalog log metadata and stream data")
         void testBulkTopicDeletionCleansLogStreams() throws Exception {
             int topicCount = 100;
             int partitionsPerTopic = 10;
@@ -835,19 +838,19 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private void assertLegacyLogMetadataExistsInOxia(String topicName) throws Exception {
-            assertLegacyLogMetadataExistsInOxia(topicName, 0);
+        private void assertLogMetadataExistsInOxia(String topicName) throws Exception {
+            assertLogMetadataExistsInOxia(topicName, 0);
         }
 
-        private void assertLegacyLogMetadataExistsInOxia(String topicName, int partition) throws Exception {
-            assertOxiaKeyExists(legacyLogMetadataPath(topicName, partition), "LegacyLogMetadata");
+        private void assertLogMetadataExistsInOxia(String topicName, int partition) throws Exception {
+            assertOxiaKeyExists(logMetadataPath(topicName, partition), "LogMetadata");
         }
 
         private void assertPartitionedTopicMetadataExistsInOxia(String topicName, int expectedPartitions)
                 throws Exception {
             String oxiaServiceAddress = oxiaContainer.getServiceAddress();
             String namespace = ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
-            String key = "/admin/partitioned-topics/public/default/persistent/" + topicName;
+            String key = partitionedTopicMetadataPath(topicName);
             Pattern partitionsPattern = Pattern.compile("\"partitions\"\\s*:\\s*" + expectedPartitions);
 
             try (AsyncOxiaClient client = OxiaClientBuilder.create(oxiaServiceAddress)
@@ -878,9 +881,9 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private void assertLegacyLogMetadataDeletedFromOxia(String topicName, int partitions) throws Exception {
+        private void assertLogMetadataDeletedFromOxia(String topicName, int partitions) throws Exception {
             try (AsyncOxiaClient client = createOxiaClient()) {
-                assertLegacyLogMetadataDeletedFromOxia(client, topicName, partitions);
+                assertLogMetadataDeletedFromOxia(client, topicName, partitions);
             }
         }
 
@@ -1008,12 +1011,12 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                 Map<TopicPartition, Long> streamIds
         ) throws Exception {
             for (String topicName : topicNames) {
-                if (!isOxiaKeyDeleted(client, "/admin/partitioned-topics/public/default/persistent/" + topicName)) {
+                if (!isOxiaKeyDeleted(client, partitionedTopicMetadataPath(topicName))) {
                     return false;
                 }
                 for (int partition = 0; partition < partitionsPerTopic; partition++) {
                     TopicPartition topicPartition = new TopicPartition(topicName, partition);
-                    if (!isOxiaKeyDeleted(client, legacyLogMetadataPath(topicName, partition))) {
+                    if (!isOxiaKeyDeleted(client, logMetadataPath(topicName, partition))) {
                         return false;
                     }
                     if (!isLogStreamDeletedFromOxia(
@@ -1038,17 +1041,17 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         }
 
         private void assertPartitionedTopicMetadataDeletedFromOxia(AsyncOxiaClient client, String topicName) throws Exception {
-            String key = "/admin/partitioned-topics/public/default/persistent/" + topicName;
+            String key = partitionedTopicMetadataPath(topicName);
             assertOxiaKeyDeleted(client, key, "PartitionedTopicMetadata");
         }
 
-        private void assertLegacyLogMetadataDeletedFromOxia(
+        private void assertLogMetadataDeletedFromOxia(
                 AsyncOxiaClient client,
                 String topicName,
                 int partitions
         ) throws Exception {
             for (int partition = 0; partition < partitions; partition++) {
-                assertOxiaKeyDeleted(client, legacyLogMetadataPath(topicName, partition), "LegacyLogMetadata");
+                assertOxiaKeyDeleted(client, logMetadataPath(topicName, partition), "LogMetadata");
             }
         }
 
@@ -1114,13 +1117,38 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             return result == null || result.value() == null;
         }
 
-        private String legacyLogMetadataPath(String topicName, int partition) {
-            // Persisted compatibility path: changing it would orphan existing log metadata.
-            return "/managed-ledgers/" + logName(topicName, partition);
+        private String logMetadataPath(String topicName, int partition) throws Exception {
+            return "/streams/" + logName(topicName, partition);
         }
 
-        private String logName(String topicName, int partition) {
-            return "public/default/persistent/" + topicName + "-partition-" + partition;
+        private String partitionedTopicMetadataPath(String topicName) throws Exception {
+            TopicIdPartition topicIdPartition = new TopicIdPartition(
+                    topicId(topicName),
+                    new TopicPartition(topicName, 0));
+            return "/admin/streams/" + KafkaLogNaming.NAMESPACE + "/"
+                    + KafkaLogNaming.streamName(topicIdPartition);
+        }
+
+        private String logName(String topicName, int partition) throws Exception {
+            return KafkaLogNaming.logName(new TopicIdPartition(
+                    topicId(topicName),
+                    new TopicPartition(topicName, partition)));
+        }
+
+        private Uuid topicId(String topicName) throws Exception {
+            Uuid cached = topicIds.get(topicName);
+            if (cached != null) {
+                return cached;
+            }
+            try (Admin admin = cluster.admin()) {
+                Uuid discovered = admin.describeTopics(Set.of(topicName))
+                        .allTopicNames()
+                        .get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .get(topicName)
+                        .topicId();
+                Uuid raced = topicIds.putIfAbsent(topicName, discovered);
+                return raced != null ? raced : discovered;
+            }
         }
     }
 

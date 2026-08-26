@@ -187,7 +187,6 @@ def main() -> None:
         "oxia",
         "localstack",
         "localstack-init",
-        "schema-registry",
         "kafka-1",
         "kafka-2",
         "kafka-3",

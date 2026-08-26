@@ -52,18 +52,23 @@ Build a linux/amd64 (x86_64) image (useful on Apple Silicon):
 ./build-image.sh --amd64
 ```
 
-### Compaction (LocalStack + Schema Registry)
+### Compaction (LocalStack)
 
-For Parquet compaction (via an external compactor container) and schema-registry integration, use:
+For raw Kafka batch to Parquet compaction via an external compactor container, use:
 
 - Cluster compose: `docker-compose-localstack-compaction.yml`
-- Demo overlay (create topic + produce/consume Avro + wait for parquet): `docker-compose-localstack-compaction.demo.yml`
+- Demo overlay (create topic + produce/consume raw records + wait for Parquet): `docker-compose-localstack-compaction.demo.yml`
 
-Build the compactor image from the `ursa-storage` repo (UE-based image recommended):
+Build the standalone Maven package in the `ursa-storage` repository. The package must contain
+`ursa-storage-compact/target/ursa-storage-compact-*.jar` and its runtime dependencies under
+`ursa-storage-compact/target/lib/`. Then build the neutral compactor image from this repository:
 
 ```bash
-# From the current repo root:
-docker build -t ursa-compact:ue-s3-e2e \
+# From the ursa-storage repository:
+mvn -B -ntp -pl ursa-storage-compact -am -DskipTests package
+
+# From the Kafka repository:
+docker build -t ursa-compact:standalone-s3-e2e \
   -f docker/examples/docker-compose-files/cluster/ursa/ursa-compact-ue.Dockerfile \
   </path/to/ursa-storage>
 ```
@@ -74,7 +79,7 @@ Run the full end-to-end demo:
 docker compose -f docker-compose-localstack-compaction.yml up -d
 docker compose -f docker-compose-localstack-compaction.yml \
   -f docker-compose-localstack-compaction.demo.yml \
-  run --rm avro-consumer
+  run --rm raw-consumer
 docker compose -f docker-compose-localstack-compaction.yml down -v --remove-orphans
 ```
 
@@ -84,8 +89,8 @@ Or run the helper script:
 bash ./run-localstack-compaction-demo.sh
 ```
 
-Notes:
-- The demo overlay uses `confluentinc/cp-schema-registry` only as a CLI image (for `kafka-avro-console-producer/consumer`); override with `AVRO_CLI_IMAGE=...` if needed.
+The raw-byte demo intentionally does not start a schema registry. The compactor runs from
+`/opt/ursa` with classpath `/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*`.
 
 ### 2. Run the Demo (Recommended)
 

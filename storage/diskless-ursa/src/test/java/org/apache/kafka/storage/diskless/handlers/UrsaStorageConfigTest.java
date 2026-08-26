@@ -18,7 +18,6 @@ package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.config.types.Password;
 import org.apache.kafka.server.config.ServerLogConfigs;
-import org.apache.kafka.storage.internals.log.LogConfig;
 
 import org.junit.jupiter.api.Test;
 
@@ -58,36 +57,6 @@ class UrsaStorageConfigTest {
     void testCatalogOxiaServiceUrlUsesPrimaryConfig() throws Exception {
         UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
             ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://catalog:6648/kafka"
-        ));
-
-        assertEquals("oxia://catalog:6648/kafka", config.getCatalogOxiaServiceUrl());
-    }
-
-    @Test
-    void testCatalogOxiaServiceUrlSupportsLegacyAlias() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
-            ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://legacy:6648/kafka"
-        ));
-
-        assertEquals("oxia://legacy:6648/kafka", config.getCatalogOxiaServiceUrl());
-    }
-
-    @Test
-    void testCatalogOxiaServiceUrlSupportsLegacyAliasAfterConfigParsing() throws Exception {
-        LogConfig parsedConfig = new LogConfig(Map.of(
-            ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://legacy:6648/kafka"
-        ));
-
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(parsedConfig.originals());
-
-        assertEquals("oxia://legacy:6648/kafka", config.getCatalogOxiaServiceUrl());
-    }
-
-    @Test
-    void testCatalogOxiaServiceUrlPrimaryConfigTakesPrecedenceOverLegacyAlias() throws Exception {
-        UrsaStorageConfig config = UrsaStorageConfig.fromConfigs(Map.of(
-            ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://catalog:6648/kafka",
-            ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG, "oxia://legacy:6648/kafka"
         ));
 
         assertEquals("oxia://catalog:6648/kafka", config.getCatalogOxiaServiceUrl());

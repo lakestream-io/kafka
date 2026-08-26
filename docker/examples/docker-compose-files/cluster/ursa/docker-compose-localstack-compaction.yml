@@ -69,34 +69,8 @@ services:
       exit 0;
       "
 
-  schema-registry:
-    image: streamnative/schema-registry:0.1.0
-    platform: linux/amd64
-    hostname: schema-registry
-    container_name: schema-registry
-    depends_on:
-      oxia:
-        condition: service_healthy
-    environment:
-      PULSAR_PREFIX_oxiaServiceUrl: oxia://oxia:6648
-      PULSAR_PREFIX_schemaRegistryListeners: http://0.0.0.0:8001
-      PULSAR_PREFIX_schemaRegistryProtocolMap: HTTP:http
-    command:
-      - /bin/sh
-      - -c
-      - |
-        set -euo pipefail
-        echo "Starting Schema Registry..."
-        bin/apply-config-from-env.py conf/sr.conf
-        bin/start.sh -d
-        echo "Schema Registry started."
-        tail -f /dev/null
-    ports:
-      - 8001:8001
-
   compactor:
-    image: ${COMPACTOR_IMAGE:-ursa-compact:ue-s3-e2e}
-    platform: linux/amd64
+    image: ${COMPACTOR_IMAGE:-ursa-compact:standalone-s3-e2e}
     hostname: compactor
     container_name: compactor
     depends_on:
@@ -104,61 +78,79 @@ services:
         condition: service_healthy
       localstack-init:
         condition: service_completed_successfully
-      schema-registry:
-        condition: service_started
     environment:
       OTEL_SDK_DISABLED: "true"
-      PULSAR_MEM: "-Xmx1024M"
-      PULSAR_GC: "-XX:+UseZGC"
+      URSA_JAVA_OPTS: "-Xmx1024M -XX:+UseZGC"
 
-      # Metadata store and topic discovery
-      PULSAR_PREFIX_metadataStoreUrl: oxia://oxia:6648/default
-      PULSAR_PREFIX_oxiaPulsarStorageUrl: oxia://oxia:6648/default
-      PULSAR_PREFIX_dataSourceForCompaction: URSA
-      PULSAR_PREFIX_metastoreRequestRateLimitPerSecond: "500"
-      PULSAR_PREFIX_refreshLocalTopicInternalInSeconds: "5"
+      # Catalog, WAL indexes, and log discovery
+      URSA_METADATA_STORE_URL: oxia://oxia:6648/default
+      URSA_OXIA_STORAGE_URL: oxia://oxia:6648/default
+      URSA_DATA_SOURCE_FOR_COMPACTION: URSA
+      URSA_ENTRY_FORMAT: KAFKA
+      URSA_ENTRY_SERDE_TYPE: KAFKA_BATCHED_RAW_PARQUET
+      URSA_METASTORE_RATE_LIMIT: "500"
+      URSA_REFRESH_LOG_INTERVAL_SECONDS: "5"
 
       # WAL backend (S3 via LocalStack)
-      PULSAR_PREFIX_backendStorageType: S3
-      PULSAR_PREFIX_bucket: kafka-ursa
+      URSA_BACKEND_STORAGE_TYPE: S3
+      URSA_BUCKET: kafka-ursa
       # NOTE: must match Kafka brokers' `ursa.storage.path` (S3 key prefix) to avoid NoSuchKey(404).
-      PULSAR_PREFIX_prefix: "${URSA_STORAGE_PATH:-ursa}"
-      PULSAR_PREFIX_cloudStorageEndpoint: http://localstack:4566
-      PULSAR_PREFIX_region: us-east-1
-      PULSAR_PREFIX_s3AccessKeyId: test
-      PULSAR_PREFIX_s3SecretAccessKey: test
+      URSA_PREFIX: "${URSA_STORAGE_PATH:-ursa}"
+      URSA_CLOUD_STORAGE_ENDPOINT: http://localstack:4566
+      URSA_REGION: us-east-1
+      URSA_S3_ACCESS_KEY_ID: test
+      URSA_S3_SECRET_ACCESS_KEY: test
 
       # Lakehouse (parquet) path resolution for v2 reader/writer
-      PULSAR_PREFIX_compactionBackendStorageType: S3
-      PULSAR_PREFIX_compactionBucket: kafka-ursa
-      PULSAR_PREFIX_compactionPrefix: "${URSA_STORAGE_PATH:-ursa}"
-      PULSAR_PREFIX_compactionBucketRegion: us-east-1
-
-      # Schema registry (required for Kafka parquet entry serde)
-      PULSAR_PREFIX_kopSchemaRegistryUrl: http://schema-registry:8001
-
-      # Force v2 compaction worker + kafka parquet serde
-      PULSAR_PREFIX_forceToUsePulsarCompactionWorker: "true"
-      PULSAR_PREFIX_managedTableSchemaEvolutionEnabled: "true"
-      PULSAR_PREFIX_entrySerDeType: KAFKA_BATCHED_RAW_PARQUET
+      URSA_COMPACTION_BACKEND_STORAGE_TYPE: S3
+      URSA_COMPACTION_BUCKET: kafka-ursa
+      URSA_COMPACTION_PREFIX: "${URSA_STORAGE_PATH:-ursa}"
+      URSA_COMPACTION_BUCKET_REGION: us-east-1
 
       # Keep the compaction cycle fast for demo/dev
-      PULSAR_PREFIX_compactedFileSizeLimit: "10240"
-      PULSAR_PREFIX_tailCompactDataVisibilityIntervalInSeconds: "5"
+      URSA_COMPACTED_FILE_SIZE_LIMIT: "10240"
+      URSA_TAIL_VISIBILITY_INTERVAL_SECONDS: "5"
+      URSA_COMPACTED_THREAD_NUM: "2"
+      URSA_PUBLISH_THREAD_NUM: "2"
+      URSA_COMMIT_THREAD_NUM: "2"
 
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
-    working_dir: /pulsar
+    working_dir: /opt/ursa
+    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - bash
-      - -c
       - |
-        set -euo pipefail
-        conf=/tmp/ursa_storage.conf
+        set -eu
+        conf=/tmp/ursa-storage.properties
         : > "$$conf"
-        bin/apply-config-from-env.py "$$conf"
-        exec java -Dio.netty.tryReflectionSetAccessible=true -Djava.net.preferIPv4Stack=true \
-          -cp "/pulsar/lib/*" io.streamnative.ursa.compact.CompactionMain --conf "$$conf"
+        property() { printf '%s=%s\n' "$$1" "$$2" >> "$$conf"; }
+        property metadataStoreUrl "$$URSA_METADATA_STORE_URL"
+        property oxiaStorageUrl "$$URSA_OXIA_STORAGE_URL"
+        property backendStorageType "$$URSA_BACKEND_STORAGE_TYPE"
+        property bucket "$$URSA_BUCKET"
+        property prefix "$$URSA_PREFIX"
+        property cloudStorageEndpoint "$$URSA_CLOUD_STORAGE_ENDPOINT"
+        property region "$$URSA_REGION"
+        property s3AccessKeyId "$$URSA_S3_ACCESS_KEY_ID"
+        property s3SecretAccessKey "$$URSA_S3_SECRET_ACCESS_KEY"
+        property compactionBackendStorageType "$$URSA_COMPACTION_BACKEND_STORAGE_TYPE"
+        property compactionBucket "$$URSA_COMPACTION_BUCKET"
+        property compactionPrefix "$$URSA_COMPACTION_PREFIX"
+        property compactionBucketRegion "$$URSA_COMPACTION_BUCKET_REGION"
+        property dataSourceForCompaction "$$URSA_DATA_SOURCE_FOR_COMPACTION"
+        property entryFormat "$$URSA_ENTRY_FORMAT"
+        property entrySerDeType "$$URSA_ENTRY_SERDE_TYPE"
+        property compactedFileSizeLimit "$$URSA_COMPACTED_FILE_SIZE_LIMIT"
+        property tailCompactDataVisibilityIntervalInSeconds "$$URSA_TAIL_VISIBILITY_INTERVAL_SECONDS"
+        property refreshLocalTopicInternalInSeconds "$$URSA_REFRESH_LOG_INTERVAL_SECONDS"
+        property compactedThreadNum "$$URSA_COMPACTED_THREAD_NUM"
+        property publishThreadNum "$$URSA_PUBLISH_THREAD_NUM"
+        property commitThreadNum "$$URSA_COMMIT_THREAD_NUM"
+        property metastoreRequestRateLimitPerSecond "$$URSA_METASTORE_RATE_LIMIT"
+        exec java $$URSA_JAVA_OPTS \
+          -Dio.netty.tryReflectionSetAccessible=true -Djava.net.preferIPv4Stack=true \
+          -cp '/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*' \
+          io.streamnative.ursa.compact.CompactionMain --conf "$$conf"
     restart: unless-stopped
 
   kafka-1:
@@ -172,8 +164,6 @@ services:
         condition: service_healthy
       localstack-init:
         condition: service_completed_successfully
-      schema-registry:
-        condition: service_started
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: "broker,controller"
@@ -229,8 +219,6 @@ services:
         condition: service_healthy
       localstack-init:
         condition: service_completed_successfully
-      schema-registry:
-        condition: service_started
     environment:
       KAFKA_NODE_ID: 2
       KAFKA_PROCESS_ROLES: "broker,controller"
@@ -278,8 +266,6 @@ services:
         condition: service_healthy
       localstack-init:
         condition: service_completed_successfully
-      schema-registry:
-        condition: service_started
     environment:
       KAFKA_NODE_ID: 3
       KAFKA_PROCESS_ROLES: "broker,controller"

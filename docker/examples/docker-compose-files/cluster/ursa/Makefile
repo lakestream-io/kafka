@@ -40,7 +40,7 @@ demo:
 .PHONY: demo-compaction
 demo-compaction:
 	$(DOCKER) compose -f docker-compose-localstack-compaction.yml up -d
-	$(DOCKER) compose -f docker-compose-localstack-compaction.yml -f docker-compose-localstack-compaction.demo.yml run --rm avro-consumer
+	$(DOCKER) compose -f docker-compose-localstack-compaction.yml -f docker-compose-localstack-compaction.demo.yml run --rm raw-consumer
 	$(DOCKER) compose -f docker-compose-localstack-compaction.yml down -v --remove-orphans
 
 .PHONY: up

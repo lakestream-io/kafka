@@ -1641,6 +1641,7 @@ project(':core:core-sdt-ursa') {
     implementation project(':server')
     implementation project(':server-common')
     implementation project(':storage')
+    implementation project(':storage:storage-diskless-api')
     implementation libs.commonsLang
     implementation libs.guava
     implementation libs.slf4jApi

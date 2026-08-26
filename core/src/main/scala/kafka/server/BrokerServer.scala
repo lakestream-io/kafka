@@ -32,7 +32,7 @@ import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.security.scram.internals.ScramMechanism
 import org.apache.kafka.common.security.token.delegation.internals.DelegationTokenCache
 import org.apache.kafka.common.utils.{LogContext, Time, Utils}
-import org.apache.kafka.common.{ClusterResource, TopicPartition, Uuid}
+import org.apache.kafka.common.{ClusterResource, TopicIdPartition => CommonTopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.coordinator.common.runtime.{CoordinatorLoaderImpl, CoordinatorRecord}
 import org.apache.kafka.coordinator.group.metrics.{GroupCoordinatorMetrics, GroupCoordinatorRuntimeMetrics}
 import org.apache.kafka.coordinator.group.{GroupConfigManager, GroupCoordinator, GroupCoordinatorRecordSerde, GroupCoordinatorService}
@@ -65,6 +65,7 @@ import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig
 import java.time.Duration
 import java.util
 import java.util.Optional
+import java.util.function.BiConsumer
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import java.util.concurrent.{CompletableFuture, ExecutionException, TimeUnit, TimeoutException}
 import scala.collection.Map
@@ -565,7 +566,17 @@ class BrokerServer(
       metadataPublishers.add(brokerMetadataPublisher)
       metadataPublishers.add(new DisklessStateReconcilerPublisher(
         disklessStorageSupport,
-        (topic: String) => replicaManager.maybeRemoveTopicMetrics(topic)
+        (topic: String) => replicaManager.maybeRemoveTopicMetrics(topic),
+        new BiConsumer[CommonTopicIdPartition, java.lang.Long] {
+          override def accept(topicIdPartition: CommonTopicIdPartition,
+                              ownershipGeneration: java.lang.Long): Unit =
+            replicaManager.onDisklessPartitionOwnershipLost(topicIdPartition, ownershipGeneration)
+        },
+        new BiConsumer[CommonTopicIdPartition, java.lang.Long] {
+          override def accept(topicIdPartition: CommonTopicIdPartition,
+                              ownershipGeneration: java.lang.Long): Unit =
+            replicaManager.notifyDisklessOwnershipAcquired(topicIdPartition, ownershipGeneration)
+        }
       ))
       brokerRegistrationTracker = new BrokerRegistrationTracker(config.brokerId,
         () => lifecycleManager.resendBrokerRegistration())

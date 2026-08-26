@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.storage.diskless;
 
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 import org.apache.kafka.test.TestUtils;
 
@@ -71,14 +72,14 @@ class UrsaPartitionedTopicsMetadataSyncTest {
         );
 
         String topicName = "test-topic";
-        String topicId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         int partitions = 3;
         sync.deleteTopicMetadata(topicName, topicId, partitions, "test");
 
         Set<String> expectedKeys = new HashSet<>();
-        expectedKeys.add("/admin/partitioned-topics/public/default/persistent/" + topicName);
+        expectedKeys.add("/admin/streams/default/" + topicName + "-topic-id-" + topicId);
         for (int partition = 0; partition < partitions; partition++) {
-            expectedKeys.add(ProducerStateSnapshotKeys.snapshotKey(topicId, partition));
+            expectedKeys.add(ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), partition));
         }
 
         TestUtils.waitForCondition(() -> store.deleteKeys.size() == expectedKeys.size()
@@ -89,7 +90,7 @@ class UrsaPartitionedTopicsMetadataSyncTest {
     }
 
     @Test
-    void deleteTopicMetadataWithoutTopicIdDoesNotDeleteProducerSnapshots() throws Exception {
+    void deleteTopicMetadataRejectsMissingTopicId() {
         RecordingStore store = new RecordingStore();
         UrsaPartitionedTopicsMetadataSync sync = new UrsaPartitionedTopicsMetadataSync(
                 (message, cause) -> {
@@ -100,13 +101,9 @@ class UrsaPartitionedTopicsMetadataSyncTest {
 
         String topicName = "test-topic";
         int partitions = 2;
-        sync.deleteTopicMetadata(topicName, null, partitions, "test");
-
-        TestUtils.waitForCondition(() -> store.deleteKeys.size() == 1,
-                5_000,
-                "Timed out waiting for delete operations. actual=" + store.deleteKeys);
-        assertFalse(store.deleteKeys.stream().anyMatch(k -> k.startsWith("producer-state-snapshot/")),
-                "Producer snapshot keys should not be deleted when topicId is missing. deleteKeys=" + store.deleteKeys);
+        assertThrows(NullPointerException.class,
+                () -> sync.deleteTopicMetadata(topicName, null, partitions, "test"));
+        assertTrue(store.deleteKeys.isEmpty());
     }
 
     @Test
@@ -119,15 +116,30 @@ class UrsaPartitionedTopicsMetadataSyncTest {
                 store
         );
 
-        sync.upsertPartitionedTopicMetadataSync("sync-topic", 3, Map.of("key", "val"), 5000);
+        Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
+        sync.upsertPartitionedTopicMetadataSync(
+                "sync-topic", topicId, 3, Map.of("key", "val"), 5000);
 
-        String expectedKey = "/admin/partitioned-topics/public/default/persistent/sync-topic";
+        String expectedKey = "/admin/streams/default/sync-topic-topic-id-" + topicId;
         assertEquals(1, store.putKeys.size());
         assertEquals(expectedKey, store.putKeys.get(0));
 
         Map<?, ?> payload = objectMapper.readValue(store.putValues.get(0), Map.class);
         assertEquals(Map.of("partitions", 3, "properties", Map.of("key", "val")), payload);
         sync.close();
+    }
+
+    @Test
+    void sameNameTopicIncarnationsUseDifferentStreamConfigPaths() {
+        Uuid firstTopicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
+        Uuid secondTopicId = Uuid.fromString("VkZ5AkuESPGkMc2OxpKUjw");
+
+        String firstPath = UrsaPartitionedTopicsMetadataSync.partitionedTopicMetadataPath(
+                "sync-topic", firstTopicId);
+        String secondPath = UrsaPartitionedTopicsMetadataSync.partitionedTopicMetadataPath(
+                "sync-topic", secondTopicId);
+
+        assertFalse(firstPath.equals(secondPath));
     }
 
     @Test

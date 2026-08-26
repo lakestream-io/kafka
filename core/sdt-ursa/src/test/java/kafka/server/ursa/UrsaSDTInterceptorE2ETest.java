@@ -27,11 +27,14 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.ElectionType;
 import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.server.config.ServerLogConfigs;
+import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 
 import org.apache.commons.lang3.RandomStringUtils;
 import org.awaitility.Awaitility;
@@ -144,7 +147,7 @@ public class UrsaSDTInterceptorE2ETest {
 
         produceRecords(currentTopic, 0, 0, NUM_RECORDS);
 
-        var topicNameInTask = currentTopic + "-partition-0";
+        var topicNameInTask = taskTopicName(currentTopic, topicId(currentTopic), 0);
 
         Awaitility.await().atMost(Duration.ofSeconds(60))
             .pollInterval(Duration.ofSeconds(2))
@@ -153,7 +156,7 @@ public class UrsaSDTInterceptorE2ETest {
                 assertEquals(1, tasksInTopic.size());
                 var task = tasksInTopic.get(0);
                 assertEquals(0, task.getStartOffset());
-                assertEquals(99, task.getEndOffset());
+                assertEquals(100, task.getEndOffset());
                 assertEquals("0", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
             });
 
@@ -174,7 +177,7 @@ public class UrsaSDTInterceptorE2ETest {
                 assertEquals(2, tasksInTopic.size());
                 var task = tasksInTopic.get(1);
                 assertEquals(100, task.getStartOffset());
-                assertEquals(199, task.getEndOffset());
+                assertEquals(200, task.getEndOffset());
                 assertEquals("1", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
             });
 
@@ -202,7 +205,7 @@ public class UrsaSDTInterceptorE2ETest {
 
         produceRecords(currentTopic, 0, 0, NUM_RECORDS);
 
-        var topicNameInTask = currentTopic + "-partition-0";
+        var topicNameInTask = taskTopicName(currentTopic, topicId(currentTopic), 0);
 
         Awaitility.await().atMost(Duration.ofSeconds(60))
             .pollInterval(Duration.ofSeconds(2))
@@ -211,7 +214,7 @@ public class UrsaSDTInterceptorE2ETest {
                 assertEquals(1, tasksInTopic.size());
                 var task = tasksInTopic.get(0);
                 assertEquals(0, task.getStartOffset());
-                assertEquals(99, task.getEndOffset());
+                assertEquals(100, task.getEndOffset());
                 assertEquals("0", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
             });
 
@@ -237,7 +240,7 @@ public class UrsaSDTInterceptorE2ETest {
                 assertEquals(2, tasksInTopic.size());
                 var task = tasksInTopic.get(1);
                 assertEquals(100, task.getStartOffset());
-                assertEquals(199, task.getEndOffset());
+                assertEquals(200, task.getEndOffset());
                 assertEquals("1", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
             });
 
@@ -258,6 +261,7 @@ public class UrsaSDTInterceptorE2ETest {
         var currentTopic = "test-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var partitions = 5;
         createTopicWithDefaults(currentTopic, partitions);
+        var topicId = topicId(currentTopic);
         try (Producer<byte[], byte[]> producer = createProducer()) {
             for (int i = 0; i < 10; i++) {
                 for (int j = 0; j < partitions; j++) {
@@ -278,7 +282,7 @@ public class UrsaSDTInterceptorE2ETest {
                 var tasks = taskManager.getFirstNTasksOfTopic(10).get();
                 var topics = tasks.keySet();
                 for (int i = 0; i < partitions; i++) {
-                    var topicName = currentTopic + "-partition-" + i;
+                    var topicName = taskTopicName(currentTopic, topicId, i);
                     assertTrue(topics.contains(topicName), "Compaction task for partition " + i + " is not found");
                     var tasksInTopic = new ArrayList<CompactStreamTask>(tasks.get(topicName));
                     assertEquals(1, tasksInTopic.size(),
@@ -287,8 +291,8 @@ public class UrsaSDTInterceptorE2ETest {
                     var task = tasksInTopic.get(0);
                     assertEquals(topicName, task.getTopic());
                     assertEquals(0, task.getStartOffset());
-                    assertEquals(9, task.getEndOffset());
-                    assertEquals(CompactStreamTask.Type.KAFKA, task.getType());
+                    assertEquals(10, task.getEndOffset());
+                    assertEquals("KAFKA", task.getProperties().get("entryFormat"));
                 }
             });
 
@@ -300,6 +304,7 @@ public class UrsaSDTInterceptorE2ETest {
         var currentTopic = "test-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var partitions = 1;
         createTopicWithDefaults(currentTopic, partitions);
+        var topicId = topicId(currentTopic);
 
         // Produce first batch of records
         try (Producer<byte[], byte[]> producer = createProducer()) {
@@ -322,14 +327,14 @@ public class UrsaSDTInterceptorE2ETest {
             .untilAsserted(() -> {
                 var tasks = taskManager.getFirstNTasksOfTopic(10).get();
                 assertFalse(tasks.isEmpty());
-                var topicName = currentTopic + "-partition-" + 0;
+                var topicName = taskTopicName(currentTopic, topicId, 0);
                 var tasksInTopic = new ArrayList<>(tasks.get(topicName));
                 assertEquals(1, tasksInTopic.size());
                 var task = tasksInTopic.get(0);
                 assertEquals(topicName, task.getTopic());
                 assertEquals(0, task.getStartOffset());
-                assertEquals(99, task.getEndOffset());
-                assertEquals(CompactStreamTask.Type.KAFKA, task.getType());
+                assertEquals(100, task.getEndOffset());
+                assertEquals("KAFKA", task.getProperties().get("entryFormat"));
             });
 
         // Produce second batch of records
@@ -352,14 +357,14 @@ public class UrsaSDTInterceptorE2ETest {
             .pollInterval(Duration.ofSeconds(3))
             .untilAsserted(() -> {
                 var tasks = taskManager.getFirstNTasksOfTopic(10).get();
-                var topicName = currentTopic + "-partition-" + 0;
+                var topicName = taskTopicName(currentTopic, topicId, 0);
                 var tasksInTopic = new ArrayList<>(tasks.get(topicName));
                 assertEquals(2, tasksInTopic.size());
                 var task = tasksInTopic.get(tasksInTopic.size() - 1);
                 assertEquals(topicName, task.getTopic());
                 assertEquals(100, task.getStartOffset());
-                assertEquals(199, task.getEndOffset());
-                assertEquals(CompactStreamTask.Type.KAFKA, task.getType());
+                assertEquals(200, task.getEndOffset());
+                assertEquals("KAFKA", task.getProperties().get("entryFormat"));
             });
     }
 
@@ -427,6 +432,17 @@ public class UrsaSDTInterceptorE2ETest {
         return topicDescription.partitions().get(partition).replicas().stream()
             .map(Node::id)
             .toList();
+    }
+
+    private Uuid topicId(String topicName) throws Exception {
+        return admin.describeTopics(Collections.singleton(topicName))
+            .allTopicNames().get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .get(topicName).topicId();
+    }
+
+    private static String taskTopicName(String topicName, Uuid topicId, int partition) {
+        return KafkaLogNaming.logName(new TopicIdPartition(
+            topicId, new TopicPartition(topicName, partition)));
     }
 
     private List<CompactStreamTask> tasksForTopic(String topicName)

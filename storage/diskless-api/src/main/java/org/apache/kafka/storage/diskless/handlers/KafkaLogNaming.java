@@ -17,39 +17,54 @@
 package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
+
+import java.util.Objects;
 
 /**
  * Stable Lakestream catalog naming for Kafka diskless partition logs.
- *
- * <p>The namespace components and legacy Oxia metadata prefix are persisted compatibility contracts.
- * Changing them would make existing partition logs appear missing.
  */
 public final class KafkaLogNaming {
 
-    public static final String TENANT = "public";
     public static final String NAMESPACE = "default";
-    public static final String DOMAIN = "persistent";
-
-    public static final String LEGACY_CATALOG_METADATA_PREFIX = "/managed-ledgers/";
+    public static final String CATALOG_METADATA_PREFIX = "/streams/";
 
     private KafkaLogNaming() {
     }
 
     /**
-     * Stable key passed to the Lakestream stream-ID generator.
+     * Stable catalog name for one Kafka topic incarnation.
+     *
+     * <p>The topic ID is intentionally part of the name. Kafka permits a deleted topic to be
+     * recreated with the same name, and cleanup of the deleted topic is best effort. A name-only
+     * key would let the recreated topic attach to the deleted incarnation's log when that cleanup
+     * failed.
      */
-    public static String logName(TopicIdPartition tp) {
-        return logName(tp.topic(), tp.partition());
+    public static String streamName(TopicIdPartition tp) {
+        Objects.requireNonNull(tp, "topicIdPartition must not be null");
+        if (Uuid.ZERO_UUID.equals(tp.topicId())) {
+            throw new IllegalArgumentException("topicIdPartition must contain a non-zero topic ID");
+        }
+        return tp.topic() + "-topic-id-" + tp.topicId();
     }
 
-    public static String logName(String topic, int partition) {
-        return TENANT + "/" + NAMESPACE + "/" + DOMAIN + "/" + topic + "-partition-" + partition;
+    /**
+     * Stable key passed to the Lakestream stream-ID generator for one topic incarnation and
+     * partition.
+     */
+    public static String logName(TopicIdPartition tp) {
+        return NAMESPACE + "/" + partitionName(tp);
+    }
+
+    /** Canonical local partition-name component; persisted identities use {@link #logName}. */
+    public static String partitionName(TopicIdPartition tp) {
+        return streamName(tp) + "-partition-" + tp.partition();
     }
 
     /**
      * Oxia catalog metadata key for the partition log.
      */
     public static String logMetadataPath(TopicIdPartition tp) {
-        return LEGACY_CATALOG_METADATA_PREFIX + logName(tp);
+        return CATALOG_METADATA_PREFIX + logName(tp);
     }
 }

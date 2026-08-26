@@ -78,6 +78,7 @@
   <allow pkg="org.awaitility" />
   <allow pkg="io.opentelemetry.api" />
   <allow pkg="io.streamnative.ursa.storage" />
+  <allow class="org.apache.kafka.storage.diskless.handlers.KafkaLogNaming" />
 
   <!-- persistent collection factories/non-library-specific wrappers -->
   <allow pkg="org.apache.kafka.server.immutable" exact-match="true" />

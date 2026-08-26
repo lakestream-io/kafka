@@ -917,7 +917,6 @@ class KafkaConfigTest {
         case ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_CONFIG => // ignore password string
         case ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG => // ignore string
-        case ServerLogConfigs.LEGACY_CATALOG_OXIA_SERVICE_URL_CONFIG => // ignore string
         case ServerLogConfigs.INTERCEPTOR_CLASS_NAME_CONFIG => // ignore string
         case ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_WAL_DIRECTORY_CONFIG => // ignore string

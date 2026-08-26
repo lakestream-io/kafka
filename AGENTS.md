@@ -69,7 +69,7 @@ The diskless layer is a **bypass** in `ReplicaManager` that routes storage opera
 
 ```
 KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
-                                  ├── diskless topics → UrsaManagedLedgerWriter / UrsaManagedLedgerReader → Ursa
+                                  ├── diskless topics → UrsaLakestreamWriter / UrsaLakestreamReader → Ursa
                                   └── classic topics  → local Log (unchanged)
 ```
 
@@ -79,7 +79,7 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 |--------|----------|-----------|
 | `storage/` | Java | Upstream Kafka storage code plus shared storage internals |
 | `storage/diskless-api/` | Java | Generic diskless SPI/common classes used by broker code |
-| `storage/diskless-ursa/` | Java | Ursa implementation: ManagedLedger writer/reader, Oxia store, producer state |
+| `storage/diskless-ursa/` | Java | Ursa implementation: Lakestream writer/reader, Oxia store, producer state |
 | `core/` | Scala | Broker: `ReplicaManager`, `KafkaApis`, `SocketServer`, `BrokerServer` |
 | `core/sdt-ursa/` | Java | Ursa SDT interceptor implementation and compaction task publisher |
 | `server/` | Java | Server configs (`SocketServerConfigs`), Ursa E2E integration tests |
@@ -97,8 +97,8 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 
 **Ursa implementation** (`storage/diskless-ursa/src/main/java/org/apache/kafka/storage/diskless/`):
 - `handlers/UrsaStorageEngineImpl.java` — Diskless storage engine implementation backed by Ursa
-- `handlers/UrsaManagedLedgerWriter.java` — Write path (async append via ManagedLedger)
-- `handlers/UrsaManagedLedgerReader.java` — Read path (Fetch + ListOffsets)
+- `handlers/UrsaLakestreamWriter.java` — Write path (async append via Lakestream)
+- `handlers/UrsaLakestreamReader.java` — Read path (Fetch + ListOffsets)
 - `handlers/UrsaStorageState.java` — Stream IDs, offset tracking, shared state
 - `OxiaDisklessMetadataStore.java` — Producer/topic metadata persistence through Oxia
 - `idempotent/ProducerStateManager.java` — Producer state tracking backed by Oxia snapshots
@@ -138,7 +138,7 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 ## Critical Patterns
 
 ### Ursa Dependencies
-Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, AWS SDK, ManagedLedger, Pulsar, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` and `core:core-sdt-ursa` runtimes, not in `storage` or `core`.
+Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` and `core:core-sdt-ursa` runtimes, not in `storage` or `core`. Kafka runtime artifacts must depend only on the protocol-neutral Ursa APIs and the dedicated Kafka lakehouse reader.
 
 Release tarballs package those isolated runtime jars under `./ursa-storage/`. Kafka, Scala, SLF4J, Log4j, and other platform jars are provided by `./libs/` and should not be duplicated into `./ursa-storage/` unless the dependency is intentionally private to the Ursa runtime. The `KafkaPluginClassLoader` loads plugin-private classes child-first while keeping Kafka/logging/Scala API packages parent-first.
 

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Demo overlay for `docker-compose-localstack-compaction.yml`.
-# It creates a diskless topic, produces Avro (schema-registry) records to trigger parquet compaction,
+# It creates a diskless topic, produces raw Kafka records to trigger Parquet compaction,
 # waits until parquet shows up in LocalStack S3, then consumes all messages back via Kafka.
 #
 # Usage (recommended):
@@ -23,7 +23,7 @@
 #   # 2) run demo workload and get an exit code
 #   docker compose -f docker-compose-localstack-compaction.yml \
 #     -f docker-compose-localstack-compaction.demo.yml \
-#     run --rm avro-consumer
+#     run --rm raw-consumer
 #   # 3) cleanup
 #   docker compose -f docker-compose-localstack-compaction.yml down -v --remove-orphans
 
@@ -66,7 +66,7 @@ services:
     command:
       - |
         set -euo pipefail
-        topic="$${DEMO_TOPIC:-test-diskless-schema}"
+        topic="$${DEMO_TOPIC:-test-diskless-raw}"
         bootstrap="kafka-1:19092,kafka-2:19092,kafka-3:19092"
         extra_timeout=()
         if /opt/kafka/bin/kafka-topics.sh --help 2>&1 | grep -q -- '--timeout-ms'; then
@@ -91,46 +91,31 @@ services:
         echo "Failed to create topic after retries: $$topic" >&2
         exit 1
 
-  avro-producer:
-    image: ${AVRO_CLI_IMAGE:-confluentinc/cp-schema-registry:7.6.0}
+  raw-producer:
+    image: ${IMAGE:-kafka-diskless:latest}
     restart: "no"
     depends_on:
       create-topic:
         condition: service_completed_successfully
-      schema-registry:
-        condition: service_started
     entrypoint: ["/bin/bash", "-c"]
     environment:
       DEMO_TOPIC: ${DEMO_TOPIC:-}
       NUM_RECORDS: ${NUM_RECORDS:-}
       PAYLOAD_BYTES: ${PAYLOAD_BYTES:-}
-      SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_URL:-}
     command:
       - |
         set -euo pipefail
-        topic="$${DEMO_TOPIC:-test-diskless-schema}"
+        topic="$${DEMO_TOPIC:-test-diskless-raw}"
         num_records="$${NUM_RECORDS:-5000}"
         payload_bytes="$${PAYLOAD_BYTES:-1024}"
-        schema_registry_url="$${SCHEMA_REGISTRY_URL:-http://schema-registry:8001}"
-
-        # NOTE: `streamnative/schema-registry` currently returns 500 on `GET /subjects` in some builds,
-        # so use `GET /schemas/types` for readiness.
-        echo "Waiting for schema-registry at $$schema_registry_url ..."
-        until curl -sf "$$schema_registry_url/schemas/types" >/dev/null; do
-          sleep 2
-        done
-
-        schema='{"type":"record","name":"DemoRecord","fields":[{"name":"id","type":"int"},{"name":"payload","type":"string"}]}'
         payload="$$(head -c "$$payload_bytes" </dev/zero | tr '\0' 'x')"
 
-        echo "Producing $$num_records Avro records to topic=$$topic payloadBytes=$$payload_bytes ..."
+        echo "Producing $$num_records raw records to topic=$$topic payloadBytes=$$payload_bytes ..."
         seq 1 "$$num_records" | while read -r i; do
-          printf '{"id":%s,"payload":"%s"}\n' "$$i" "$$payload"
-        done | kafka-avro-console-producer \
+          printf 'record-%s-%s\n' "$$i" "$$payload"
+        done | /opt/kafka/bin/kafka-console-producer.sh \
           --bootstrap-server kafka-1:19092 \
-          --topic "$$topic" \
-          --property schema.registry.url="$$schema_registry_url" \
-          --property value.schema="$$schema"
+          --topic "$$topic"
 
         echo "Producer finished."
 
@@ -138,7 +123,7 @@ services:
     image: amazon/aws-cli:latest
     restart: "no"
     depends_on:
-      avro-producer:
+      raw-producer:
         condition: service_completed_successfully
       localstack:
         condition: service_healthy
@@ -175,8 +160,8 @@ services:
         echo "Timed out waiting for parquet files in s3://$$bucket/$$prefix" >&2
         exit 1
 
-  avro-consumer:
-    image: ${AVRO_CLI_IMAGE:-confluentinc/cp-schema-registry:7.6.0}
+  raw-consumer:
+    image: ${IMAGE:-kafka-diskless:latest}
     restart: "no"
     depends_on:
       wait-for-parquet:
@@ -185,25 +170,23 @@ services:
     environment:
       DEMO_TOPIC: ${DEMO_TOPIC:-}
       NUM_RECORDS: ${NUM_RECORDS:-}
-      SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_URL:-}
     command:
       - |
         set -euo pipefail
-        topic="$${DEMO_TOPIC:-test-diskless-schema}"
+        topic="$${DEMO_TOPIC:-test-diskless-raw}"
         num_records="$${NUM_RECORDS:-5000}"
-        schema_registry_url="$${SCHEMA_REGISTRY_URL:-http://schema-registry:8001}"
 
-        echo "Consuming $$num_records Avro records from topic=$$topic ..."
+        echo "Consuming $$num_records raw records from topic=$$topic ..."
         out="/tmp/consumed.txt"
-        kafka-avro-console-consumer \
+        /opt/kafka/bin/kafka-console-consumer.sh \
           --bootstrap-server kafka-1:19092 \
           --topic "$$topic" \
           --from-beginning \
           --max-messages "$$num_records" \
-          --property schema.registry.url="$$schema_registry_url" \
+          --timeout-ms 120000 \
           > "$$out"
 
-        count="$$(grep -c '\"payload\"' "$$out" || true)"
+        count="$$(grep -c '^record-' "$$out" || true)"
         echo "Consumed records: $$count"
         test "$$count" = "$$num_records"
         echo "OK: consumed all records."

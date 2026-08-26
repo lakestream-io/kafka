@@ -225,7 +225,7 @@ class UrsaStorageStateRetentionTest {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Stream stream = mock(Stream.class);
         Log logInstance = mock(Log.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp.topic());
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> updatedConfig = Map.of(TopicConfig.RETENTION_MS_CONFIG, "120000");
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
@@ -260,7 +260,7 @@ class UrsaStorageStateRetentionTest {
                         ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, 60_000L),
                 ignored -> Map.of())) {
             state.getOrCreatePartitionLog(tp);
-            state.updateTopicConfigAsync(tp.topic(), updatedConfig).get(5, TimeUnit.SECONDS);
+            state.updateTopicConfigAsync(tp, updatedConfig).get(5, TimeUnit.SECONDS);
 
             verify(logInstance).softTrim(10L);
         }
@@ -272,7 +272,7 @@ class UrsaStorageStateRetentionTest {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         Stream stream = mock(Stream.class);
         Log logInstance = mock(Log.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp.topic());
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> updatedConfig = Map.of(TopicConfig.RETENTION_MS_CONFIG, "120000");
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
@@ -310,7 +310,7 @@ class UrsaStorageStateRetentionTest {
 
             assertThrows(
                     ExecutionException.class,
-                    () -> state.updateTopicConfigAsync(tp.topic(), updatedConfig).get(5, TimeUnit.SECONDS));
+                    () -> state.updateTopicConfigAsync(tp, updatedConfig).get(5, TimeUnit.SECONDS));
             verify(logInstance).softTrim(10L);
         }
     }

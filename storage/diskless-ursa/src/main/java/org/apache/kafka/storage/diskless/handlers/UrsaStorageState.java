@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.config.ServerLogConfigs;
+import org.apache.kafka.storage.diskless.DisklessLogMetadata;
 import org.apache.kafka.storage.diskless.DisklessStorageStateOperations;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
@@ -194,42 +195,46 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         return brokerTopicStats;
     }
 
-    public void updateTopicConfig(String topic, Map<String, String> topicConfig) {
+    public void updateTopicConfig(TopicIdPartition topicIdPartition, Map<String, String> topicConfig) {
         try {
-            updateTopicConfigAsync(topic, topicConfig).get(TOPIC_CONFIG_UPDATE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            updateTopicConfigAsync(topicIdPartition, topicConfig)
+                    .get(TOPIC_CONFIG_UPDATE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while updating topic config for " + topic, e);
+            throw new RuntimeException("Interrupted while updating topic config for " + topicIdPartition, e);
         } catch (ExecutionException e) {
-            throw new RuntimeException("Failed to update topic config for " + topic, e.getCause());
+            throw new RuntimeException("Failed to update topic config for " + topicIdPartition, e.getCause());
         } catch (TimeoutException e) {
             throw new RuntimeException("Timed out after " + TOPIC_CONFIG_UPDATE_TIMEOUT_SECONDS
-                    + " seconds while updating topic config for " + topic, e);
+                    + " seconds while updating topic config for " + topicIdPartition, e);
         }
     }
 
-    CompletableFuture<Void> updateTopicConfigAsync(String topic, Map<String, String> topicConfig) {
-        if (topic == null || topicConfig == null || lakestreamStorageHolder == null) {
+    CompletableFuture<Void> updateTopicConfigAsync(
+            TopicIdPartition topicIdPartition,
+            Map<String, String> topicConfig
+    ) {
+        if (topicIdPartition == null || topicConfig == null || lakestreamStorageHolder == null) {
             return CompletableFuture.completedFuture(null);
         }
         Map<String, String> configSnapshot = Map.copyOf(topicConfig);
         // Kafka metadata is authoritative for retention. Trigger it immediately; catalog
         // persistence is for Lakestream/materialization consumers and must not delay local cleanup.
-        triggerRetentionForTopic(topic, configSnapshot);
-        return lakestreamStorageHolder.asyncUpdateTopicConfig(topic, configSnapshot)
+        triggerRetentionForTopic(topicIdPartition, configSnapshot);
+        return lakestreamStorageHolder.asyncUpdateTopicConfig(topicIdPartition, configSnapshot)
                 .whenComplete((ignored, error) -> {
                     if (error != null) {
-                        log.warn("Failed to update topic config for Lakestream topic {}", topic, error);
+                        log.warn("Failed to update topic config for Lakestream topic {}", topicIdPartition, error);
                     }
                 });
     }
 
-    public void deleteTopicConfig(String topic) {
-        if (topic == null || lakestreamStorageHolder == null) {
+    public void deleteTopicConfig(TopicIdPartition topicIdPartition) {
+        if (topicIdPartition == null || lakestreamStorageHolder == null) {
             return;
         }
-        triggerRetentionForTopic(topic, Map.of());
-        lakestreamStorageHolder.asyncDeleteTopicConfig(topic).join();
+        triggerRetentionForTopic(topicIdPartition, Map.of());
+        lakestreamStorageHolder.asyncDeleteTopicConfig(topicIdPartition).join();
     }
 
     UrsaPartitionLog getOrCreatePartitionLog(TopicIdPartition tp) {
@@ -263,6 +268,12 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
 
     UrsaPartitionLog partitionLog(TopicIdPartition tp) {
         return partitionLogs.get(tp);
+    }
+
+    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(TopicIdPartition tp) {
+        UrsaPartitionLog partitionLog = getOrCreatePartitionLog(tp);
+        return partitionLog.logMetadata().thenApply(metadata ->
+                partitionLogs.get(tp) == partitionLog ? Optional.of(metadata) : Optional.empty());
     }
 
     void removePartitionLog(TopicIdPartition tp, UrsaPartitionLog partitionLog) {
@@ -433,16 +444,20 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         });
     }
 
-    private void triggerRetentionForTopic(String topic, Map<String, String> topicConfig) {
+    private void triggerRetentionForTopic(
+            TopicIdPartition topicIdPartition,
+            Map<String, String> topicConfig
+    ) {
         try {
             RetentionConfig retentionConfig = buildRetentionConfig(topicConfig);
             partitionLogs.forEach((tp, partitionLog) -> {
-                if (tp.topic().equals(topic)) {
+                if (tp.topic().equals(topicIdPartition.topic())
+                        && tp.topicId().equals(topicIdPartition.topicId())) {
                     partitionLog.triggerRetention(retentionConfig.retentionMs(), retentionConfig.retentionBytes());
                 }
             });
         } catch (Throwable error) {
-            log.warn("Failed to schedule updated retention for topic {}", topic, error);
+            log.warn("Failed to schedule updated retention for topic {}", topicIdPartition, error);
         }
     }
 

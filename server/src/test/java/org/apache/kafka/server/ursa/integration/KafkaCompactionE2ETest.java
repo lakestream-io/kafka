@@ -16,14 +16,19 @@
  */
 package org.apache.kafka.server.ursa.integration;
 
+import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.server.config.ServerLogConfigs;
+import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
@@ -37,7 +42,6 @@ import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.localstack.LocalStackContainer;
 import org.testcontainers.containers.wait.strategy.LogMessageWaitStrategy;
-import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
@@ -48,9 +52,9 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -58,8 +62,6 @@ import io.opentelemetry.api.OpenTelemetry;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.OxiaClientBuilder;
-import io.streamnative.lakestream.api.EntryIndex;
-import io.streamnative.lakestream.api.Position;
 import io.streamnative.oxia.testcontainers.OxiaContainer;
 import io.streamnative.ursa.storage.StorageApi;
 import io.streamnative.ursa.storage.UrsaStorage;
@@ -92,19 +94,17 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     private static Network network;
     private static OxiaContainer oxiaContainer;
     private static LocalStackContainer localStackContainer;
-    private static GenericContainer<?> schemaRegistryContainer;
     private static URI s3Endpoint;
     private static KafkaClusterTestKit cluster;
     private static String s3Prefix;
     private static Properties compactionStorageConfig;
     private static AsyncOxiaClient verificationClient;
-    private static String schemaRegistryBaseUrl;
 
     @BeforeAll
     static void startContainers() throws Exception {
         String compactorImage = System.getenv(COMPACTOR_IMAGE_ENV);
         Assumptions.assumeTrue(compactorImage != null && !compactorImage.isBlank(),
-                "Set " + COMPACTOR_IMAGE_ENV + " to a compactor image built from ursa-storage/docker/Dockerfile");
+                "Set " + COMPACTOR_IMAGE_ENV + " to an image containing the standalone Ursa compactor package");
 
         // Used as S3 key prefix (not a local path) for WAL and compacted data.
         s3Prefix = "kafka-compaction-e2e/" + UUID.randomUUID();
@@ -134,16 +134,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         createS3Bucket(s3Endpoint, S3_BUCKET);
         log.info("Created S3 bucket: {}", S3_BUCKET);
 
-        schemaRegistryContainer = startSchemaRegistryContainer(network);
-        schemaRegistryContainer.start();
-
-        schemaRegistryBaseUrl = "http://"
-                + schemaRegistryContainer.getHost()
-                + ":"
-                + schemaRegistryContainer.getMappedPort(8001);
-        awaitSchemaRegistryReady(schemaRegistryBaseUrl);
-        log.info("Schema registry started at: {}", schemaRegistryBaseUrl);
-
         compactionStorageConfig = createCompactionConfig(
                 oxiaContainer.getServiceAddress(),
                 s3Endpoint,
@@ -168,7 +158,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     static void stopContainers() {
         closeQuietly(verificationClient, "verification client");
         closeQuietly(cluster, "Kafka cluster");
-        closeQuietly(schemaRegistryContainer, "schema registry container");
         closeQuietly(localStackContainer, "LocalStack container");
         closeQuietly(oxiaContainer, "Oxia container");
         closeQuietly(network, "Docker network");
@@ -181,8 +170,9 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         String topicName = uniqueTopicName("kafka-compaction-e2e-topic");
 
         createTopicWithUrsaStorage(topicName);
+        Uuid topicId = topicId(topicName);
         writeRecords(cluster.bootstrapServers(), topicName);
-        waitForLegacyLogMetadata(topicName);
+        waitForLogMetadata(topicName, topicId);
 
         String compactorImage = System.getenv(COMPACTOR_IMAGE_ENV);
         try (GenericContainer<?> compactor = startCompactorContainer(
@@ -191,7 +181,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 s3Prefix,
                 localStackContainer.getRegion(),
                 S3_BUCKET)) {
-            waitForParquetCompaction(topicName);
+            waitForParquetCompaction(topicName, topicId);
             verifyKafkaConsumerCanReadAllMessages(cluster.bootstrapServers(), topicName);
         }
     }
@@ -216,54 +206,54 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         log.info("Successfully wrote {} records to topic {}", NUM_RECORDS, topicName);
     }
 
-    private void waitForLegacyLogMetadata(String topicName) {
-        // Persisted compatibility path consumed by the external compactor.
-        String legacyLogMetadataPath = "/managed-ledgers/public/default/persistent/" + topicName + "-partition-0";
+    private void waitForLogMetadata(String topicName, Uuid topicId) {
+        String logMetadataPath = KafkaLogNaming.logMetadataPath(topicIdPartition(topicName, topicId));
         Awaitility.await()
                 .atMost(30, TimeUnit.SECONDS)
                 .pollInterval(1, TimeUnit.SECONDS)
-                .until(() -> checkLegacyLogMetadataExists(legacyLogMetadataPath));
-        log.info("Legacy-compatible log metadata verified in Oxia at path: {}", legacyLogMetadataPath);
+                .until(() -> checkLogMetadataExists(logMetadataPath));
+        log.info("Catalog log metadata verified in Oxia at path: {}", logMetadataPath);
     }
 
-    private boolean checkLegacyLogMetadataExists(String path) {
+    private boolean checkLogMetadataExists(String path) {
         try {
             GetResult result = verificationClient.get(path).get(5, TimeUnit.SECONDS);
             return result != null && result.value() != null;
         } catch (Exception e) {
-            log.debug("Legacy-compatible log metadata not yet available: {}", e.getMessage());
+            log.debug("Catalog log metadata not yet available: {}", e.getMessage());
             return false;
         }
     }
 
-    private void waitForParquetCompaction(String topicName) {
+    private void waitForParquetCompaction(String topicName, Uuid topicId) {
         log.info("Waiting for compaction output to be visible (max 5 minutes)...");
         Awaitility.await()
                 .atMost(5, TimeUnit.MINUTES)
                 .pollInterval(5, TimeUnit.SECONDS)
                 .untilAsserted(() -> {
-                    verifyReadsUseParquetIndexes(topicName);
+                    verifyReadsUseParquetIndexes(topicName, topicId);
                     verifyParquetFilesExistOnS3();
                 });
     }
 
-    private void verifyReadsUseParquetIndexes(String topicName) throws Exception {
-        String streamKey = "public/default/persistent/" + topicName + "-partition-0";
+    private void verifyReadsUseParquetIndexes(String topicName, Uuid topicId) throws Exception {
+        String streamKey = KafkaLogNaming.logName(topicIdPartition(topicName, topicId));
 
         try (UrsaStorage ursaStorage = new UrsaStorage(compactionStorageConfig, OpenTelemetry.noop())) {
             StorageApi storageApi = ursaStorage.getDefaultStorageApi();
 
             long streamId = storageApi.getStreamIdByKey(streamKey).get(30, TimeUnit.SECONDS);
-            EntryIndex lastEntry = storageApi.getLastEntry(streamId).get(30, TimeUnit.SECONDS);
+            var lastEntry = storageApi.getLastEntry(streamId).get(30, TimeUnit.SECONDS);
 
-            assertTrue(lastEntry != EntryIndex.NOT_FOUND, "Expected stream to have data, but last entry was NOT_FOUND");
+            assertTrue(lastEntry.header().offset() >= 0,
+                    "Expected stream to have data, but last entry was NOT_FOUND");
 
             long lastOffset = lastEntry.header().offset() + lastEntry.header().numberOfMessages();
-            List<EntryIndex> indexes = storageApi.readIndexes(streamId, 0, lastOffset, false).get(30, TimeUnit.SECONDS);
+            var indexes = storageApi.readIndexes(streamId, 0, lastOffset, false).get(30, TimeUnit.SECONDS);
             assertTrue(!indexes.isEmpty(), "Expected indexes to be present for streamId=" + streamId);
 
-            List<EntryIndex> parquetIndexes = indexes.stream()
-                    .filter(idx -> idx.position().fileType() == Position.FileType.PARQUET)
+            var parquetIndexes = indexes.stream()
+                    .filter(idx -> "PARQUET".equals(idx.position().fileType().name()))
                     .toList();
             assertTrue(!parquetIndexes.isEmpty(),
                     "Expected at least one PARQUET index after compaction, streamId=" + streamId);
@@ -271,6 +261,20 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
             log.info("Verified PARQUET index usage: {} of {} indexes are PARQUET for streamId={}",
                     parquetIndexes.size(), indexes.size(), streamId);
         }
+    }
+
+    private Uuid topicId(String topicName) throws Exception {
+        try (Admin admin = cluster.admin()) {
+            return admin.describeTopics(Set.of(topicName))
+                    .allTopicNames()
+                    .get(30, TimeUnit.SECONDS)
+                    .get(topicName)
+                    .topicId();
+        }
+    }
+
+    private static TopicIdPartition topicIdPartition(String topicName, Uuid topicId) {
+        return new TopicIdPartition(topicId, new TopicPartition(topicName, 0));
     }
 
     private void verifyParquetFilesExistOnS3() throws Exception {
@@ -308,6 +312,8 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         properties.setProperty("s3AccessKeyId", "test");
         properties.setProperty("s3SecretAccessKey", "test");
         properties.setProperty("dataSourceForCompaction", "URSA");
+        properties.setProperty("entryFormat", "KAFKA");
+        properties.setProperty("entrySerDeType", "KAFKA_BATCHED_RAW_PARQUET");
         properties.setProperty("compactedFileSizeLimit", String.valueOf(10 * 1024));
         properties.setProperty("tailCompactDataVisibilityIntervalInSeconds", "5");
         properties.setProperty("refreshLocalTopicInternalInSeconds", "5");
@@ -335,47 +341,37 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
 
         GenericContainer<?> compactor = new GenericContainer<>(compactorImage)
                 .withNetwork(network)
-                .withWorkingDirectory("/pulsar")
-                .withCreateContainerCmdModifier(cmd -> cmd.withUser("root"))
-                .withEnv("PULSAR_MEM", "-Xmx512M")
-                .withEnv("PULSAR_GC", "-XX:+UseZGC")
+                .withWorkingDirectory("/opt/ursa")
+                .withCreateContainerCmdModifier(cmd -> cmd.withEntrypoint("sh", "-ec"))
+                .withEnv("URSA_JAVA_OPTS", "-Xmx512M -XX:+UseZGC")
                 .withEnv("OTEL_SDK_DISABLED", "true")
-                .withEnv("PULSAR_PREFIX_metadataStoreUrl", oxiaUrl)
-                .withEnv("PULSAR_PREFIX_oxiaPulsarStorageUrl", oxiaUrl)
-                .withEnv("PULSAR_PREFIX_backendStorageType", "S3")
-                .withEnv("PULSAR_PREFIX_bucket", bucket)
-                .withEnv("PULSAR_PREFIX_prefix", s3Prefix)
-                .withEnv("PULSAR_PREFIX_cloudStorageEndpoint", "http://localstack:4566")
-                .withEnv("PULSAR_PREFIX_region", region)
-                .withEnv("PULSAR_PREFIX_s3AccessKeyId", "test")
-                .withEnv("PULSAR_PREFIX_s3SecretAccessKey", "test")
+                .withEnv("URSA_METADATA_STORE_URL", oxiaUrl)
+                .withEnv("URSA_OXIA_STORAGE_URL", oxiaUrl)
+                .withEnv("URSA_BACKEND_STORAGE_TYPE", "S3")
+                .withEnv("URSA_BUCKET", bucket)
+                .withEnv("URSA_PREFIX", s3Prefix)
+                .withEnv("URSA_CLOUD_STORAGE_ENDPOINT", "http://localstack:4566")
+                .withEnv("URSA_REGION", region)
+                .withEnv("URSA_S3_ACCESS_KEY_ID", "test")
+                .withEnv("URSA_S3_SECRET_ACCESS_KEY", "test")
                 // V2 lakehouse writer/reader uses these properties for s3a:// path resolution.
-                .withEnv("PULSAR_PREFIX_compactionBackendStorageType", "S3")
-                .withEnv("PULSAR_PREFIX_compactionBucket", bucket)
-                .withEnv("PULSAR_PREFIX_compactionPrefix", s3Prefix)
-                .withEnv("PULSAR_PREFIX_compactionBucketRegion", region)
-                .withEnv("PULSAR_PREFIX_dataSourceForCompaction", "URSA")
-                .withEnv("PULSAR_PREFIX_compactedFileSizeLimit", String.valueOf(10 * 1024))
-                .withEnv("PULSAR_PREFIX_tailCompactDataVisibilityIntervalInSeconds", "5")
-                .withEnv("PULSAR_PREFIX_refreshLocalTopicInternalInSeconds", "5")
-                .withEnv("PULSAR_PREFIX_compactedThreadNum", "2")
-                .withEnv("PULSAR_PREFIX_publishThreadNum", "2")
-                .withEnv("PULSAR_PREFIX_commitThreadNum", "2")
-                .withEnv("PULSAR_PREFIX_metastoreRequestRateLimitPerSecond", "500")
-                // Force V2 compaction worker for Kafka Parquet
-                .withEnv("PULSAR_PREFIX_forceToUsePulsarCompactionWorker", "true")
-                .withEnv("PULSAR_PREFIX_managedTableSchemaEvolutionEnabled", "true")
-                .withEnv("PULSAR_PREFIX_entrySerDeType", "KAFKA_BATCHED_RAW_PARQUET")
-                .withEnv("PULSAR_PREFIX_kopSchemaRegistryUrl", "http://schema-registry:8001")
+                .withEnv("URSA_COMPACTION_BACKEND_STORAGE_TYPE", "S3")
+                .withEnv("URSA_COMPACTION_BUCKET", bucket)
+                .withEnv("URSA_COMPACTION_PREFIX", s3Prefix)
+                .withEnv("URSA_COMPACTION_BUCKET_REGION", region)
+                .withEnv("URSA_DATA_SOURCE_FOR_COMPACTION", "URSA")
+                .withEnv("URSA_ENTRY_FORMAT", "KAFKA")
+                .withEnv("URSA_ENTRY_SERDE_TYPE", "KAFKA_BATCHED_RAW_PARQUET")
+                .withEnv("URSA_COMPACTED_FILE_SIZE_LIMIT", String.valueOf(10 * 1024))
+                .withEnv("URSA_TAIL_VISIBILITY_INTERVAL_SECONDS", "5")
+                .withEnv("URSA_REFRESH_LOG_INTERVAL_SECONDS", "5")
+                .withEnv("URSA_COMPACTED_THREAD_NUM", "2")
+                .withEnv("URSA_PUBLISH_THREAD_NUM", "2")
+                .withEnv("URSA_COMMIT_THREAD_NUM", "2")
+                .withEnv("URSA_METASTORE_RATE_LIMIT", "500")
                 .withEnv("AWS_ACCESS_KEY_ID", "test")
                 .withEnv("AWS_SECRET_ACCESS_KEY", "test")
-                .withCommand("bash", "-c",
-                        "set -euo pipefail; " +
-                                "mkdir -p /mnt/sn-license; " +
-                                "conf=/tmp/ursa_storage.conf; : > \"$conf\"; " +
-                                "bin/apply-config-from-env.py \"$conf\"; " +
-                                "java -Dio.netty.tryReflectionSetAccessible=true -Djava.net.preferIPv4Stack=true " +
-                                "-cp '/pulsar/lib/*' io.streamnative.ursa.compact.CompactionMain --conf \"$conf\"")
+                .withCommand(compactorCommand())
                 .waitingFor(new LogMessageWaitStrategy()
                         .withRegEx(".*was elected leader.*\\n")
                         .withStartupTimeout(Duration.ofMinutes(5)));
@@ -392,42 +388,41 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         return compactor;
     }
 
-    private static GenericContainer<?> startSchemaRegistryContainer(Network network) {
-        return new GenericContainer<>(DockerImageName.parse("streamnative/schema-registry:0.1.0"))
-                .withCreateContainerCmdModifier(cmd -> cmd.withPlatform("linux/amd64"))
-                .withNetwork(network)
-                .withNetworkAliases("schema-registry")
-                .withWorkingDirectory("/schema-registry")
-                .withExposedPorts(8001)
-                .withEnv("PULSAR_PREFIX_oxiaServiceUrl", "oxia://oxia:6648")
-                .withEnv("PULSAR_PREFIX_schemaRegistryListeners", "http://0.0.0.0:8001")
-                .withEnv("PULSAR_PREFIX_schemaRegistryProtocolMap", "HTTP:http")
-                .withCommand("sh", "-c",
-                        "set -euo pipefail; "
-                                + "echo \"Starting Schema Registry...\"; "
-                                + "bin/apply-config-from-env.py conf/sr.conf; "
-                                + "bin/start.sh -d; "
-                                + "echo \"Schema Registry started.\"; "
-                                + "tail -f /dev/null")
-                .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(3)));
-    }
-
-    private static void awaitSchemaRegistryReady(String baseUrl) {
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(5))
-                .build();
-        Awaitility.await()
-                .atMost(2, TimeUnit.MINUTES)
-                .pollInterval(1, TimeUnit.SECONDS)
-                .until(() -> {
-                    HttpRequest request = HttpRequest.newBuilder()
-                            .GET()
-                            .uri(URI.create(baseUrl + "/subjects"))
-                            .timeout(Duration.ofSeconds(5))
-                            .build();
-                    HttpResponse<Void> response = client.send(request, HttpResponse.BodyHandlers.discarding());
-                    return response.statusCode() == 200;
-                });
+    private static String compactorCommand() {
+        return """
+                set -eu
+                mkdir -p /mnt/sn-license
+                conf=/tmp/ursa-storage.properties
+                : > "$conf"
+                property() { printf '%s=%s\\n' "$1" "$2" >> "$conf"; }
+                property metadataStoreUrl "$URSA_METADATA_STORE_URL"
+                property oxiaStorageUrl "$URSA_OXIA_STORAGE_URL"
+                property backendStorageType "$URSA_BACKEND_STORAGE_TYPE"
+                property bucket "$URSA_BUCKET"
+                property prefix "$URSA_PREFIX"
+                property cloudStorageEndpoint "$URSA_CLOUD_STORAGE_ENDPOINT"
+                property region "$URSA_REGION"
+                property s3AccessKeyId "$URSA_S3_ACCESS_KEY_ID"
+                property s3SecretAccessKey "$URSA_S3_SECRET_ACCESS_KEY"
+                property compactionBackendStorageType "$URSA_COMPACTION_BACKEND_STORAGE_TYPE"
+                property compactionBucket "$URSA_COMPACTION_BUCKET"
+                property compactionPrefix "$URSA_COMPACTION_PREFIX"
+                property compactionBucketRegion "$URSA_COMPACTION_BUCKET_REGION"
+                property dataSourceForCompaction "$URSA_DATA_SOURCE_FOR_COMPACTION"
+                property entryFormat "$URSA_ENTRY_FORMAT"
+                property entrySerDeType "$URSA_ENTRY_SERDE_TYPE"
+                property compactedFileSizeLimit "$URSA_COMPACTED_FILE_SIZE_LIMIT"
+                property tailCompactDataVisibilityIntervalInSeconds "$URSA_TAIL_VISIBILITY_INTERVAL_SECONDS"
+                property refreshLocalTopicInternalInSeconds "$URSA_REFRESH_LOG_INTERVAL_SECONDS"
+                property compactedThreadNum "$URSA_COMPACTED_THREAD_NUM"
+                property publishThreadNum "$URSA_PUBLISH_THREAD_NUM"
+                property commitThreadNum "$URSA_COMMIT_THREAD_NUM"
+                property metastoreRequestRateLimitPerSecond "$URSA_METASTORE_RATE_LIMIT"
+                exec java $URSA_JAVA_OPTS \
+                  -Dio.netty.tryReflectionSetAccessible=true -Djava.net.preferIPv4Stack=true \
+                  -cp '/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*' \
+                  io.streamnative.ursa.compact.CompactionMain --conf "$conf"
+                """;
     }
 
     private static KafkaClusterTestKit createCluster(String oxiaServiceAddress, URI s3Endpoint,

@@ -41,7 +41,6 @@ import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.options.DeleteOption;
-import io.streamnative.lakestream.api.CatalogType;
 import io.streamnative.lakestream.api.Log;
 import io.streamnative.lakestream.api.LogId;
 import io.streamnative.lakestream.api.Stream;
@@ -75,7 +74,8 @@ final class LakestreamStorageHolder implements Closeable {
     private final IndexedStreamCatalog catalog;
     private final AsyncOxiaClient producerStateOxiaClient;
     private final OpenTelemetrySdk openTelemetrySdk;
-    private final ConcurrentHashMap<String, TopicOperations> topicOperations = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<StreamIdentifier, TopicOperations> topicOperations = new ConcurrentHashMap<>();
+    private final Set<StreamIdentifier> deletedTopicStreams = ConcurrentHashMap.newKeySet();
 
     LakestreamStorageHolder(
             IndexedStreamCatalog catalog,
@@ -95,52 +95,73 @@ final class LakestreamStorageHolder implements Closeable {
     }
 
     CompletableFuture<Void> registerPartition(TopicIdPartition tp, long streamId, Map<String, String> topicConfig) {
-        String topic = tp.topic();
+        StreamIdentifier identifier = streamIdentifier(tp);
+        if (deletedTopicStreams.contains(identifier)) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Kafka topic incarnation is already deleted: " + tp));
+        }
         Map<String, String> suppliedConfig = topicConfig != null ? Map.copyOf(topicConfig) : Map.of();
-        return enqueueTopicOperation(topic, operations -> operations.enqueueRegistration(
+        return enqueueTopicOperation(identifier, operations -> operations.enqueueRegistration(
                 suppliedConfig,
-                currentConfig -> catalog.registerExternalPartition(
-                                streamIdentifier(topic),
-                                tp.partition(),
-                                streamId,
-                                currentConfig)
-                        // registerExternalPartition only updates properties while growing the partition count.
-                        // Replace them explicitly so a config event racing this open cannot be overwritten by
-                        // the snapshot captured when openLog started.
-                        .thenCompose(ignored -> replaceTopicConfig(topic, currentConfig))))
+                currentConfig -> {
+                    if (deletedTopicStreams.contains(identifier)) {
+                        return CompletableFuture.failedFuture(
+                                new IllegalStateException("Kafka topic incarnation is already deleted: " + tp));
+                    }
+                    return catalog.registerExternalPartition(
+                                    identifier,
+                                    tp.partition(),
+                                    streamId,
+                                    currentConfig)
+                            // registerExternalPartition only updates properties while growing the partition count.
+                            // Replace them explicitly so a config event racing this open cannot be overwritten by
+                            // the snapshot captured when openLog started.
+                            .thenCompose(ignored -> replaceTopicConfig(identifier, currentConfig));
+                }))
                 .future();
     }
 
-    CompletableFuture<Void> asyncUpdateTopicConfig(String topic, Map<String, String> topicConfig) {
+    CompletableFuture<Void> asyncUpdateTopicConfig(
+            TopicIdPartition topicIdPartition,
+            Map<String, String> topicConfig
+    ) {
+        StreamIdentifier identifier = streamIdentifier(topicIdPartition);
+        if (deletedTopicStreams.contains(identifier)) {
+            return CompletableFuture.completedFuture(null);
+        }
         Map<String, String> configSnapshot = topicConfig != null ? Map.copyOf(topicConfig) : Map.of();
-        return enqueueTopicOperation(topic, operations -> operations.enqueueConfigUpdate(
+        return enqueueTopicOperation(identifier, operations -> operations.enqueueConfigUpdate(
                 configSnapshot,
-                () -> replaceTopicConfig(topic, configSnapshot)))
+                () -> deletedTopicStreams.contains(identifier)
+                        ? CompletableFuture.completedFuture(null)
+                        : replaceTopicConfig(identifier, configSnapshot)))
                 .future();
     }
 
-    CompletableFuture<Void> asyncDeleteTopicConfig(String topic) {
+    CompletableFuture<Void> asyncDeleteTopicConfig(TopicIdPartition topicIdPartition) {
+        StreamIdentifier identifier = streamIdentifier(topicIdPartition);
+        deletedTopicStreams.add(identifier);
         TopicOperation deletion = enqueueTopicOperation(
-                topic,
-                operations -> operations.enqueueDeletion(() -> replaceTopicConfig(topic, Map.of())));
+                identifier,
+                operations -> operations.enqueueDeletion(() -> replaceTopicConfig(identifier, Map.of())));
         deletion.future().whenComplete((ignored, error) -> {
             if (error == null) {
-                evictTopicOperations(topic, deletion);
+                evictTopicOperations(identifier, deletion);
             }
         });
         return deletion.future();
     }
 
     private TopicOperation enqueueTopicOperation(
-            String topic,
+            StreamIdentifier identifier,
             Function<TopicOperations, QueuedOperation> enqueue) {
         while (true) {
-            TopicOperations operations = topicOperations.computeIfAbsent(topic, ignored -> new TopicOperations());
+            TopicOperations operations = topicOperations.computeIfAbsent(identifier, ignored -> new TopicOperations());
             synchronized (operations) {
                 // A successful deletion can evict an idle operations object while another thread still
-                // holds a reference to it. Only enqueue while it is still the canonical object for this
-                // topic; otherwise retry against the replacement.
-                if (topicOperations.get(topic) != operations) {
+                // holds a reference to it. Only enqueue while it is still canonical for this exact
+                // Kafka topic incarnation; otherwise retry against the replacement.
+                if (topicOperations.get(identifier) != operations) {
                     continue;
                 }
                 QueuedOperation queued = enqueue.apply(operations);
@@ -149,19 +170,20 @@ final class LakestreamStorageHolder implements Closeable {
         }
     }
 
-    private void evictTopicOperations(String topic, TopicOperation deletion) {
+    private void evictTopicOperations(StreamIdentifier identifier, TopicOperation deletion) {
         TopicOperations operations = deletion.operations();
         synchronized (operations) {
-            // Keep the state when an update or same-name recreation was queued behind the deletion.
-            // Its queue is needed to prevent that recreation from racing the old metadata drop.
+            // Keep the state when another operation for this exact UUID-qualified stream was
+            // queued behind the deletion. Its queue must remain canonical until that work settles.
             if (operations.isLatest(deletion.sequence())) {
-                topicOperations.remove(topic, operations);
+                topicOperations.remove(identifier, operations);
             }
         }
     }
 
-    private CompletableFuture<Void> replaceTopicConfig(String topic, Map<String, String> topicConfig) {
-        StreamIdentifier identifier = streamIdentifier(topic);
+    private CompletableFuture<Void> replaceTopicConfig(
+            StreamIdentifier identifier,
+            Map<String, String> topicConfig) {
         return catalog.streamExists(identifier).thenCompose(exists -> {
             // Config changes are broadcast to every broker, including brokers that have never opened
             // a partition of this topic. The current metadata supplier will provide the full config
@@ -186,6 +208,18 @@ final class LakestreamStorageHolder implements Closeable {
     }
 
     CompletableFuture<Void> deletePartitionData(TopicIdPartition tp) {
+        StreamIdentifier identifier = streamIdentifier(tp);
+        // Fence this exact topic incarnation before queuing deletion. A lazy open that was
+        // admitted before the metadata delete either completes ahead of this operation or sees
+        // the tombstone and fails; it cannot re-register the old stream after cleanup.
+        deletedTopicStreams.add(identifier);
+        return enqueueTopicOperation(
+                identifier,
+                operations -> operations.enqueueCleanup(() -> deletePartitionDataNow(tp)))
+                .future();
+    }
+
+    private CompletableFuture<Void> deletePartitionDataNow(TopicIdPartition tp) {
         String logName = KafkaLogNaming.logName(tp);
         String metadataPath = KafkaLogNaming.logMetadataPath(tp);
         return catalog.getOxiaClient().get(metadataPath).thenCompose(metadata -> {
@@ -231,7 +265,7 @@ final class LakestreamStorageHolder implements Closeable {
             properties.setProperty("storageTier", "default");
 
             StreamCatalogService scs = new StreamCatalogService();
-            catalog = scs.open(oxiaUrl, CatalogType.KAFKA, properties, openTelemetrySdk);
+            catalog = scs.open(oxiaUrl, properties, openTelemetrySdk);
 
             producerStateOxiaClientFuture = new OxiaServiceUrl(config.getUrsaOxiaServiceUrl()).client();
             producerStateOxiaClient = producerStateOxiaClientFuture.get(
@@ -390,10 +424,8 @@ final class LakestreamStorageHolder implements Closeable {
                 : className;
     }
 
-    static StreamIdentifier streamIdentifier(String topic) {
-        return StreamIdentifier.of(
-                KafkaLogNaming.TENANT + "/" + KafkaLogNaming.NAMESPACE,
-                KafkaLogNaming.DOMAIN + "/" + topic);
+    static StreamIdentifier streamIdentifier(TopicIdPartition tp) {
+        return StreamIdentifier.of(KafkaLogNaming.NAMESPACE, KafkaLogNaming.streamName(tp));
     }
 
     private static void closeStreamQuietly(Stream stream) {
@@ -450,6 +482,10 @@ final class LakestreamStorageHolder implements Closeable {
             return enqueue(operation);
         }
 
+        synchronized QueuedOperation enqueueCleanup(Supplier<CompletableFuture<Void>> operation) {
+            return enqueue(operation);
+        }
+
         private QueuedOperation enqueue(Supplier<CompletableFuture<Void>> operation) {
             long operationSequence = ++sequence;
             CompletableFuture<Void> next = tail.handle((ignored, previousError) -> null)
@@ -475,6 +511,7 @@ final class LakestreamStorageHolder implements Closeable {
     @Override
     public void close() throws IOException {
         topicOperations.clear();
+        deletedTopicStreams.clear();
         List<Exception> failures = new ArrayList<>();
         try {
             if (catalog != null) {

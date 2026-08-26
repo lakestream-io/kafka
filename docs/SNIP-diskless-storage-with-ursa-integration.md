@@ -434,7 +434,6 @@ No protocol changes required.
 | `ursa.storage.topic.default.enable` | boolean | `false` | Enable diskless storage for topics by default |
 | `ursa.storage.oxia.service.url` | string | `localhost:6648` | Oxia service URL for metadata |
 | `ursa.catalog.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for the Ursa log catalog (format: `oxia://host:port/[namespace]`) |
-| `pulsar.oxia.service.url` | string | `oxia://localhost:6648/default` | Deprecated compatibility alias for `ursa.catalog.oxia.service.url` |
 | `ursa.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for Ursa storage metadata (format: `oxia://host:port/[namespace]`) |
 | `ursa.storage.backend.type` | string | `LOCAL` | Storage backend: `LOCAL`, `S3`, `GCS`, `AZURE_BLOB` (`AZUREBLOB` is also accepted for compatibility). Azure compaction requires an HNS-enabled account because compacted files use ABFS. |
 | `ursa.storage.path` | string | `/tmp/ursa-data` | Local storage path for `LOCAL`, or the remote object prefix for `S3`/`GCS`/Azure Blob |
@@ -672,10 +671,10 @@ The repository includes Docker Compose files for running a compaction demo:
 cd docker/examples/docker-compose-files/cluster/ursa
 docker compose -f docker-compose-localstack-compaction.yml up -d
 
-# Run the demo (creates topic, produces Avro records, waits for Parquet compaction)
+# Run the demo (creates a topic, produces raw Kafka records, waits for Parquet compaction)
 docker compose -f docker-compose-localstack-compaction.yml \
   -f docker-compose-localstack-compaction.demo.yml \
-  run --rm avro-consumer
+  run --rm raw-consumer
 
 # Cleanup
 docker compose -f docker-compose-localstack-compaction.yml down -v --remove-orphans
@@ -687,6 +686,25 @@ bash ./run-localstack-compaction-demo.sh
 ```
 
 **Requirements**:
-- Ursa compactor image (built from `ursa-storage` repository)
-- Schema Registry (for Avro serialization in demo)
+- Standalone Ursa compactor Maven package (built from the `ursa-storage` repository)
 - LocalStack or real S3 for storage backend
+
+### Storage metadata compatibility
+
+Every partition log and materialization stream is scoped to the Kafka topic incarnation, not only
+the reusable topic name. For topic ID `<uuid>`, the canonical identities are:
+
+- partition log and compaction task: `default/<topic>-topic-id-<uuid>-partition-N`
+- Lakestream aggregate stream: `default/<topic>-topic-id-<uuid>`
+- catalog log metadata: `/streams/default/<topic>-topic-id-<uuid>-partition-N`
+- keyed stream-ID mapping: `/stream-id-generator/default/<topic>-topic-id-<uuid>-partition-N`
+
+The name-only publisher cache key remains `<topic>-partition-N` so a same-name recreation fences
+the old publisher, while all persisted identities use the topic ID. If deletion cleanup fails, the
+old metadata can remain orphaned, but a recreated topic receives a distinct log, catalog stream,
+publication cursor, and object path and cannot attach to the orphan.
+
+In-place rolling upgrades from earlier experimental name-only diskless-storage metadata layouts are
+not supported. Deploy this version with an empty Oxia namespace, or perform an offline metadata and
+object-store migration before starting the brokers. The runtime intentionally does not retain a
+legacy dual-read or name-only fallback path.

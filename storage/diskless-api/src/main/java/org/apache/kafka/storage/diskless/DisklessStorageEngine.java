@@ -16,13 +16,27 @@
  */
 package org.apache.kafka.storage.diskless;
 
+import org.apache.kafka.common.TopicIdPartition;
+
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 public interface DisklessStorageEngine extends Reader, Writer, DisklessStorageStateOperations {
 
-    default void updateTopicConfig(String topic, Map<String, String> config) {
+    /**
+     * Returns storage-native metadata for an initialized partition log.
+     *
+     * <p>The future must not block the caller while storage metadata is loaded. An empty result means that
+     * metadata for this initialized log is temporarily unavailable and may be retried.
+     */
+    default CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(TopicIdPartition topicIdPartition) {
+        return CompletableFuture.completedFuture(Optional.empty());
     }
 
-    default void deleteTopicConfig(String topic) {
+    default void updateTopicConfig(TopicIdPartition topicIdPartition, Map<String, String> config) {
+    }
+
+    default void deleteTopicConfig(TopicIdPartition topicIdPartition) {
     }
 }

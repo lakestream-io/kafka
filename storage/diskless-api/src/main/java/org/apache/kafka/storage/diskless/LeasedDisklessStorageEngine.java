@@ -26,6 +26,7 @@ import org.apache.kafka.server.storage.log.FetchPartitionData;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
@@ -61,6 +62,11 @@ final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
     }
 
     @Override
+    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(TopicIdPartition topicIdPartition) {
+        return callWithClassLoader(() -> delegate.logMetadata(topicIdPartition));
+    }
+
+    @Override
     public boolean cleanupPartition(TopicIdPartition tp, boolean deletePartition) {
         return callWithClassLoader(() -> delegate.cleanupPartition(tp, deletePartition));
     }
@@ -74,17 +80,17 @@ final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
     }
 
     @Override
-    public void updateTopicConfig(String topic, Map<String, String> config) {
+    public void updateTopicConfig(TopicIdPartition topicIdPartition, Map<String, String> config) {
         callWithClassLoader(() -> {
-            delegate.updateTopicConfig(topic, config);
+            delegate.updateTopicConfig(topicIdPartition, config);
             return null;
         });
     }
 
     @Override
-    public void deleteTopicConfig(String topic) {
+    public void deleteTopicConfig(TopicIdPartition topicIdPartition) {
         callWithClassLoader(() -> {
-            delegate.deleteTopicConfig(topic);
+            delegate.deleteTopicConfig(topicIdPartition);
             return null;
         });
     }
