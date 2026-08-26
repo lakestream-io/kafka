@@ -61,7 +61,8 @@ class UrsaStorageStateRetentionTest {
         Log logInstance = mock(Log.class);
         when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(LogId.of(1L))).thenReturn(logInstance);
+        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+                .thenReturn(logInstance);
 
         try (UrsaStorageState state = newState(catalog)) {
             Log result = state.openLog(tp).get(5, TimeUnit.SECONDS);
@@ -186,7 +187,8 @@ class UrsaStorageStateRetentionTest {
         LogOffset lastOffset = mockOffset(42L);
         when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(LogId.of(1L))).thenReturn(logInstance);
+        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+                .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset())
                 .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND))
@@ -237,7 +239,8 @@ class UrsaStorageStateRetentionTest {
         when(stream.properties()).thenReturn(Map.of());
         when(catalog.setStreamProperties(identifier, updatedConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.createLog(LogId.of(1L))).thenReturn(logInstance);
+        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+                .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
@@ -283,7 +286,8 @@ class UrsaStorageStateRetentionTest {
                 .thenReturn(CompletableFuture.failedFuture(new RuntimeException("catalog unavailable")));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
-        when(catalog.createLog(LogId.of(1L))).thenReturn(logInstance);
+        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+                .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
@@ -330,7 +334,8 @@ class UrsaStorageStateRetentionTest {
 
         when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(LogId.of(1L))).thenReturn(logInstance);
+        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+                .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
@@ -380,7 +385,8 @@ class UrsaStorageStateRetentionTest {
 
         when(catalog.generateStreamId(Optional.of(KafkaManagedLedgerNaming.managedLedgerName(tp))))
                 .thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(LogId.of(1L))).thenReturn(logInstance);
+        when(catalog.createLog(KafkaManagedLedgerNaming.managedLedgerName(tp), LogId.of(1L)))
+                .thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(trimOffset);

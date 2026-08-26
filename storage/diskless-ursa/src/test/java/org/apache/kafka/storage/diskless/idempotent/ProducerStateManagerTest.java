@@ -37,6 +37,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.netty.buffer.ByteBuf;
@@ -59,6 +60,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -199,6 +201,7 @@ class ProducerStateManagerTest {
                 batch(1L, (short) 0, 3, 3, 1, 3000L)
             )).get();
             assertInstanceOf(ProducerStateManager.Ready.class, recovered);
+            verify(replayEntry).close();
         } finally {
             manager1.close();
             if (manager2 != null) {
@@ -316,8 +319,83 @@ class ProducerStateManagerTest {
                 batch(1L, (short) 0, 0, 0, 1, 3000L)
             )).get();
             assertInstanceOf(ProducerStateManager.Ready.class, result);
+            verify(nonIdempotentReplayEntry).close();
+            verify(idempotentReplayEntry).close();
         } finally {
             manager.close();
+        }
+    }
+
+    @Test
+    void testReplayFailureClosesEntireEntryBatch() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        RuntimeException entryFailure = new RuntimeException("entry offset unavailable");
+        LogEntry failingEntry = mock(LogEntry.class);
+        when(failingEntry.offset()).thenThrow(entryFailure);
+        LogEntry unvisitedEntry = newReplayEntry(tp, 1L, (short) 0, 0, "unvisited", 1L, 1);
+        Log replayLog = replayLog(List.of(failingEntry, unvisitedEntry), 1L, 1);
+
+        ProducerStateManager manager = newManager(
+                tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
+        try {
+            ExecutionException prepareError = assertThrows(ExecutionException.class, () -> manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 3000L)
+            )).get());
+            Throwable rootCause = prepareError;
+            while (rootCause.getCause() != null) {
+                rootCause = rootCause.getCause();
+            }
+
+            assertSame(entryFailure, rootCause);
+            verify(failingEntry).close();
+            verify(unvisitedEntry).close();
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
+    void testLateReplayReadAfterManagerCloseClosesEntriesAndCursor() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        LogOffset lastOffset = mockLogOffset(0L, 1);
+        CompletableFuture<List<LogEntry>> readFuture = new CompletableFuture<>();
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(lastOffset));
+        when(logInstance.openEphemeralCursor(anyString(), anyLong())).thenReturn(
+                CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), any(), anyLong())).thenReturn(readFuture);
+
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        ProducerStateManager manager = new ProducerStateManager(
+                tp,
+                () -> null,
+                () -> CompletableFuture.completedFuture(logInstance),
+                "test-zone",
+                0L,
+                ProducerStateManager.DEFAULT_SNAPSHOT_RECORD_THRESHOLD,
+                scheduler);
+        try {
+            CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 3000L)
+            ));
+            verify(cursor, timeout(5_000)).readEntries(anyInt(), anyLong(), any(), anyLong());
+            assertFalse(prepareFuture.isDone());
+
+            manager.close();
+            assertThrows(ExecutionException.class, prepareFuture::get);
+
+            LogEntry lateEntry = newReplayEntry(tp, 1L, (short) 0, 0, "late", 0L, 1);
+            readFuture.complete(List.of(lateEntry));
+
+            verify(lateEntry, timeout(5_000)).close();
+            verify(lateEntry, never()).payload();
+            verify(cursor, timeout(5_000)).close();
+            verify(cursor).readEntries(anyInt(), anyLong(), any(), anyLong());
+        } finally {
+            manager.close();
+            scheduler.shutdownNow();
         }
     }
 
@@ -525,10 +603,17 @@ class ProducerStateManagerTest {
         ByteBuf data = KafkaEntryFormatter.encode(memoryRecords, analysisResult);
 
         LogEntry entry = mock(LogEntry.class);
+        AtomicBoolean closed = new AtomicBoolean();
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(numMessages);
         when(entry.size()).thenReturn(data.readableBytes());
         when(entry.payload()).thenReturn(data.asReadOnly());
+        doAnswer(invocation -> {
+            if (closed.compareAndSet(false, true)) {
+                data.release();
+            }
+            return null;
+        }).when(entry).close();
         return entry;
     }
 
@@ -548,10 +633,17 @@ class ProducerStateManagerTest {
         ByteBuf data = KafkaEntryFormatter.encode(memoryRecords, analysisResult);
 
         LogEntry entry = mock(LogEntry.class);
+        AtomicBoolean closed = new AtomicBoolean();
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(numMessages);
         when(entry.size()).thenReturn(data.readableBytes());
         when(entry.payload()).thenReturn(data.asReadOnly());
+        doAnswer(invocation -> {
+            if (closed.compareAndSet(false, true)) {
+                data.release();
+            }
+            return null;
+        }).when(entry).close();
         return entry;
     }
 

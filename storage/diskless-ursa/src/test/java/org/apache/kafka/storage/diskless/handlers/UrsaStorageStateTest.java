@@ -51,6 +51,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -78,8 +80,8 @@ class UrsaStorageStateTest {
         AtomicInteger openCount = new AtomicInteger();
         when(catalog.generateStreamId(any())).thenAnswer(invocation ->
                 CompletableFuture.completedFuture((long) openCount.incrementAndGet()));
-        when(catalog.createLog(any(LogId.class))).thenAnswer(invocation ->
-                invocation.<LogId>getArgument(0).equals(LogId.of(1L)) ? log1 : log2);
+        when(catalog.createLog(anyString(), any(LogId.class))).thenAnswer(invocation ->
+                invocation.<LogId>getArgument(1).equals(LogId.of(1L)) ? log1 : log2);
 
         try (UrsaStorageState state = newState(catalog)) {
             UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
@@ -141,7 +143,7 @@ class UrsaStorageStateTest {
                 openCount.getAndIncrement() == 0
                         ? firstStreamId
                         : CompletableFuture.completedFuture(2L));
-        when(catalog.createLog(LogId.of(2L))).thenReturn(secondLog);
+        when(catalog.createLog(anyString(), eq(LogId.of(2L)))).thenReturn(secondLog);
 
         try (UrsaStorageState state = newState(catalog)) {
             UrsaPartitionLog first = state.getOrCreatePartitionLog(tp);
@@ -165,7 +167,7 @@ class UrsaStorageStateTest {
         when(catalog.generateStreamId(any()))
                 .thenReturn(CompletableFuture.failedFuture(new RuntimeException("open failed")))
                 .thenReturn(CompletableFuture.completedFuture(2L));
-        when(catalog.createLog(LogId.of(2L))).thenReturn(secondLog);
+        when(catalog.createLog(anyString(), eq(LogId.of(2L)))).thenReturn(secondLog);
 
         try (UrsaStorageState state = newState(catalog)) {
             UrsaPartitionLog failed = state.getOrCreatePartitionLog(tp);
@@ -210,7 +212,7 @@ class UrsaStorageStateTest {
         CompletableFuture<LogOffset> firstOffset = new CompletableFuture<>();
         CompletableFuture<LogOffset> lastOffset = new CompletableFuture<>();
         when(catalog.generateStreamId(any())).thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(LogId.of(1L))).thenReturn(logInstance);
+        when(catalog.createLog(anyString(), eq(LogId.of(1L)))).thenReturn(logInstance);
         when(logInstance.getFirstOffset()).thenReturn(firstOffset);
         when(logInstance.getLastOffset()).thenReturn(lastOffset);
 
@@ -288,8 +290,8 @@ class UrsaStorageStateTest {
                 openCount.getAndIncrement() == 0
                         ? firstStreamIdFuture
                         : CompletableFuture.completedFuture(2L));
-        when(catalog.createLog(any(LogId.class))).thenAnswer(invocation ->
-                invocation.<LogId>getArgument(0).equals(LogId.of(1L)) ? firstLog : secondLog);
+        when(catalog.createLog(anyString(), any(LogId.class))).thenAnswer(invocation ->
+                invocation.<LogId>getArgument(1).equals(LogId.of(1L)) ? firstLog : secondLog);
 
         try (UrsaStorageState state = newState(catalog)) {
             state.getOrCreatePartitionLog(tp);
@@ -412,7 +414,8 @@ class UrsaStorageStateTest {
                 .thenReturn(CompletableFuture.completedFuture(null));
         when(catalog.setStreamProperties(identifier, latestConfig))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.createLog(LogId.of(17L))).thenReturn(logInstance);
+        String managedLedgerName = KafkaManagedLedgerNaming.managedLedgerName(tp);
+        when(catalog.createLog(managedLedgerName, LogId.of(17L))).thenReturn(logInstance);
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null, null);
         try (UrsaStorageState state = new UrsaStorageState(
@@ -434,6 +437,7 @@ class UrsaStorageStateTest {
             updateFuture.get();
             verify(catalog, times(1)).setStreamProperties(identifier, initialConfig);
             verify(catalog, times(1)).setStreamProperties(identifier, latestConfig);
+            verify(catalog).createLog(managedLedgerName, LogId.of(17L));
         }
     }
 
@@ -449,7 +453,7 @@ class UrsaStorageStateTest {
     private static IndexedStreamCatalog mockCatalogWithLog(Log logInstance) {
         IndexedStreamCatalog catalog = mock(IndexedStreamCatalog.class);
         when(catalog.generateStreamId(any())).thenReturn(CompletableFuture.completedFuture(1L));
-        when(catalog.createLog(any(LogId.class))).thenReturn(logInstance);
+        when(catalog.createLog(anyString(), any(LogId.class))).thenReturn(logInstance);
         return catalog;
     }
 

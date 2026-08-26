@@ -51,6 +51,7 @@ import io.oxia.client.api.AsyncOxiaClient;
 import io.streamnative.lakestream.api.Log;
 import io.streamnative.lakestream.api.LogCursor;
 import io.streamnative.lakestream.api.LogEntry;
+import io.streamnative.ursa.storage.OwnedResultFutures;
 
 /**
  * Per-partition producer state manager for diskless idempotent produce.
@@ -141,7 +142,8 @@ public class ProducerStateManager implements Closeable {
     private enum ReplayEntryResult {
         HAS_PRODUCER_BATCH,
         NO_PRODUCER_BATCH,
-        DECODE_FAILED
+        DECODE_FAILED,
+        MANAGER_CLOSED
     }
 
     private static final class ProducerShadowState {
@@ -538,6 +540,10 @@ public class ProducerStateManager implements Closeable {
         if (replayFuture.isDone()) {
             return;
         }
+        if (closed.get()) {
+            replayFuture.completeExceptionally(replayClosedException());
+            return;
+        }
         long nextOffset;
         synchronized (this) {
             nextOffset = nextOffsetToRecover;
@@ -559,8 +565,15 @@ public class ProducerStateManager implements Closeable {
         }
         readFuture.whenComplete((entries, readError) -> {
             if (readError != null) {
+                Throwable closeError = closeLogEntries(entries, null);
+                if (closeError != null && closeError != readError) {
+                    readError.addSuppressed(closeError);
+                }
                 if (!replayFuture.isDone()) {
                     replayFuture.completeExceptionally(readError);
+                } else if (closeError != null) {
+                    log.warn("[{}] Failed to close replay entries after a late failed read",
+                            topicIdPartition, closeError);
                 }
                 return;
             }
@@ -574,31 +587,85 @@ public class ProducerStateManager implements Closeable {
                                     boolean hasNoSnapshot,
                                     AtomicInteger replayedEntries,
                                     CompletableFuture<Void> replayFuture) {
-        if (replayFuture.isDone()) {
-            return;
-        }
-        if (entries == null || entries.isEmpty()) {
-            replayFuture.complete(null);
-            return;
-        }
-        for (LogEntry entry : entries) {
-            try {
-                ReplayEntryResult replayEntryResult = replayEntry(entry);
-                if (hasNoSnapshot
-                        && replayedEntries.get() == 0
-                        && replayEntryResult == ReplayEntryResult.NO_PRODUCER_BATCH) {
-                    replayFuture.complete(null);
-                    return;
+        boolean replayComplete = false;
+        Throwable processingError = null;
+        if (!replayFuture.isDone()) {
+            if (closed.get()) {
+                processingError = replayClosedException();
+            } else if (entries == null || entries.isEmpty()) {
+                replayComplete = true;
+            } else {
+                for (LogEntry entry : entries) {
+                    try {
+                        if (closed.get()) {
+                            processingError = replayClosedException();
+                            break;
+                        }
+                        ReplayEntryResult replayEntryResult = replayEntry(entry);
+                        if (replayEntryResult == ReplayEntryResult.MANAGER_CLOSED) {
+                            processingError = replayClosedException();
+                            break;
+                        }
+                        if (hasNoSnapshot
+                                && replayedEntries.get() == 0
+                                && replayEntryResult == ReplayEntryResult.NO_PRODUCER_BATCH) {
+                            replayComplete = true;
+                            break;
+                        }
+                        replayedEntries.incrementAndGet();
+                    } catch (Throwable entryError) {
+                        log.error("[{}] Failed to replay entry at offset {}",
+                                topicIdPartition, replayEntryOffset(entry, entryError), entryError);
+                        processingError = entryError;
+                        break;
+                    }
                 }
-                replayedEntries.incrementAndGet();
-            } catch (Exception e) {
-                log.error("[{}] Failed to replay entry at offset {}",
-                        topicIdPartition, entry == null ? "null" : entry.offset(), e);
-                replayFuture.completeExceptionally(e);
-                return;
             }
         }
-        scheduleNextReplayRead(cursor, endOffset, hasNoSnapshot, replayedEntries, replayFuture);
+
+        processingError = closeLogEntries(entries, processingError);
+        if (replayFuture.isDone()) {
+            if (processingError != null) {
+                log.warn("[{}] Failed to finish a replay batch after replay completion",
+                        topicIdPartition, processingError);
+            }
+            return;
+        }
+        if (processingError != null) {
+            replayFuture.completeExceptionally(processingError);
+        } else if (replayComplete) {
+            replayFuture.complete(null);
+        } else {
+            scheduleNextReplayRead(cursor, endOffset, hasNoSnapshot, replayedEntries, replayFuture);
+        }
+    }
+
+    private static Object replayEntryOffset(LogEntry entry, Throwable entryError) {
+        if (entry == null) {
+            return "null";
+        }
+        try {
+            return entry.offset();
+        } catch (Throwable offsetError) {
+            if (entryError != offsetError) {
+                entryError.addSuppressed(offsetError);
+            }
+            return "unknown";
+        }
+    }
+
+    private static Throwable closeLogEntries(List<LogEntry> entries, Throwable precedingError) {
+        try {
+            OwnedResultFutures.closeLogEntries(entries);
+        } catch (Throwable closeError) {
+            if (precedingError == null) {
+                return closeError;
+            }
+            if (precedingError != closeError) {
+                precedingError.addSuppressed(closeError);
+            }
+        }
+        return precedingError;
     }
 
     private void scheduleNextReplayRead(LogCursor cursor,
@@ -607,6 +674,10 @@ public class ProducerStateManager implements Closeable {
                                         AtomicInteger replayedEntries,
                                         CompletableFuture<Void> replayFuture) {
         if (replayFuture.isDone()) {
+            return;
+        }
+        if (closed.get()) {
+            replayFuture.completeExceptionally(replayClosedException());
             return;
         }
         try {
@@ -618,6 +689,9 @@ public class ProducerStateManager implements Closeable {
     }
 
     private ReplayEntryResult replayEntry(LogEntry entry) {
+        if (closed.get()) {
+            return ReplayEntryResult.MANAGER_CLOSED;
+        }
         long baseOffset = entry.offset();
         long nextOffset = entry.offset() + Math.max(1, entry.numberOfRecords());
 
@@ -638,6 +712,9 @@ public class ProducerStateManager implements Closeable {
                 if (batch.hasProducerId()) {
                     hasProducerBatch = true;
                     synchronized (this) {
+                        if (closed.get()) {
+                            return ReplayEntryResult.MANAGER_CLOSED;
+                        }
                         appendRecoveredBatchLocked(
                             batch.producerId(),
                             batch.producerEpoch(),
@@ -656,9 +733,15 @@ public class ProducerStateManager implements Closeable {
             return ReplayEntryResult.DECODE_FAILED;
         } finally {
             synchronized (this) {
-                nextOffsetToRecover = Math.max(nextOffsetToRecover, nextOffset);
+                if (!closed.get()) {
+                    nextOffsetToRecover = Math.max(nextOffsetToRecover, nextOffset);
+                }
             }
         }
+    }
+
+    private IllegalStateException replayClosedException() {
+        return new IllegalStateException("ProducerStateManager is closed during replay for " + topicIdPartition);
     }
 
     private PrepareResult prepareAppendInternal(List<AppendBatch> batches) {

@@ -49,6 +49,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import io.netty.buffer.ByteBuf;
@@ -58,6 +59,7 @@ import io.streamnative.lakestream.api.LogCursor;
 import io.streamnative.lakestream.api.LogEntry;
 import io.streamnative.lakestream.api.LogEntryHeader;
 import io.streamnative.lakestream.api.LogOffset;
+import io.streamnative.ursa.storage.OwnedResultFutures;
 
 final class UrsaPartitionLog {
 
@@ -584,23 +586,53 @@ final class UrsaPartitionLog {
                     new IllegalStateException("Fetch cursor pool is not initialized for " + topicIdPartition));
         }
 
-        return pool.acquire(fetchOffset)
-                .thenCompose(lease -> {
-                    CompletableFuture<List<LogEntry>> readFuture;
-                    try {
-                        readFuture = lease.cursor().readEntries(
-                                maxEntries, maxBytes, null, maxOffsetExclusive);
-                        if (readFuture == null) {
-                            throw new IllegalStateException("LogCursor.readEntries returned null future");
-                        }
-                    } catch (Throwable readError) {
-                        lease.close();
-                        return CompletableFuture.failedFuture(readError);
+        CompletableFuture<MemoryRecords> result = new CompletableFuture<>();
+        CompletableFuture<LogCursorPool.Lease> acquireFuture = pool.acquire(fetchOffset);
+        acquireFuture.whenComplete((lease, acquireError) -> {
+            if (acquireError != null) {
+                completeFromSource(result, acquireFuture, null, acquireError);
+                return;
+            }
+            if (result.isDone()) {
+                lease.close();
+                return;
+            }
+
+            CompletableFuture<List<LogEntry>> readFuture;
+            try {
+                readFuture = lease.cursor().readEntries(
+                        maxEntries, maxBytes, null, maxOffsetExclusive);
+                if (readFuture == null) {
+                    throw new IllegalStateException("LogCursor.readEntries returned null future");
+                }
+            } catch (Throwable readError) {
+                lease.close();
+                result.completeExceptionally(readError);
+                return;
+            }
+
+            readFuture.whenComplete((entries, readError) -> {
+                MemoryRecords records = null;
+                Throwable completionError = readError;
+                try {
+                    if (completionError == null && !result.isDone()) {
+                        records = convertLogEntriesToMemoryRecords(entries);
                     }
-                    return readFuture
-                            .whenComplete((ignored, error) -> lease.close())
-                            .thenApply(this::convertLogEntriesToMemoryRecords);
-                });
+                } catch (Throwable conversionError) {
+                    completionError = conversionError;
+                } finally {
+                    completionError = closeLogEntries(entries, completionError);
+                    lease.close();
+                }
+
+                if (completionError != null) {
+                    completeFromSource(result, readFuture, null, completionError);
+                } else {
+                    result.complete(records);
+                }
+            });
+        });
+        return result;
     }
 
     private MemoryRecords convertLogEntriesToMemoryRecords(List<LogEntry> entries) {
@@ -698,31 +730,41 @@ final class UrsaPartitionLog {
         } catch (Throwable openError) {
             return CompletableFuture.failedFuture(openError);
         }
-        return cursorFuture.thenCompose(cursor -> runWithClosingCursor(
-                cursor,
-                () -> scanCursorForFirstTimestampAtOrAfter(cursor, maxOffset, targetTimestamp),
-                "timestamp-scan"));
+        return runWithClosingCursor(
+                cursorFuture,
+                cursor -> scanCursorForFirstTimestampAtOrAfter(cursor, maxOffset, targetTimestamp),
+                "timestamp-scan");
     }
 
     private CompletableFuture<long[]> scanCursorForFirstTimestampAtOrAfter(
             LogCursor cursor,
             long maxOffset,
             long targetTimestamp) {
-        return cursor.readEntries(MAX_ENTRIES_PER_FETCH, Long.MAX_VALUE, null, maxOffset)
-                .thenCompose(entries -> {
-                    if (entries.isEmpty()) {
-                        return CompletableFuture.completedFuture(null);
-                    }
+        CompletableFuture<List<LogEntry>> readFuture;
+        try {
+            readFuture = cursor.readEntries(MAX_ENTRIES_PER_FETCH, Long.MAX_VALUE, null, maxOffset);
+            if (readFuture == null) {
+                throw new IllegalStateException("LogCursor.readEntries returned null future");
+            }
+        } catch (Throwable readError) {
+            return CompletableFuture.failedFuture(readError);
+        }
+        return consumeLogEntries(readFuture, entries -> {
+            if (entries.isEmpty()) {
+                return new ScanBatchResult<long[]>(true, null);
+            }
 
-                    for (LogEntry entry : entries) {
-                        long[] found = findFirstTimestampGe(entry.payload(), entry.offset(), targetTimestamp);
-                        if (found != null) {
-                            return CompletableFuture.completedFuture(found);
-                        }
-                    }
+            for (LogEntry entry : entries) {
+                long[] found = findFirstTimestampGe(entry.payload(), entry.offset(), targetTimestamp);
+                if (found != null) {
+                    return new ScanBatchResult<>(true, found);
+                }
+            }
 
-                    return scanCursorForFirstTimestampAtOrAfter(cursor, maxOffset, targetTimestamp);
-                });
+            return new ScanBatchResult<long[]>(false, null);
+        }).thenCompose(batchResult -> batchResult.done()
+                ? CompletableFuture.completedFuture(batchResult.value())
+                : scanCursorForFirstTimestampAtOrAfter(cursor, maxOffset, targetTimestamp));
     }
 
     private CompletableFuture<TimestampAndOffset> scanForMaxTimestamp(
@@ -739,54 +781,135 @@ final class UrsaPartitionLog {
         } catch (Throwable openError) {
             return CompletableFuture.failedFuture(openError);
         }
-        return cursorFuture.thenCompose(cursor -> runWithClosingCursor(
-                cursor,
-                () -> scanCursorForMaxTimestamp(cursor, maxOffset, null),
-                "max-timestamp-scan"));
+        return runWithClosingCursor(
+                cursorFuture,
+                cursor -> scanCursorForMaxTimestamp(cursor, maxOffset, null),
+                "max-timestamp-scan");
     }
 
     private CompletableFuture<TimestampAndOffset> scanCursorForMaxTimestamp(
             LogCursor cursor,
             long maxOffset,
             TimestampAndOffset bestSoFar) {
-        return cursor.readEntries(MAX_ENTRIES_PER_FETCH, Long.MAX_VALUE, null, maxOffset)
-                .thenCompose(entries -> {
-                    if (entries.isEmpty()) {
-                        return CompletableFuture.completedFuture(bestSoFar);
-                    }
+        CompletableFuture<List<LogEntry>> readFuture;
+        try {
+            readFuture = cursor.readEntries(MAX_ENTRIES_PER_FETCH, Long.MAX_VALUE, null, maxOffset);
+            if (readFuture == null) {
+                throw new IllegalStateException("LogCursor.readEntries returned null future");
+            }
+        } catch (Throwable readError) {
+            return CompletableFuture.failedFuture(readError);
+        }
+        return consumeLogEntries(readFuture, entries -> {
+            if (entries.isEmpty()) {
+                return new ScanBatchResult<>(true, bestSoFar);
+            }
 
-                    TimestampAndOffset best = bestSoFar;
-                    for (LogEntry entry : entries) {
-                        TimestampAndOffset candidate = findMaxTimestamp(entry.payload(), entry.offset());
-                        if (candidate != null && (best == null || candidate.timestamp() > best.timestamp())) {
-                            best = candidate;
-                        }
-                    }
+            TimestampAndOffset best = bestSoFar;
+            for (LogEntry entry : entries) {
+                TimestampAndOffset candidate = findMaxTimestamp(entry.payload(), entry.offset());
+                if (candidate != null && (best == null || candidate.timestamp() > best.timestamp())) {
+                    best = candidate;
+                }
+            }
 
-                    return scanCursorForMaxTimestamp(cursor, maxOffset, best);
-                });
+            return new ScanBatchResult<>(false, best);
+        }).thenCompose(batchResult -> batchResult.done()
+                ? CompletableFuture.completedFuture(batchResult.value())
+                : scanCursorForMaxTimestamp(cursor, maxOffset, batchResult.value()));
     }
 
     private <T> CompletableFuture<T> runWithClosingCursor(
-            LogCursor cursor,
-            Supplier<CompletableFuture<T>> operation,
+            CompletableFuture<LogCursor> cursorFuture,
+            Function<LogCursor, CompletableFuture<T>> operation,
             String purpose) {
-        if (cursor == null) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("Log.openEphemeralCursor returned null cursor"));
-        }
-
-        CompletableFuture<T> operationFuture;
-        try {
-            operationFuture = operation.get();
-            if (operationFuture == null) {
-                throw new IllegalStateException("Cursor operation returned null future");
+        CompletableFuture<T> result = new CompletableFuture<>();
+        cursorFuture.whenComplete((cursor, openError) -> {
+            if (openError != null) {
+                completeFromSource(result, cursorFuture, null, openError);
+                return;
             }
-        } catch (Throwable operationError) {
-            closeCursorQuietly(cursor, purpose);
-            return CompletableFuture.failedFuture(operationError);
+            if (cursor == null) {
+                result.completeExceptionally(
+                        new IllegalStateException("Log.openEphemeralCursor returned null cursor"));
+                return;
+            }
+            if (result.isDone()) {
+                closeCursorQuietly(cursor, purpose);
+                return;
+            }
+
+            CompletableFuture<T> operationFuture;
+            try {
+                operationFuture = operation.apply(cursor);
+                if (operationFuture == null) {
+                    throw new IllegalStateException("Cursor operation returned null future");
+                }
+            } catch (Throwable operationError) {
+                closeCursorQuietly(cursor, purpose);
+                result.completeExceptionally(operationError);
+                return;
+            }
+            operationFuture.whenComplete((value, operationError) -> {
+                closeCursorQuietly(cursor, purpose);
+                completeFromSource(result, operationFuture, value, operationError);
+            });
+        });
+        return result;
+    }
+
+    private <T> CompletableFuture<T> consumeLogEntries(
+            CompletableFuture<List<LogEntry>> readFuture,
+            Function<List<LogEntry>, T> consumer) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        readFuture.whenComplete((entries, readError) -> {
+            T value = null;
+            Throwable completionError = readError;
+            try {
+                if (completionError == null && !result.isDone()) {
+                    value = consumer.apply(entries);
+                }
+            } catch (Throwable consumerError) {
+                completionError = consumerError;
+            } finally {
+                completionError = closeLogEntries(entries, completionError);
+            }
+
+            if (completionError != null) {
+                completeFromSource(result, readFuture, null, completionError);
+            } else {
+                result.complete(value);
+            }
+        });
+        return result;
+    }
+
+    private Throwable closeLogEntries(List<LogEntry> entries, Throwable precedingError) {
+        try {
+            OwnedResultFutures.closeLogEntries(entries);
+        } catch (Throwable closeError) {
+            if (precedingError == null) {
+                return closeError;
+            }
+            if (precedingError != closeError) {
+                precedingError.addSuppressed(closeError);
+            }
         }
-        return operationFuture.whenComplete((ignored, error) -> closeCursorQuietly(cursor, purpose));
+        return precedingError;
+    }
+
+    private static <T> void completeFromSource(
+            CompletableFuture<T> result,
+            CompletableFuture<?> source,
+            T value,
+            Throwable error) {
+        if (error == null) {
+            result.complete(value);
+        } else if (source.isCancelled()) {
+            result.cancel(false);
+        } else {
+            result.completeExceptionally(error);
+        }
     }
 
     private void closeCursorQuietly(LogCursor cursor, String purpose) {
@@ -1246,6 +1369,9 @@ final class UrsaPartitionLog {
     }
 
     private record FetchOffsetRange(long logStartOffset, long highWatermark) {
+    }
+
+    private record ScanBatchResult<T>(boolean done, T value) {
     }
 
     private record TimestampAndOffset(long timestamp, long offset) {

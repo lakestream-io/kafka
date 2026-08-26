@@ -515,7 +515,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
                     // registerPartition serializes registration with config events and exact-replaces
                     // properties using the latest published snapshot. Re-applying topicConfig here
                     // would let this open's stale snapshot overwrite a racing newer event.
-                    return registration.thenApply(ignored -> catalog.createLog(LogId.of(streamId)));
+                    return registration.thenApply(ignored -> catalog.createLog(name, LogId.of(streamId)));
                 });
     }
 
