@@ -33,11 +33,11 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogOffset;
-import io.streamnative.lakestream.api.Stream;
-import io.streamnative.lakestream.api.StreamCatalog;
-import io.streamnative.lakestream.api.StreamIdentifier;
+import io.lakestream.api.Log;
+import io.lakestream.api.LogOffset;
+import io.lakestream.api.Stream;
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;

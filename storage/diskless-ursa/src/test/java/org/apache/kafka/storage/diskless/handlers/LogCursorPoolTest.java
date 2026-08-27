@@ -21,8 +21,8 @@ import org.junit.jupiter.api.Test;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogCursor;
+import io.lakestream.api.Log;
+import io.lakestream.api.LogCursor;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;

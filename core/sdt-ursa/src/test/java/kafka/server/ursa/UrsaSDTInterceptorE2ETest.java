@@ -58,11 +58,11 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import io.lakestream.ursa.compaction.OxiaCompactTaskManager;
+import io.lakestream.ursa.compaction.task.CompactStreamTask;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.OxiaClientBuilder;
-import io.streamnative.oxia.testcontainers.OxiaContainer;
-import io.streamnative.ursa.compaction.OxiaCompactTaskManager;
-import io.streamnative.ursa.compaction.task.CompactStreamTask;
+import io.oxia.testcontainers.OxiaContainer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

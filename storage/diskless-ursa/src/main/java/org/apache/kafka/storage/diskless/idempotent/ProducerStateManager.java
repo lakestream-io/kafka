@@ -47,10 +47,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.LogCursor;
+import io.lakestream.api.LogEntry;
 import io.oxia.client.api.AsyncOxiaClient;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogCursor;
-import io.streamnative.lakestream.api.LogEntry;
 
 /**
  * Per-partition producer state manager for diskless idempotent produce.

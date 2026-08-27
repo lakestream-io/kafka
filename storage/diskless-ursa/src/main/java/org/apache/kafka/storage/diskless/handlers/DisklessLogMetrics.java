@@ -32,8 +32,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogOffset;
+import io.lakestream.api.Log;
+import io.lakestream.api.LogOffset;
 
 final class DisklessLogMetrics {
 

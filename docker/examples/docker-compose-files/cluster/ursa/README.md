@@ -313,7 +313,7 @@ You can browse the `kafka-ursa` bucket to see stored log segments.
 
 ### Oxia Settings
 
-Oxia is configured with 8 shards (`--shards=8`) to prevent WAL offset conflicts under high concurrent write load. This is a workaround for [oxia#796](https://github.com/streamnative/oxia/issues/796).
+Oxia is configured with 8 shards (`--shards=8`) to prevent WAL offset conflicts under high concurrent write load. This is a workaround for [oxia#796](https://github.com/oxia-db/oxia/issues/796).
 
 ### Environment Variables
 

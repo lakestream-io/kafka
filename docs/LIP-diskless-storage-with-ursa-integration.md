@@ -15,18 +15,18 @@
  limitations under the License.
 -->
 
-# SNIP-001: Diskless Storage with Ursa Integration
+# LIP-001: Diskless Storage with Ursa Integration
 
 - *Author(s)*: Kai Wang
 - *Proposal time*: 2026-01
 - *Implemented*: YES
 - *Released*: NO
-- *Repository*: https://github.com/ursaio/ursa-for-kafka
+- *Repository*: https://github.com/lakestream-io/kafka
 - *Discussion Link*: N/A
 
 ## TL;DR
 
-This SNIP introduces **Diskless Storage** mode for Apache Kafka, replacing traditional local log persistence with remote stream-based storage via **StreamNative Ursa**. When enabled, Kafka brokers become stateless with respect to message data, offloading durability to Ursa's distributed storage layer and producer state management to **Oxia** (a distributed key-value store). This architectural shift enables rapid broker failover, eliminates ISR-based replication overhead for diskless topics, and provides a foundation for truly elastic Kafka deployments.
+This LIP introduces **Diskless Storage** mode for Apache Kafka, replacing traditional local log persistence with remote stream-based storage via **Ursa**. When enabled, Kafka brokers become stateless with respect to message data, offloading durability to Ursa's distributed storage layer and producer state management to **Oxia** (a distributed key-value store). This architectural shift enables rapid broker failover, eliminates ISR-based replication overhead for diskless topics, and provides a foundation for truly elastic Kafka deployments.
 
 ## Background Knowledge
 
@@ -40,9 +40,9 @@ In standard Apache Kafka, each broker maintains local log segments on disk:
 
 This model tightly couples brokers to their local storage, making failover expensive (data must be re-replicated) and scaling inflexible.
 
-### StreamNative Ursa Storage
+### Ursa Storage
 
-Ursa is StreamNative's distributed storage engine designed for streaming workloads:
+Ursa is a distributed storage engine designed for streaming workloads:
 - **Stream-based API**: Data is organized as streams with append-only semantics
 - **Built-in Replication**: Ursa handles durability internally, eliminating the need for Kafka-level ISR
 - **Backend Flexibility**: Supports LOCAL, S3, GCS, and Azure Blob storage backends
@@ -106,7 +106,7 @@ Apache Kafka's KIP-405 introduced tiered storage, where older log segments are m
 
 The diskless storage architecture introduces a **bypass layer** that intercepts storage operations in the `ReplicaManager` and routes them to Ursa instead of local logs.
 
-In this SNIP, diskless topics are handled by the Lakestream-backed implementations
+In this LIP, diskless topics are handled by the Lakestream-backed implementations
 `UrsaLakestreamWriter` / `UrsaLakestreamReader`.
 
 ```

@@ -12,9 +12,9 @@ This file provides guidance to AI coding agents (Codex CLI, OpenCode, Claude Cod
 
 ## Project Overview
 
-Fork of Apache Kafka with **Diskless Storage** via **StreamNative Ursa**. When enabled, Kafka brokers become stateless — message durability is offloaded to Ursa's distributed storage layer and producer state to **Oxia** (a distributed KV store). The primary goal is to maintain compatibility with upstream Kafka while adding the Ursa storage bypass layer.
+Fork of Apache Kafka with **Diskless Storage** via **Ursa**. When enabled, Kafka brokers become stateless — message durability is offloaded to Ursa's distributed storage layer and producer state to **Oxia** (a distributed KV store). The primary goal is to maintain compatibility with upstream Kafka while adding the Ursa storage bypass layer.
 
-Design document: `docs/SNIP-diskless-storage-with-ursa-integration.md`
+Design document: `docs/LIP-diskless-storage-with-ursa-integration.md`
 
 ## Build Commands
 
@@ -140,7 +140,7 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 ### Ursa Dependencies
 Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` and `core:core-sdt-ursa` runtimes, not in `storage` or `core`.
 
-The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.streamnative.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state metadata and the controller's existing diskless metadata-store adapter.
+The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.lakestream.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state metadata and the controller's existing diskless metadata-store adapter.
 
 Release tarballs package those isolated runtime jars under `./ursa-storage/`. Kafka, Scala, SLF4J, Log4j, and other platform jars are provided by `./libs/` and should not be duplicated into `./ursa-storage/` unless the dependency is intentionally private to the Ursa runtime. The `KafkaPluginClassLoader` loads plugin-private classes child-first while keeping Kafka/logging/Scala API packages parent-first.
 

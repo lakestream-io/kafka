@@ -58,13 +58,13 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogId;
-import io.streamnative.lakestream.api.Stream;
-import io.streamnative.lakestream.api.StreamCatalog;
-import io.streamnative.lakestream.api.StreamCatalogLoader;
-import io.streamnative.lakestream.api.StreamIdentifier;
-import io.streamnative.oxia.testcontainers.OxiaContainer;
+import io.lakestream.api.Log;
+import io.lakestream.api.LogId;
+import io.lakestream.api.Stream;
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamCatalogLoader;
+import io.lakestream.api.StreamIdentifier;
+import io.oxia.testcontainers.OxiaContainer;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -392,7 +392,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 exec java $URSA_JAVA_OPTS \
                   -Dio.netty.tryReflectionSetAccessible=true -Djava.net.preferIPv4Stack=true \
                   -cp '/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*' \
-                  io.streamnative.ursa.compact.CompactionMain --conf "$conf"
+                  io.lakestream.ursa.compact.CompactionMain --conf "$conf"
                 """;
     }
 

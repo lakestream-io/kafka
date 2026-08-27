@@ -150,7 +150,7 @@ services:
         exec java $$URSA_JAVA_OPTS \
           -Dio.netty.tryReflectionSetAccessible=true -Djava.net.preferIPv4Stack=true \
           -cp '/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*' \
-          io.streamnative.ursa.compact.CompactionMain --conf "$$conf"
+          io.lakestream.ursa.compact.CompactionMain --conf "$$conf"
     restart: unless-stopped
 
   kafka-1:

@@ -35,4 +35,4 @@ RUN useradd --uid 10000 --gid 0 --home-dir /opt/ursa --no-create-home \
 ENV HOME=/opt/ursa
 USER 10000:0
 
-ENTRYPOINT ["java", "-cp", "/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*", "io.streamnative.ursa.compact.CompactionMain"]
+ENTRYPOINT ["java", "-cp", "/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*", "io.lakestream.ursa.compact.CompactionMain"]

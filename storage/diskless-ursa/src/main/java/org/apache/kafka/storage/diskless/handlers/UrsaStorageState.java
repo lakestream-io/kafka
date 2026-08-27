@@ -47,9 +47,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.StreamCatalog;
 import io.oxia.client.api.AsyncOxiaClient;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.StreamCatalog;
 
 /**
  * Shared state container for Ursa storage components.

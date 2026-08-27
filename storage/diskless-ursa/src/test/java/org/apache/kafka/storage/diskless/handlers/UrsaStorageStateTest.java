@@ -37,12 +37,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogId;
-import io.streamnative.lakestream.api.LogOffset;
-import io.streamnative.lakestream.api.Stream;
-import io.streamnative.lakestream.api.StreamCatalog;
-import io.streamnative.lakestream.api.StreamIdentifier;
+import io.lakestream.api.Log;
+import io.lakestream.api.LogId;
+import io.lakestream.api.LogOffset;
+import io.lakestream.api.Stream;
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

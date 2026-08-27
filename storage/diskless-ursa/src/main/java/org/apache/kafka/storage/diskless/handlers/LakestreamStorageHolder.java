@@ -35,12 +35,12 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.Stream;
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamCatalogLoader;
+import io.lakestream.api.StreamIdentifier;
 import io.oxia.client.api.AsyncOxiaClient;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.Stream;
-import io.streamnative.lakestream.api.StreamCatalog;
-import io.streamnative.lakestream.api.StreamCatalogLoader;
-import io.streamnative.lakestream.api.StreamIdentifier;
 
 /**
  * Holds a {@link StreamCatalog} instance for Kafka diskless storage.

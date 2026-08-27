@@ -23,8 +23,8 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
-import io.streamnative.lakestream.api.ExternalStreamRegistry;
-import io.streamnative.lakestream.api.StreamIdentifier;
+import io.lakestream.api.ExternalStreamRegistry;
+import io.lakestream.api.StreamIdentifier;
 
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.mockito.Mockito.mock;

@@ -69,7 +69,7 @@ import java.util.concurrent.TimeUnit;
 
 import javax.management.ObjectName;
 
-import io.streamnative.oxia.testcontainers.OxiaContainer;
+import io.oxia.testcontainers.OxiaContainer;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 

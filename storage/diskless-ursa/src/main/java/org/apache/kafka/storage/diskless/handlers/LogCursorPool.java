@@ -25,8 +25,8 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogCursor;
+import io.lakestream.api.Log;
+import io.lakestream.api.LogCursor;
 
 /**
  * A bounded pool for reusing ephemeral {@link LogCursor} instances against a single {@link Log}.

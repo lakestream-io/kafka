@@ -48,12 +48,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.LogCursor;
+import io.lakestream.api.LogEntry;
+import io.lakestream.api.LogOffset;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogCursor;
-import io.streamnative.lakestream.api.LogEntry;
-import io.streamnative.lakestream.api.LogOffset;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;

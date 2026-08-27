@@ -539,7 +539,7 @@ bundled under ./ursa-storage.
 - kerby-config-2.0.3
 - kerby-pkix-2.0.3
 - kerby-util-2.0.3
-- lakestream-api-5.0.0-M1-SNAPSHOT
+- lakestream-api-1.0.0
 - lambda-2.32.28
 - lang-tag-1.7
 - lz4-java-1.8.0
@@ -633,11 +633,11 @@ bundled under ./ursa-storage.
 - third-party-jackson-core-2.32.28
 - threetenbp-1.7.0
 - txw2-2.3.9
-- ursa-storage-common-5.0.0-M1-SNAPSHOT
-- ursa-storage-core-5.0.0-M1-SNAPSHOT
-- ursa-storage-kafka-runtime-5.0.0-M1-SNAPSHOT
-- ursa-storage-lakehouse-kafka-reader-5.0.0-M1-SNAPSHOT
-- ursa-storage-lakestream-5.0.0-M1-SNAPSHOT
+- ursa-storage-common-1.0.0
+- ursa-storage-core-1.0.0
+- ursa-storage-kafka-runtime-1.0.0
+- ursa-storage-lakehouse-kafka-reader-1.0.0
+- ursa-storage-lakestream-1.0.0
 - util-2.2.31
 - util-hadoop-hadoop3-2.2.31
 - utils-2.32.28

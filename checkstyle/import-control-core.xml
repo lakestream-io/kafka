@@ -68,7 +68,8 @@
     <allow pkg="org.apache.kafka" />
     <allow pkg="io.oxia"/>
     <allow pkg="com.google.common" />
-    <allow pkg="io.streamnative" />
+    <allow pkg="io.lakestream.ursa.compaction" />
+    <allow pkg="io.lakestream.ursa.storage" />
     <allow pkg="org.awaitility" />
     <allow pkg="org.testcontainers.utility" />
     <allow class="org.apache.commons.lang3.RandomStringUtils" />

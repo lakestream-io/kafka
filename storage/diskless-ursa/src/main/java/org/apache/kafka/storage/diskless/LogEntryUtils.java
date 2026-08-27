@@ -18,7 +18,7 @@ package org.apache.kafka.storage.diskless;
 
 import java.util.List;
 
-import io.streamnative.lakestream.api.LogEntry;
+import io.lakestream.api.LogEntry;
 
 /** Utilities for releasing Lakestream read results owned by the caller. */
 public final class LogEntryUtils {

@@ -73,12 +73,12 @@
   <allow pkg="org.apache.kafka.test" />
   <allow class="org.apache.kafka.controller.QuorumController" />
   <allow pkg="org.testcontainers" />
-  <allow pkg="io.streamnative.oxia.testcontainers" />
+  <allow pkg="io.oxia.testcontainers" />
   <allow pkg="io.oxia.client.api" />
   <allow pkg="org.awaitility" />
   <allow pkg="io.opentelemetry.api" />
-  <allow pkg="io.streamnative.lakestream.api" />
-  <allow pkg="io.streamnative.ursa.storage" />
+  <allow pkg="io.lakestream.api" />
+  <allow pkg="io.lakestream.ursa.storage" />
   <allow class="org.apache.kafka.storage.diskless.handlers.KafkaLogNaming" />
   <allow class="org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys" />
 

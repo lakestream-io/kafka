@@ -54,13 +54,13 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.LogCursor;
+import io.lakestream.api.LogEntry;
+import io.lakestream.api.LogEntryHeader;
+import io.lakestream.api.LogOffset;
 import io.netty.buffer.ByteBuf;
 import io.oxia.client.api.AsyncOxiaClient;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogCursor;
-import io.streamnative.lakestream.api.LogEntry;
-import io.streamnative.lakestream.api.LogEntryHeader;
-import io.streamnative.lakestream.api.LogOffset;
 
 final class UrsaPartitionLog {
 

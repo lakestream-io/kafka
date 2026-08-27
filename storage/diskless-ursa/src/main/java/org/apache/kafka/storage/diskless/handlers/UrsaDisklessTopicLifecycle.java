@@ -26,9 +26,9 @@ import java.util.Objects;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 
-import io.streamnative.lakestream.api.ExternalStreamRegistry;
-import io.streamnative.lakestream.api.ExternalStreamRegistryLoader;
-import io.streamnative.lakestream.api.StreamIdentifier;
+import io.lakestream.api.ExternalStreamRegistry;
+import io.lakestream.api.ExternalStreamRegistryLoader;
+import io.lakestream.api.StreamIdentifier;
 
 /** Ursa implementation of Kafka's logical diskless topic lifecycle. */
 public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle {

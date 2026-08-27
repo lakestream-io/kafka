@@ -70,17 +70,17 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import io.lakestream.api.Stream;
+import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamCatalogLoader;
+import io.lakestream.api.StreamIdentifier;
+import io.lakestream.ursa.storage.Key;
+import io.lakestream.ursa.storage.impl.StorageFormat;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.OxiaClientBuilder;
 import io.oxia.client.api.options.GetOption;
-import io.streamnative.lakestream.api.Stream;
-import io.streamnative.lakestream.api.StreamCatalog;
-import io.streamnative.lakestream.api.StreamCatalogLoader;
-import io.streamnative.lakestream.api.StreamIdentifier;
-import io.streamnative.oxia.testcontainers.OxiaContainer;
-import io.streamnative.ursa.storage.Key;
-import io.streamnative.ursa.storage.impl.StorageFormat;
+import io.oxia.testcontainers.OxiaContainer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -1187,7 +1187,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                 .get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         Class<?> logClass = Class.forName(
-                "io.streamnative.lakestream.api.Log",
+                "io.lakestream.api.Log",
                 true,
                 logInstance.getClass().getClassLoader());
         var trimMethod = state.getClass()

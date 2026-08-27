@@ -54,12 +54,12 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.stream.Collectors;
 
+import io.lakestream.ursa.compaction.CompactionManager;
+import io.lakestream.ursa.compaction.DynamicConfigs;
+import io.lakestream.ursa.compaction.OxiaCompactTaskManager;
+import io.lakestream.ursa.storage.UrsaStorage;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.OxiaClientBuilder;
-import io.streamnative.ursa.compaction.CompactionManager;
-import io.streamnative.ursa.compaction.DynamicConfigs;
-import io.streamnative.ursa.compaction.OxiaCompactTaskManager;
-import io.streamnative.ursa.storage.UrsaStorage;
 
 /**
  * UrsaSDTInterceptor to initialize the ursa compaction task publisher to prepare the compaction task

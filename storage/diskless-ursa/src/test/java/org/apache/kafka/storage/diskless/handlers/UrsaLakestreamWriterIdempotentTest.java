@@ -45,10 +45,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.LogEntryHeader;
+import io.lakestream.api.LogOffset;
 import io.netty.buffer.ByteBuf;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogEntryHeader;
-import io.streamnative.lakestream.api.LogOffset;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

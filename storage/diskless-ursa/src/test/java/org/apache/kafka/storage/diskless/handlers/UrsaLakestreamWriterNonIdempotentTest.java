@@ -44,9 +44,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.LogEntryHeader;
 import io.netty.buffer.ByteBuf;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogEntryHeader;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;

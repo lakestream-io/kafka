@@ -40,15 +40,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import io.lakestream.api.Log;
+import io.lakestream.api.LogCursor;
+import io.lakestream.api.LogEntry;
+import io.lakestream.api.LogOffset;
 import io.netty.buffer.ByteBuf;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
-import io.streamnative.lakestream.api.Log;
-import io.streamnative.lakestream.api.LogCursor;
-import io.streamnative.lakestream.api.LogEntry;
-import io.streamnative.lakestream.api.LogOffset;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

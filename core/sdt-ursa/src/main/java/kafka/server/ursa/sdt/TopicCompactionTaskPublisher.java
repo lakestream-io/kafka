@@ -40,10 +40,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
-import io.streamnative.ursa.compaction.CompactionManager;
-import io.streamnative.ursa.compaction.DynamicConfigs;
-import io.streamnative.ursa.compaction.PublicationFencedException;
-import io.streamnative.ursa.compaction.task.PreparedCompactStreamTask;
+import io.lakestream.ursa.compaction.CompactionManager;
+import io.lakestream.ursa.compaction.DynamicConfigs;
+import io.lakestream.ursa.compaction.PublicationFencedException;
+import io.lakestream.ursa.compaction.task.PreparedCompactStreamTask;
 
 public class TopicCompactionTaskPublisher implements AutoCloseable {
 
