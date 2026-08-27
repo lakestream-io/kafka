@@ -1,0 +1,133 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+services:
+  kafka-ready:
+    image: ${IMAGE:-kafka-diskless:latest}
+    restart: "no"
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-metadata-quorum.sh \
+          --bootstrap-server kafka-1:19092 describe --status
+        echo "Kafka cluster is ready."
+
+  create-topic:
+    image: ${IMAGE:-kafka-diskless:latest}
+    restart: "no"
+    depends_on:
+      kafka-ready:
+        condition: service_completed_successfully
+    environment:
+      DEMO_TOPIC: ${DEMO_TOPIC:-ursa-lakehouse-e2e}
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka-1:19092,kafka-2:19092,kafka-3:19092 \
+          --create \
+          --if-not-exists \
+          --config ursa.storage.enable=true \
+          --topic "$${DEMO_TOPIC}" \
+          --partitions 1 \
+          --replication-factor 1
+
+  raw-producer:
+    image: ${IMAGE:-kafka-diskless:latest}
+    restart: "no"
+    depends_on:
+      create-topic:
+        condition: service_completed_successfully
+    environment:
+      DEMO_TOPIC: ${DEMO_TOPIC:-ursa-lakehouse-e2e}
+      NUM_RECORDS: ${NUM_RECORDS:-100}
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        echo "Producing $${NUM_RECORDS} records to $${DEMO_TOPIC}..."
+        seq -f 'record-%06g' 1 "$${NUM_RECORDS}" \
+          | /opt/kafka/bin/kafka-console-producer.sh \
+              --bootstrap-server kafka-1:19092 \
+              --topic "$${DEMO_TOPIC}"
+
+  kafka-consumer-check:
+    image: ${IMAGE:-kafka-diskless:latest}
+    restart: "no"
+    depends_on:
+      raw-producer:
+        condition: service_completed_successfully
+    environment:
+      DEMO_TOPIC: ${DEMO_TOPIC:-ursa-lakehouse-e2e}
+      NUM_RECORDS: ${NUM_RECORDS:-100}
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        output=/tmp/kafka-consumed.txt
+        /opt/kafka/bin/kafka-console-consumer.sh \
+          --bootstrap-server kafka-2:19092 \
+          --topic "$${DEMO_TOPIC}" \
+          --from-beginning \
+          --max-messages "$${NUM_RECORDS}" \
+          --timeout-ms 120000 > "$$output"
+        count="$$(grep -c '^record-' "$$output" || true)"
+        test "$$count" = "$${NUM_RECORDS}"
+        echo "Kafka read back $$count records from Ursa storage."
+
+  duckdb-query-check:
+    image: ${DUCKDB_IMAGE:-duckdb/duckdb:1.5.5}
+    restart: "no"
+    depends_on:
+      raw-producer:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
+    volumes:
+      - ./lakehouse/duckdb-init.sql:/opt/ursa-demo/duckdb-init.sql:ro
+      - duckdb-extensions:/root/.duckdb
+    entrypoint:
+      - /duckdb
+      - -init
+      - /opt/ursa-demo/duckdb-init.sql
+      - -noheader
+      - -list
+      - -c
+    command:
+      - |
+        SET VARIABLE target_table = (
+          SELECT format('lakehouse.default."{}"', table_name)
+          FROM duckdb_tables()
+          WHERE database_name = 'lakehouse'
+            AND schema_name = 'default'
+            AND table_name LIKE '${DEMO_TOPIC:-ursa-lakehouse-e2e}-topic-id-%'
+          ORDER BY table_name
+          LIMIT 1
+        );
+        SET VARIABLE actual_rows = (
+          SELECT count(*) FROM query_table(getvariable('target_table'))
+        );
+        SELECT CASE
+          WHEN getvariable('actual_rows') = ${NUM_RECORDS:-100}
+            THEN format('DuckDB read {} rows from {}.',
+                        getvariable('actual_rows'), getvariable('target_table'))
+          ELSE error('Iceberg table does not contain the expected row count yet')
+        END;

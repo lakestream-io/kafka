@@ -14,6 +14,9 @@
 # limitations under the License.
 
 DOCKER := docker
+LAKEHOUSE_PROJECT ?= kafka-ursa-lakehouse
+LAKEHOUSE_COMPOSE := docker-compose-lakehouse.yml
+LAKEHOUSE_DEMO_COMPOSE := docker-compose-lakehouse.demo.yml
 
 .PHONY: help
 help:
@@ -29,6 +32,37 @@ help:
 	@echo "  make produce      - Run producer perf test"
 	@echo "  make consume      - Run consumer perf test"
 	@echo ""
+	@echo "Lakehouse Demo Commands:"
+	@echo "  make build-lakehouse URSA_STORAGE_DIR=/path/to/ursa-storage"
+	@echo "  make up-lakehouse"
+	@echo "  make demo-lakehouse"
+	@echo "  make duckdb-lakehouse"
+	@echo "  make destroy-lakehouse"
+	@echo ""
+
+.PHONY: build-lakehouse
+build-lakehouse:
+	URSA_STORAGE_DIR="$(URSA_STORAGE_DIR)" ./build-lakehouse-images.sh
+
+.PHONY: up-lakehouse
+up-lakehouse:
+	$(DOCKER) compose --project-name $(LAKEHOUSE_PROJECT) -f $(LAKEHOUSE_COMPOSE) up -d \
+		oxia minio minio-init polaris polaris-setup compactor kafka-1 kafka-2 kafka-3
+
+.PHONY: demo-lakehouse
+demo-lakehouse:
+	COMPOSE_PROJECT_NAME=$(LAKEHOUSE_PROJECT) ./run-lakehouse-demo.sh
+
+.PHONY: duckdb-lakehouse
+duckdb-lakehouse:
+	$(DOCKER) compose --project-name $(LAKEHOUSE_PROJECT) -f $(LAKEHOUSE_COMPOSE) \
+		--profile tools run --rm duckdb
+
+.PHONY: destroy-lakehouse
+destroy-lakehouse:
+	$(DOCKER) compose --project-name $(LAKEHOUSE_PROJECT) -f $(LAKEHOUSE_COMPOSE) \
+		-f $(LAKEHOUSE_DEMO_COMPOSE) \
+		down -v --remove-orphans
 
 .PHONY: demo
 demo:

@@ -35,6 +35,87 @@ This directory contains Docker Compose configuration for running Kafka with **Di
 
 ## Quick Start
 
+### Full lakehouse E2E (MinIO + Polaris + DuckDB)
+
+`docker-compose-lakehouse.yml` is the complete local lakehouse stack. It uses:
+
+- three Kafka KRaft brokers with diskless Ursa storage;
+- Oxia for the Lakestream catalog, WAL indexes, and compaction tasks;
+- MinIO for both the Ursa WAL/managed compacted objects and the Iceberg warehouse;
+- Apache Polaris as an Iceberg REST catalog;
+- the standalone Ursa compactor to materialize Kafka records into an external Iceberg table;
+- DuckDB as an on-demand SQL engine and automated E2E verifier.
+
+Kafka owns compaction-task publication in this stack so each range carries the
+Kafka entry format and source-topic metadata exactly once. The standalone Ursa
+compactor only consumes those tasks and writes the managed and Iceberg outputs.
+
+```text
+Kafka producer -> Kafka broker -> Ursa WAL (MinIO)
+                                     |
+                                     v
+                             Ursa compactor
+                              |           |
+                              v           v
+                    managed objects   Iceberg table
+                                      |     |
+                                      v     v
+                                  Polaris  MinIO
+                                      |
+                                      v
+                                   DuckDB
+```
+
+Build the two local project images first. `URSA_STORAGE_DIR` must point to the
+matching local `ursa-storage` checkout:
+
+```bash
+URSA_STORAGE_DIR=/path/to/ursa-storage ./build-lakehouse-images.sh
+```
+
+Then run the end-to-end assertion:
+
+```bash
+./run-lakehouse-demo.sh
+```
+
+The verifier creates a diskless topic, writes 100 raw Kafka records, reads all
+100 back through Kafka, waits for Ursa to commit the external Iceberg table,
+asserts that DuckDB reads the same row count through Polaris, and checks that
+the range was materialized exactly once without compactor errors. On success
+it removes the demo containers and volumes. To retain the stack for inspection:
+
+```bash
+KEEP_RUNNING=true ./run-lakehouse-demo.sh
+```
+
+The verifier requires a fresh Compose project so a prior topic or Iceberg
+snapshot cannot make an assertion pass accidentally. After a retained or failed
+run, use `make destroy-lakehouse` before retrying.
+
+For a long-running local cluster, use:
+
+```bash
+make up-lakehouse
+make duckdb-lakehouse
+```
+
+Inside DuckDB, discover the incarnation-qualified table name and query it:
+
+```sql
+SHOW ALL TABLES;
+SELECT count(*) FROM lakehouse.default."ursa-lakehouse-e2e-topic-id-<uuid>";
+```
+
+Destroy the retained cluster with `make destroy-lakehouse`.
+
+The Polaris service intentionally uses its in-memory development metastore and
+static MinIO credentials. It is suitable for a reproducible local E2E, not for
+durable or production catalog deployment. DuckDB is on demand rather than a
+resident server; use Trino instead when a shared JDBC/HTTP query endpoint is a
+requirement. All published ports bind to `127.0.0.1` because the demo uses
+fixed development credentials.
+
 ### 1. Build the Docker Image
 
 ```bash
@@ -65,7 +146,7 @@ Build the standalone Maven package in the `ursa-storage` repository. The package
 
 ```bash
 # From the ursa-storage repository:
-mvn -B -ntp -pl ursa-storage-compact -am -DskipTests package
+mvn -B -ntp -pl ursa-storage-compact -am -DskipTests clean package
 
 # From the Kafka repository:
 docker build -t ursa-compact:standalone-s3-e2e \
@@ -198,6 +279,11 @@ For more control over performance tests:
 | `make consume` | Run consumer perf test |
 | `make console-producer` | Start interactive console producer |
 | `make console-consumer` | Start interactive console consumer |
+| `make build-lakehouse` | Build Kafka and Ursa compactor images for the lakehouse stack |
+| `make up-lakehouse` | Start Kafka, Ursa, MinIO, and Polaris |
+| `make demo-lakehouse` | Run the Kafka-to-DuckDB E2E and clean up on success |
+| `make duckdb-lakehouse` | Open DuckDB attached to the local Polaris catalog |
+| `make destroy-lakehouse` | Stop the lakehouse stack and remove its volumes |
 
 **Note**: Diskless topics enforce RF=1 (replication factor of 1) because data is stored in remote storage, not replicated across brokers.
 
@@ -211,6 +297,8 @@ For more control over performance tests:
 | oxia | 6648 | Oxia metadata service |
 | minio | 19000 | MinIO S3 API |
 | minio | 19001 | MinIO Console |
+| polaris | 18181 | Iceberg REST and management APIs |
+| polaris | 18182 | Health and metrics APIs |
 
 ## MinIO Console
 

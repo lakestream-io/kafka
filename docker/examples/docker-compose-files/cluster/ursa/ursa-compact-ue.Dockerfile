@@ -16,7 +16,7 @@
 # Local development image for the standalone Ursa compactor Maven package.
 # Build context must be the ursa-storage repository root after running:
 #
-#   mvn -B -ntp -pl ursa-storage-compact -am -DskipTests package
+#   mvn -B -ntp -pl ursa-storage-compact -am -DskipTests clean package
 #
 # The package contract is a versioned compact jar plus its runtime dependency
 # directory at ursa-storage-compact/target/lib/.
@@ -28,8 +28,11 @@ WORKDIR /opt/ursa
 COPY ursa-storage-compact/target/ursa-storage-compact-*.jar /opt/ursa/ursa-storage-compact.jar
 COPY ursa-storage-compact/target/lib/ /opt/ursa/lib/
 
-RUN mkdir -p /mnt/sn-license && chown -R 10000:0 /opt/ursa /mnt/sn-license
+RUN useradd --uid 10000 --gid 0 --home-dir /opt/ursa --no-create-home \
+      --shell /usr/sbin/nologin ursa \
+    && chown -R 10000:0 /opt/ursa
 
-USER 10000
+ENV HOME=/opt/ursa
+USER 10000:0
 
 ENTRYPOINT ["java", "-cp", "/opt/ursa/ursa-storage-compact.jar:/opt/ursa/lib/*", "io.streamnative.ursa.compact.CompactionMain"]

@@ -1,0 +1,261 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+
+x-kafka-environment: &kafka-environment
+  KAFKA_PROCESS_ROLES: "broker,controller"
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+  KAFKA_LISTENERS: "PLAINTEXT://:19092,CONTROLLER://:9093,PLAINTEXT_HOST://:9092"
+  KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+  KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+  KAFKA_SOCKET_SERVER_ENABLE_REQUEST_PIPELINING: "true"
+
+  # Diskless storage and the two protocol-level Lakestream/Oxia endpoints.
+  KAFKA_URSA_STORAGE_ENABLE: "true"
+  KAFKA_URSA_CATALOG_OXIA_SERVICE_URL: "oxia://oxia:6648/default"
+  KAFKA_URSA_OXIA_SERVICE_URL: "oxia://oxia:6648/default"
+  KAFKA_URSA_STORAGE_BACKEND_TYPE: "S3"
+  KAFKA_URSA_STORAGE_PATH: "ursa/wal"
+  KAFKA_URSA_STORAGE_S3_ENDPOINT: "http://minio:9000"
+  KAFKA_URSA_STORAGE_S3_ACCESS_KEY: "minioadmin"
+  KAFKA_URSA_STORAGE_S3_SECRET_KEY: "minioadmin"
+  KAFKA_URSA_STORAGE_S3_BUCKET: "kafka-ursa"
+  KAFKA_URSA_STORAGE_S3_REGION: "us-east-1"
+  KAFKA_URSA_STORAGE_S3_PATH_STYLE_ACCESS: "true"
+  KAFKA_URSA_STORAGE_COMPACTION_BUCKET: "kafka-ursa"
+  KAFKA_URSA_STORAGE_COMPACTION_PREFIX: "ursa/compacted"
+  KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE: "4096"
+  KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS: "100"
+
+  # This class lives in the isolated Ursa runtime shipped under
+  # /opt/kafka/ursa-storage, not on Kafka's main classpath.
+  KAFKA_KAFKA_SERVER_INTERCEPTOR_CLASS_NAME: "kafka.server.ursa.sdt.UrsaSDTInterceptor"
+
+x-kafka-service: &kafka-service
+  image: ${IMAGE:-kafka-diskless:latest}
+  restart: unless-stopped
+  depends_on:
+    oxia:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+    polaris-setup:
+      condition: service_completed_successfully
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1
+    interval: 5s
+    timeout: 10s
+    retries: 30
+    start_period: 30s
+
+services:
+  oxia:
+    image: ${OXIA_IMAGE:-oxia/oxia:0.16.7}
+    hostname: oxia
+    command: ["standalone", "--data-dir=/data", "--shards=8"]
+    entrypoint: ["/oxia/bin/oxia"]
+    ports:
+      - "127.0.0.1:6648:6648"
+    volumes:
+      - oxia-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8080/metrics || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    hostname: minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-04-16T18-13-26Z}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb local/kafka-ursa --ignore-existing
+        mc mb local/lakehouse --ignore-existing
+
+  polaris:
+    image: ${POLARIS_IMAGE:-apache/polaris:1.7.0}
+    hostname: polaris
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:18181:8181"
+      - "127.0.0.1:18182:8182"
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
+      polaris.realm-context.realms: POLARIS
+      quarkus.otel.sdk.disabled: "true"
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+      polaris.features."ALLOW_SETTING_S3_ENDPOINTS": "true"
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": '["S3"]'
+      # The stack intentionally uses Polaris' test-only in-memory metastore and
+      # an HTTP MinIO endpoint. Permit those dev-only readiness exceptions.
+      polaris.readiness.ignore-severe-issues: "true"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 3s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
+  polaris-setup:
+    image: ${POLARIS_SETUP_IMAGE:-alpine/curl:8.21.0}
+    depends_on:
+      polaris:
+        condition: service_healthy
+    environment:
+      POLARIS_CLIENT_ID: root
+      POLARIS_CLIENT_SECRET: s3cr3t
+      POLARIS_REALM: POLARIS
+      POLARIS_CATALOG_NAME: ursa
+      POLARIS_OAUTH2_URI: http://polaris:8181/api/catalog/v1/oauth/tokens
+      POLARIS_MANAGEMENT_URI: http://polaris:8181/api/management
+      POLARIS_WAREHOUSE: s3://lakehouse/warehouse
+      POLARIS_S3_ENDPOINT: http://minio:9000
+      AWS_REGION: us-east-1
+    volumes:
+      - ./lakehouse/polaris-setup.sh:/opt/ursa-demo/polaris-setup.sh:ro
+    entrypoint: ["/bin/sh", "/opt/ursa-demo/polaris-setup.sh"]
+
+  compactor:
+    image: ${COMPACTOR_IMAGE:-ursa-compact:lakehouse-e2e}
+    hostname: compactor
+    restart: unless-stopped
+    depends_on:
+      oxia:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      polaris-setup:
+        condition: service_completed_successfully
+    environment:
+      OTEL_SDK_DISABLED: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      URSA_METADATA_STORE_URL: oxia://oxia:6648/default
+      URSA_OXIA_STORAGE_URL: oxia://oxia:6648/default
+      URSA_WAL_BUCKET: kafka-ursa
+      URSA_WAL_PREFIX: ursa/wal
+      URSA_COMPACTION_BUCKET: kafka-ursa
+      URSA_COMPACTION_PREFIX: ursa/compacted
+      URSA_S3_ENDPOINT: http://minio:9000
+      POLARIS_CATALOG_NAME: ursa
+      POLARIS_CATALOG_URI: http://polaris:8181/api/catalog
+      POLARIS_OAUTH2_URI: http://polaris:8181/api/catalog/v1/oauth/tokens
+      POLARIS_CLIENT_ID: root
+      POLARIS_CLIENT_SECRET: s3cr3t
+    volumes:
+      - ./lakehouse/compactor-entrypoint.sh:/opt/ursa-demo/compactor-entrypoint.sh:ro
+      - ./lakehouse/log4j2.properties:/opt/ursa-demo/log4j2.properties:ro
+    entrypoint: ["/bin/sh", "/opt/ursa-demo/compactor-entrypoint.sh"]
+
+  kafka-1:
+    <<: *kafka-service
+    hostname: kafka-1
+    ports:
+      - "127.0.0.1:29092:9092"
+    environment:
+      <<: *kafka-environment
+      KAFKA_NODE_ID: "1"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-1:19092,PLAINTEXT_HOST://localhost:29092"
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+      - ./lakehouse/kafka-server.properties:/mnt/shared/config/server.properties:ro
+
+  kafka-2:
+    <<: *kafka-service
+    hostname: kafka-2
+    ports:
+      - "127.0.0.1:39092:9092"
+    environment:
+      <<: *kafka-environment
+      KAFKA_NODE_ID: "2"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-2:19092,PLAINTEXT_HOST://localhost:39092"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+      - ./lakehouse/kafka-server.properties:/mnt/shared/config/server.properties:ro
+
+  kafka-3:
+    <<: *kafka-service
+    hostname: kafka-3
+    ports:
+      - "127.0.0.1:49092:9092"
+    environment:
+      <<: *kafka-environment
+      KAFKA_NODE_ID: "3"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-3:19092,PLAINTEXT_HOST://localhost:49092"
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+      - ./lakehouse/kafka-server.properties:/mnt/shared/config/server.properties:ro
+
+  # DuckDB is an on-demand tool rather than a daemon. Start the stack, then run:
+  # docker compose -f docker-compose-lakehouse.yml --profile tools run --rm duckdb
+  duckdb:
+    image: ${DUCKDB_IMAGE:-duckdb/duckdb:1.5.5}
+    profiles: ["tools"]
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./lakehouse/duckdb-init.sql:/opt/ursa-demo/duckdb-init.sql:ro
+      - duckdb-extensions:/root/.duckdb
+    entrypoint: ["/duckdb", "-init", "/opt/ursa-demo/duckdb-init.sql"]
+
+volumes:
+  oxia-data:
+  minio-data:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+  duckdb-extensions:
