@@ -279,12 +279,11 @@ public class UrsaSDTInterceptorE2ETest {
         Awaitility.await().atMost(Duration.ofSeconds(60))
             .pollInterval(Duration.ofSeconds(5))
             .untilAsserted(() -> {
-                var tasks = taskManager.getFirstNTasksOfTopic(10).get();
-                var topics = tasks.keySet();
                 for (int i = 0; i < partitions; i++) {
                     var topicName = taskTopicName(currentTopic, topicId, i);
-                    assertTrue(topics.contains(topicName), "Compaction task for partition " + i + " is not found");
-                    var tasksInTopic = new ArrayList<CompactStreamTask>(tasks.get(topicName));
+                    var tasksInTopic = tasksForTopic(topicName);
+                    assertFalse(tasksInTopic.isEmpty(),
+                        "Compaction task for partition " + i + " is not found");
                     assertEquals(1, tasksInTopic.size(),
                         String.format("There should be only one compaction task for %s, tasks %s", topicName,
                             Arrays.toString(tasksInTopic.toArray())));
@@ -325,10 +324,8 @@ public class UrsaSDTInterceptorE2ETest {
         Awaitility.await().atMost(Duration.ofSeconds(60))
             .pollInterval(Duration.ofSeconds(3))
             .untilAsserted(() -> {
-                var tasks = taskManager.getFirstNTasksOfTopic(10).get();
-                assertFalse(tasks.isEmpty());
                 var topicName = taskTopicName(currentTopic, topicId, 0);
-                var tasksInTopic = new ArrayList<>(tasks.get(topicName));
+                var tasksInTopic = tasksForTopic(topicName);
                 assertEquals(1, tasksInTopic.size());
                 var task = tasksInTopic.get(0);
                 assertEquals(topicName, task.getTopic());
@@ -356,9 +353,8 @@ public class UrsaSDTInterceptorE2ETest {
         Awaitility.await().atMost(Duration.ofSeconds(60))
             .pollInterval(Duration.ofSeconds(3))
             .untilAsserted(() -> {
-                var tasks = taskManager.getFirstNTasksOfTopic(10).get();
                 var topicName = taskTopicName(currentTopic, topicId, 0);
-                var tasksInTopic = new ArrayList<>(tasks.get(topicName));
+                var tasksInTopic = tasksForTopic(topicName);
                 assertEquals(2, tasksInTopic.size());
                 var task = tasksInTopic.get(tasksInTopic.size() - 1);
                 assertEquals(topicName, task.getTopic());
