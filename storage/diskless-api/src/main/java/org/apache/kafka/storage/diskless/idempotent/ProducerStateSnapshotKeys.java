@@ -24,6 +24,8 @@ import org.apache.kafka.storage.diskless.DisklessClientZone;
 public final class ProducerStateSnapshotKeys {
 
     private static final String SNAPSHOT_PREFIX = "producer-state-snapshot/";
+    private static final String DELETED_TOPIC_PREFIX = "producer-state-snapshot-deleted/";
+    private static final String TOPIC_INDEX_NAME = "producer-state-snapshot-topic";
 
     private ProducerStateSnapshotKeys() {
     }
@@ -35,6 +37,25 @@ public final class ProducerStateSnapshotKeys {
     /** Prefix shared by every unzoned and zoned snapshot for one exact topic incarnation. */
     public static String topicSnapshotPrefix(String topicId) {
         return SNAPSHOT_PREFIX + topicId + "-";
+    }
+
+    /** Durable marker that prevents a deleted topic incarnation from recreating snapshots. */
+    public static String deletedTopicMarkerKey(String topicId) {
+        return DELETED_TOPIC_PREFIX + topicId;
+    }
+
+    /** Oxia secondary index used to enumerate snapshots for one topic without a namespace scan. */
+    public static String topicIndexName() {
+        return TOPIC_INDEX_NAME;
+    }
+
+    public static String topicIndexKey(String topicId) {
+        return topicId;
+    }
+
+    /** Exclusive upper bound that includes every entry with the exact topic ID index key. */
+    public static String topicIndexEndExclusive(String topicId) {
+        return topicId + '\uffff';
     }
 
     public static String snapshotKey(String topicId, int partition, String zone) {

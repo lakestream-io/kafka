@@ -43,12 +43,14 @@ import io.lakestream.api.LogOffset;
 import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
+import io.oxia.client.api.AsyncOxiaClient;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -142,6 +144,144 @@ class UrsaStorageStateTest {
 
             assertTrue(state.cleanupPartition(tp, false));
             verify(zoneAManager).cleanup(false);
+        }
+    }
+
+    @Test
+    void testStateCloseWaitsForPreviouslyStartedProducerStateCleanup() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("close-drain-topic", 0));
+        CompletableFuture<Void> cleanupGate = new CompletableFuture<>();
+        CountDownLatch cleanupStarted = new CountDownLatch(1);
+        ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
+        when(producerStateManager.cleanup(false)).thenAnswer(invocation -> {
+            cleanupStarted.countDown();
+            return cleanupGate;
+        });
+        StreamCatalog catalog = mockCatalogWithLog(mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
+        when(catalog.streamExists(any())).thenReturn(CompletableFuture.completedFuture(false));
+        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
+        doAnswer(invocation -> {
+            assertTrue(cleanupGate.isDone(), "Oxia client closed before producer-state cleanup completed");
+            return null;
+        }).when(oxiaClient).close();
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, oxiaClient);
+        UrsaStorageState state = new UrsaStorageState(
+                Time.SYSTEM,
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                holder,
+                Map.of(),
+                null);
+
+        try {
+            UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
+            partitionLog.installProducerStateManager(DisklessClientZone.NO_ZONE, producerStateManager);
+            assertTrue(state.cleanupPartition(tp, false));
+            assertTrue(state.snapshotTrackedPartitions().isEmpty());
+            assertTrue(cleanupStarted.await(5, TimeUnit.SECONDS));
+
+            CompletableFuture<Void> closeFuture = CompletableFuture.runAsync(() -> {
+                try {
+                    state.close();
+                } catch (Exception error) {
+                    throw new RuntimeException(error);
+                }
+            });
+
+            assertFalse(closeFuture.isDone());
+            verify(oxiaClient, never()).close();
+            cleanupGate.complete(null);
+            closeFuture.get(5, TimeUnit.SECONDS);
+            verify(oxiaClient).close();
+        } finally {
+            cleanupGate.complete(null);
+            state.close();
+        }
+    }
+
+    @Test
+    void testStateCloseReleasesResourcesAfterProducerStateCleanupFailure() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("close-failure-topic", 0));
+        ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
+        when(producerStateManager.cleanup(false))
+                .thenReturn(CompletableFuture.failedFuture(new RuntimeException("cleanup failed")));
+        StreamCatalog catalog = mockCatalogWithLog(mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
+        when(catalog.streamExists(any())).thenReturn(CompletableFuture.completedFuture(false));
+        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, oxiaClient);
+        UrsaStorageState state = new UrsaStorageState(
+                Time.SYSTEM,
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                holder,
+                Map.of(),
+                null);
+
+        UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
+        partitionLog.installProducerStateManager(DisklessClientZone.NO_ZONE, producerStateManager);
+
+        state.close();
+
+        verify(producerStateManager).cleanup(false);
+        verify(oxiaClient).close();
+        verify(catalog).close();
+    }
+
+    @Test
+    void testGetOrCreatePartitionLogIsRejectedAfterStateClose() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("closed-state-topic", 0));
+        StreamCatalog catalog = mock(StreamCatalog.class);
+        UrsaStorageState state = newState(catalog);
+
+        state.close();
+
+        assertThrows(IllegalStateException.class, () -> state.getOrCreatePartitionLog(tp));
+        assertTrue(state.snapshotTrackedPartitions().isEmpty());
+        verify(catalog, never()).openExternalPartition(any(), anyInt(), any());
+    }
+
+    @Test
+    void testStateCloseDrainsPartitionLogCreationAlreadyInProgress() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("closing-state-topic", 0));
+        CountDownLatch openStarted = new CountDownLatch(1);
+        CountDownLatch allowOpen = new CountDownLatch(1);
+        CountDownLatch closeStarted = new CountDownLatch(1);
+        Log logInstance = mockLog(0L, 0L, 1, 10L, 10, 10L, 10);
+        StreamCatalog catalog = mock(StreamCatalog.class);
+        when(catalog.openExternalPartition(any(), anyInt(), any())).thenAnswer(invocation -> {
+            openStarted.countDown();
+            assertTrue(allowOpen.await(5, TimeUnit.SECONDS));
+            return CompletableFuture.completedFuture(logInstance);
+        });
+        UrsaStorageState state = newState(catalog);
+
+        try {
+            CompletableFuture<UrsaPartitionLog> createFuture = CompletableFuture.supplyAsync(
+                    () -> state.getOrCreatePartitionLog(tp));
+            assertTrue(openStarted.await(5, TimeUnit.SECONDS));
+
+            CompletableFuture<Void> closeFuture = CompletableFuture.runAsync(() -> {
+                closeStarted.countDown();
+                try {
+                    state.close();
+                } catch (Exception error) {
+                    throw new RuntimeException(error);
+                }
+            });
+            assertTrue(closeStarted.await(5, TimeUnit.SECONDS));
+            assertFalse(closeFuture.isDone());
+
+            allowOpen.countDown();
+            assertNotNull(createFuture.get(5, TimeUnit.SECONDS));
+            closeFuture.get(5, TimeUnit.SECONDS);
+
+            assertTrue(state.snapshotTrackedPartitions().isEmpty());
+            verify(logInstance).close();
+        } finally {
+            allowOpen.countDown();
+            state.close();
         }
     }
 

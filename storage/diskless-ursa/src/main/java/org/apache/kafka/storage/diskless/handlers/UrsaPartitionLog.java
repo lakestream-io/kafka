@@ -108,7 +108,10 @@ final class UrsaPartitionLog {
         this.initFuture = createInitFuture(logFuture);
     }
 
-    ProducerStateManager getOrCreateProducerStateManager(String zone) {
+    synchronized ProducerStateManager getOrCreateProducerStateManager(String zone) {
+        if (closed) {
+            throw ownershipLostException();
+        }
         return producerStateManagers.computeIfAbsent(zone, zoneId -> new ProducerStateManager(
                 topicIdPartition,
                 oxiaClientSupplier,
@@ -119,7 +122,10 @@ final class UrsaPartitionLog {
                 producerStateScheduler));
     }
 
-    void installProducerStateManager(String zone, ProducerStateManager producerStateManager) {
+    synchronized void installProducerStateManager(String zone, ProducerStateManager producerStateManager) {
+        if (closed) {
+            throw ownershipLostException();
+        }
         producerStateManagers.put(zone, producerStateManager);
     }
 
@@ -1141,16 +1147,24 @@ final class UrsaPartitionLog {
         return closeFetchCursorPool() || cleaned;
     }
 
-    private boolean cleanupProducerState(String zone, boolean deletePartition) {
-        ProducerStateManager producerStateManager = producerStateManagers.remove(zone);
+    private synchronized boolean cleanupProducerState(String zone, boolean deletePartition) {
+        ProducerStateManager producerStateManager = producerStateManagers.get(zone);
         if (producerStateManager == null) {
             return false;
         }
 
-        producerStateManager.cleanup(deletePartition).exceptionally(error -> {
-            log.warn("Failed to cleanup producer state manager for partition {} and zone {}",
-                    topicIdPartition, zone, error);
-            return null;
+        Optional<CompletableFuture<Void>> cleanupFuture = state.startProducerStateCleanup(() -> {
+            producerStateManagers.remove(zone, producerStateManager);
+            return producerStateManager.cleanup(deletePartition);
+        });
+        if (cleanupFuture.isEmpty()) {
+            return false;
+        }
+        cleanupFuture.orElseThrow().whenComplete((ignored, error) -> {
+            if (error != null) {
+                log.warn("Failed to cleanup producer state manager for partition {} and zone {}",
+                        topicIdPartition, zone, error);
+            }
         });
         return true;
     }

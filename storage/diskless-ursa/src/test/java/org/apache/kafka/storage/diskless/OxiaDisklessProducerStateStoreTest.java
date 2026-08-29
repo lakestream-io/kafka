@@ -21,42 +21,65 @@ import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import io.oxia.client.api.AsyncOxiaClient;
+import io.oxia.client.api.PutResult;
+import io.oxia.client.api.options.ListOption;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 class OxiaDisklessProducerStateStoreTest {
 
     @Test
-    void testDeleteTopicSnapshotsCoversUnzonedAndZonedKeys() throws Exception {
+    void testDeleteTopicSnapshotsFiltersAndDeletesKeysAtAnyDepth() throws Exception {
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
-        String prefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId.toString());
-        String rangeEnd = prefix + '\uffff';
+        String topicPrefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId.toString());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
+        String unzonedKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 0);
+        String zonedKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 1, "rack/region/zone");
+        String otherTopicKey = ProducerStateSnapshotKeys.snapshotKey(
+                Uuid.fromString("VkZ5AkuESPGkMc2OxpKUjw").toString(), 0, "rack/region/zone");
+        String malformedTopicScopedKey = topicPrefix + "metadata";
         AsyncOxiaClient client = mock(AsyncOxiaClient.class);
-        when(client.deleteRange(prefix, rangeEnd)).thenReturn(CompletableFuture.completedFuture(null));
+        when(client.put(eq(deletedTopicMarkerKey), any(byte[].class)))
+                .thenReturn(CompletableFuture.completedFuture(mock(PutResult.class)));
+        when(client.deleteRange(topicPrefix, topicPrefix + '\uffff'))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(client.list(
+                ProducerStateSnapshotKeys.topicIndexKey(topicId.toString()),
+                ProducerStateSnapshotKeys.topicIndexEndExclusive(topicId.toString()),
+                Set.of(ListOption.UseIndex(ProducerStateSnapshotKeys.topicIndexName()))))
+                .thenReturn(CompletableFuture.completedFuture(
+                        List.of(unzonedKey, otherTopicKey, malformedTopicScopedKey, zonedKey)))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+        when(client.delete(unzonedKey)).thenReturn(CompletableFuture.completedFuture(true));
+        when(client.delete(zonedKey)).thenReturn(CompletableFuture.completedFuture(true));
 
         try (OxiaDisklessProducerStateStore store = new OxiaDisklessProducerStateStore(client)) {
             store.deleteTopicSnapshots(topicId).get();
         }
 
-        String unzonedKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 3);
-        String zonedKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 3, "us-west-2a");
-        String otherTopicKey = ProducerStateSnapshotKeys.snapshotKey(
-                Uuid.fromString("VkZ5AkuESPGkMc2OxpKUjw").toString(), 3, "us-west-2a");
-        assertTrue(inRange(unzonedKey, prefix, rangeEnd));
-        assertTrue(inRange(zonedKey, prefix, rangeEnd));
-        assertFalse(inRange(otherTopicKey, prefix, rangeEnd));
-        verify(client).deleteRange(prefix, rangeEnd);
+        verify(client).put(eq(deletedTopicMarkerKey), any(byte[].class));
+        verify(client).deleteRange(topicPrefix, topicPrefix + '\uffff');
+        verify(client, times(2)).list(
+                ProducerStateSnapshotKeys.topicIndexKey(topicId.toString()),
+                ProducerStateSnapshotKeys.topicIndexEndExclusive(topicId.toString()),
+                Set.of(ListOption.UseIndex(ProducerStateSnapshotKeys.topicIndexName())));
+        verify(client).delete(unzonedKey);
+        verify(client).delete(zonedKey);
+        verify(client, never()).delete(otherTopicKey);
+        verify(client, never()).delete(malformedTopicScopedKey);
         verify(client).close();
-    }
-
-    private static boolean inRange(String key, String startInclusive, String endExclusive) {
-        return key.compareTo(startInclusive) >= 0 && key.compareTo(endExclusive) < 0;
+        verifyNoMoreInteractions(client);
     }
 }

@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.SimpleRecord;
@@ -63,6 +64,33 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class UrsaLakestreamWriterIdempotentTest {
+
+    @Test
+    void testProducerSnapshotOwnershipLossInvalidatesPartition() throws Exception {
+        TopicIdPartition tp = testTopicPartition(0);
+        Log logInstance = emptyLog();
+        ProducerStateManager producerStateManager = spy(newProducerStateManager(tp, logInstance));
+        doAnswer(invocation -> CompletableFuture.failedFuture(
+                new NotLeaderOrFollowerException("producer snapshot ownership lost")))
+                .when(producerStateManager).prepareAppend(any());
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        UrsaPartitionLog partitionLog = attachPartitionLog(state, tp, logInstance);
+        partitionLog.installProducerStateManager(DisklessClientZone.NO_ZONE, producerStateManager);
+        UrsaLakestreamWriter writer = new UrsaLakestreamWriter(state);
+
+        try {
+            PartitionResponse response = writer.write(
+                    Map.of(tp, idempotentRecords(4_444L, 0, "fenced")),
+                    DisklessClientZone.NO_ZONE).get(5, TimeUnit.SECONDS).get(tp);
+
+            assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, response.error);
+            verify(state).removePartitionLog(tp, partitionLog);
+            verify(logInstance, never()).append(anyInt(), any(ByteBuf.class));
+        } finally {
+            producerStateManager.close();
+            writer.close();
+        }
+    }
 
     @Test
     void testQueuedWriteDoesNotPrepareOrAppendAfterPartitionClose() throws Exception {

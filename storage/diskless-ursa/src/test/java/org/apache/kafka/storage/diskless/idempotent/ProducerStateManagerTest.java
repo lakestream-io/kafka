@@ -20,25 +20,32 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.SimpleRecord;
+import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.storage.diskless.handlers.KafkaRecordsPayload;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import io.lakestream.api.Log;
 import io.lakestream.api.LogCursor;
@@ -49,6 +56,11 @@ import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.Version;
+import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
+import io.oxia.client.api.exceptions.UnexpectedVersionIdException;
+import io.oxia.client.api.options.DeleteOption;
+import io.oxia.client.api.options.PutOption;
+import io.oxia.client.api.options.defs.OptionVersionId;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -59,11 +71,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -192,6 +207,8 @@ class ProducerStateManagerTest {
                 ready(manager1.prepareAppend(List.of(batch(1L, (short) 0, 0, 1, 2, 1000L))).get());
             manager1.completeAppend(firstPending, 0L, 1000L);
             manager1.takeSnapshot("test").get();
+            assertTrue(snapshotStore.data().containsKey(
+                    ProducerStateSnapshotKeys.snapshotKey(tp.topicId().toString(), tp.partition())));
 
             LogEntry firstReplayEntry = newReplayEntry(1L, (short) 0, 2, "r2", 2L, 1);
             LogEntry secondReplayEntry = newReplayEntry(1L, (short) 0, 3, "r3", 3L, 1);
@@ -209,6 +226,528 @@ class ProducerStateManagerTest {
             if (manager2 != null) {
                 manager2.close();
             }
+        }
+    }
+
+    @Test
+    void testCleanupWaitsForInFlightSnapshotBeforeDeleting() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            manager.completeAppend(pendingAppend, 0L, 1000L);
+
+            CompletableFuture<GetResult> pendingMarkerRead = new CompletableFuture<>();
+            snapshotStore.queueGet(deletedTopicMarkerKey, pendingMarkerRead);
+            CompletableFuture<Void> snapshotFuture = manager.takeSnapshot("test");
+            CompletableFuture<Void> cleanupFuture = manager.cleanup(true);
+
+            assertFalse(snapshotFuture.isDone());
+            assertFalse(cleanupFuture.isDone());
+            assertTrue(snapshotStore.data().containsKey(snapshotKey));
+
+            pendingMarkerRead.complete(null);
+            cleanupFuture.get();
+
+            assertFalse(snapshotStore.data().containsKey(snapshotKey));
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
+    void testCleanupWithoutDeletePersistsFinalSnapshot() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(
+                tp.topicId().toString(), tp.partition());
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+
+        ProducerStateManager.PendingAppend append = ready(manager.prepareAppend(List.of(
+                batch(1L, (short) 0, 0, 0, 1, 1000L)
+        )).get());
+        manager.completeAppend(append, 0L, 1000L);
+
+        manager.cleanup(false).get();
+
+        assertEquals(0,
+                ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).get(1L).lastSequence());
+        verify(snapshotStore.client(), never()).delete(snapshotKey);
+        verify(snapshotStore.client(), never()).delete(eq(snapshotKey), anySet());
+    }
+
+    @Test
+    void testCleanupWithoutDeleteDrainsCoalescedFinalSnapshot() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+
+        ProducerStateManager.PendingAppend firstAppend = ready(manager.prepareAppend(List.of(
+                batch(1L, (short) 0, 0, 0, 1, 1000L)
+        )).get());
+        manager.completeAppend(firstAppend, 0L, 1000L);
+        CompletableFuture<GetResult> delayedMarkerRead = new CompletableFuture<>();
+        snapshotStore.queueGet(deletedTopicMarkerKey, delayedMarkerRead);
+        CompletableFuture<Void> firstSnapshot = manager.takeSnapshot("first");
+
+        ProducerStateManager.PendingAppend secondAppend = ready(manager.prepareAppend(List.of(
+                batch(1L, (short) 0, 1, 1, 1, 2000L)
+        )).get());
+        manager.completeAppend(secondAppend, 1L, 2000L);
+        CompletableFuture<Void> cleanupFuture = manager.cleanup(false);
+
+        assertFalse(firstSnapshot.isDone());
+        assertFalse(cleanupFuture.isDone());
+        delayedMarkerRead.complete(null);
+        cleanupFuture.get();
+
+        assertEquals(1,
+                ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).get(1L).lastSequence());
+        verify(snapshotStore.client(), never()).delete(snapshotKey);
+        verify(snapshotStore.client(), never()).delete(eq(snapshotKey), anySet());
+    }
+
+    @Test
+    void testCleanupWithoutDeleteWaitsForRecoveryClaimAndRetainsSnapshot() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(
+                tp.topicId().toString(), tp.partition());
+        byte[] snapshot = ProducerStateSerDes.emptySnapshot();
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        snapshotStore.storeValue(snapshotKey, snapshot, 1L);
+        CompletableFuture<PutResult> claimGate = new CompletableFuture<>();
+        snapshotStore.queuePut(snapshotKey, claimGate);
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+
+        CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                batch(1L, (short) 0, 0, 0, 1, 1000L)
+        ));
+        verify(snapshotStore.client(), timeout(5_000))
+                .put(eq(snapshotKey), any(byte[].class), anySet());
+
+        CompletableFuture<Void> cleanupFuture = manager.cleanup(false);
+        assertFalse(cleanupFuture.isDone(), "Cleanup must drain the in-flight recovery claim");
+
+        snapshotStore.storeValue(snapshotKey, snapshot, 2L);
+        claimGate.complete(new PutResult(snapshotKey, InMemorySnapshotStore.version(2L)));
+        cleanupFuture.get();
+
+        assertTrue(snapshotStore.data().containsKey(snapshotKey));
+        ExecutionException prepareError = assertThrows(ExecutionException.class, prepareFuture::get);
+        assertInstanceOf(IllegalStateException.class, prepareError.getCause());
+        verify(snapshotStore.client(), never()).delete(eq(snapshotKey), anySet());
+    }
+
+    @Test
+    void testCleanupWithoutDeleteRemovesLateClaimAfterTopicDeletion() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        byte[] snapshot = ProducerStateSerDes.emptySnapshot();
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        CompletableFuture<PutResult> claimGate = new CompletableFuture<>();
+        snapshotStore.queuePut(snapshotKey, claimGate);
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+
+        CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                batch(1L, (short) 0, 0, 0, 1, 1000L)
+        ));
+        verify(snapshotStore.client(), timeout(5_000))
+                .put(eq(snapshotKey), any(byte[].class), anySet());
+
+        CompletableFuture<Void> cleanupFuture = manager.cleanup(false);
+        assertFalse(cleanupFuture.isDone(), "Cleanup must drain the in-flight recovery claim");
+
+        snapshotStore.storeValue(deletedTopicMarkerKey, new byte[] {1}, 1L);
+        snapshotStore.storeValue(snapshotKey, snapshot, 2L);
+        claimGate.complete(new PutResult(snapshotKey, InMemorySnapshotStore.version(2L)));
+        cleanupFuture.get();
+
+        assertFalse(snapshotStore.data().containsKey(snapshotKey));
+        assertTrue(snapshotStore.data().containsKey(deletedTopicMarkerKey));
+        ExecutionException prepareError = assertThrows(ExecutionException.class, prepareFuture::get);
+        assertInstanceOf(IllegalStateException.class, prepareError.getCause());
+        verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
+    }
+
+    @Test
+    void testCleanupWithDeleteWaitsForRecoveryClaimAndDeletesOwnedSnapshot() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(
+                tp.topicId().toString(), tp.partition());
+        byte[] snapshot = ProducerStateSerDes.emptySnapshot();
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        snapshotStore.storeValue(snapshotKey, snapshot, 1L);
+        CompletableFuture<PutResult> claimGate = new CompletableFuture<>();
+        snapshotStore.queuePut(snapshotKey, claimGate);
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+
+        CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                batch(1L, (short) 0, 0, 0, 1, 1000L)
+        ));
+        verify(snapshotStore.client(), timeout(5_000))
+                .put(eq(snapshotKey), any(byte[].class), anySet());
+
+        CompletableFuture<Void> cleanupFuture = manager.cleanup(true);
+        assertFalse(cleanupFuture.isDone(), "Cleanup must drain the in-flight recovery claim");
+
+        snapshotStore.storeValue(snapshotKey, snapshot, 2L);
+        claimGate.complete(new PutResult(snapshotKey, InMemorySnapshotStore.version(2L)));
+        cleanupFuture.get();
+
+        assertFalse(snapshotStore.data().containsKey(snapshotKey));
+        ExecutionException prepareError = assertThrows(ExecutionException.class, prepareFuture::get);
+        assertInstanceOf(IllegalStateException.class, prepareError.getCause());
+        verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
+    }
+
+    @Test
+    void testSnapshotDeletesItselfWhenTopicDeletionRacesWithWrite() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            manager.completeAppend(pendingAppend, 0L, 1000L);
+
+            snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.completedFuture(null));
+            snapshotStore.queueGet(
+                    deletedTopicMarkerKey, CompletableFuture.completedFuture(mock(GetResult.class)));
+            manager.takeSnapshot("test").get();
+
+            assertFalse(snapshotStore.data().containsKey(snapshotKey));
+            verify(snapshotStore.client(), never()).delete(snapshotKey);
+            verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
+    void testSnapshotDeletesItselfWhenPostWriteMarkerCheckFails() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        RuntimeException markerFailure = new RuntimeException("marker read failed");
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            manager.completeAppend(pendingAppend, 0L, 1000L);
+
+            snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.completedFuture(null));
+            snapshotStore.queueGet(
+                    deletedTopicMarkerKey, CompletableFuture.failedFuture(markerFailure));
+            ExecutionException error = assertThrows(
+                    ExecutionException.class, () -> manager.takeSnapshot("test").get());
+
+            assertSame(markerFailure, error.getCause());
+            assertFalse(snapshotStore.data().containsKey(snapshotKey));
+            verify(snapshotStore.client(), never()).delete(snapshotKey);
+            verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
+            manager.cleanup(true).get();
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
+    void testAmbiguousSnapshotPutFencesOwnershipWithoutDeleting() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        RuntimeException ambiguousPutFailure = new RuntimeException("put outcome is unknown");
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            manager.completeAppend(pendingAppend, 0L, 1000L);
+
+            snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.completedFuture(null));
+            snapshotStore.queuePut(snapshotKey, CompletableFuture.failedFuture(ambiguousPutFailure));
+            ExecutionException error = assertThrows(
+                    ExecutionException.class, () -> manager.takeSnapshot("test").get());
+
+            assertSame(ambiguousPutFailure, error.getCause());
+            assertTrue(ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).isEmpty());
+            verify(snapshotStore.client(), never()).delete(snapshotKey);
+            verify(snapshotStore.client(), never()).delete(eq(snapshotKey), anySet());
+
+            ExecutionException fencedError = assertThrows(
+                    ExecutionException.class, () -> manager.takeSnapshot("after-fence").get());
+            assertInstanceOf(IllegalStateException.class, fencedError.getCause());
+
+            ExecutionException appendError = assertThrows(
+                    ExecutionException.class, () -> manager.prepareAppend(List.of(
+                            batch(1L, (short) 0, 1, 1, 1, 2000L)
+                    )).get());
+            assertInstanceOf(NotLeaderOrFollowerException.class, appendError.getCause());
+            manager.cleanup(true).get();
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
+    void testPeriodicSnapshotStartsOnlyAfterRecoveryClaimCompletes() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(
+                tp.topicId().toString(), tp.partition());
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        CompletableFuture<PutResult> claimGate = new CompletableFuture<>();
+        snapshotStore.queuePut(snapshotKey, claimGate);
+        ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+        ScheduledFuture<?> periodicTask = mock(ScheduledFuture.class);
+        doAnswer(invocation -> periodicTask).when(scheduler).scheduleAtFixedRate(
+                any(Runnable.class), anyLong(), anyLong(), eq(TimeUnit.MILLISECONDS));
+        ProducerStateManager manager = new ProducerStateManager(
+                tp,
+                snapshotStore::client,
+                emptyLogSupplier()::get,
+                DisklessClientZone.NO_ZONE,
+                ProducerStateManager.DEFAULT_SNAPSHOT_INTERVAL_MS,
+                ProducerStateManager.DEFAULT_SNAPSHOT_RECORD_THRESHOLD,
+                scheduler);
+        try {
+            CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            ));
+
+            verify(scheduler, never()).scheduleAtFixedRate(
+                    any(Runnable.class), anyLong(), anyLong(), eq(TimeUnit.MILLISECONDS));
+            snapshotStore.storeValue(snapshotKey, ProducerStateSerDes.emptySnapshot(), 1L);
+            claimGate.complete(new PutResult(snapshotKey, InMemorySnapshotStore.version(1L)));
+
+            assertInstanceOf(ProducerStateManager.Ready.class, prepareFuture.get());
+            verify(scheduler).scheduleAtFixedRate(
+                    any(Runnable.class),
+                    eq(ProducerStateManager.DEFAULT_SNAPSHOT_INTERVAL_MS),
+                    eq(ProducerStateManager.DEFAULT_SNAPSHOT_INTERVAL_MS),
+                    eq(TimeUnit.MILLISECONDS));
+        } finally {
+            manager.cleanup(true).get();
+        }
+    }
+
+    @Test
+    void testOwnershipLossCancelsPeriodicSnapshotTask() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        ScheduledExecutorService scheduler = mock(ScheduledExecutorService.class);
+        ScheduledFuture<?> periodicTask = mock(ScheduledFuture.class);
+        ArgumentCaptor<Runnable> periodicTaskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        doAnswer(invocation -> periodicTask).when(scheduler).scheduleAtFixedRate(
+                any(Runnable.class), anyLong(), anyLong(), eq(TimeUnit.MILLISECONDS));
+        ProducerStateManager manager = new ProducerStateManager(
+                tp,
+                snapshotStore::client,
+                emptyLogSupplier()::get,
+                DisklessClientZone.NO_ZONE,
+                ProducerStateManager.DEFAULT_SNAPSHOT_INTERVAL_MS,
+                ProducerStateManager.DEFAULT_SNAPSHOT_RECORD_THRESHOLD,
+                scheduler);
+        try {
+            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            manager.completeAppend(pendingAppend, 0L, 1000L);
+            verify(scheduler).scheduleAtFixedRate(
+                    periodicTaskCaptor.capture(),
+                    eq(ProducerStateManager.DEFAULT_SNAPSHOT_INTERVAL_MS),
+                    eq(ProducerStateManager.DEFAULT_SNAPSHOT_INTERVAL_MS),
+                    eq(TimeUnit.MILLISECONDS));
+
+            snapshotStore.queueGet(
+                    deletedTopicMarkerKey, CompletableFuture.completedFuture(mock(GetResult.class)));
+            periodicTaskCaptor.getValue().run();
+
+            verify(periodicTask).cancel(false);
+            verify(snapshotStore.client(), times(3)).get(deletedTopicMarkerKey);
+
+            periodicTaskCaptor.getValue().run();
+            verify(snapshotStore.client(), times(3)).get(deletedTopicMarkerKey);
+        } finally {
+            manager.cleanup(true).get();
+        }
+    }
+
+    @Test
+    void testSlowSnapshotCoalescesThresholdRequestsAndKeepsLatestState() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        ProducerStateManager manager = new ProducerStateManager(
+                tp,
+                snapshotStore::client,
+                emptyLogSupplier()::get,
+                DisklessClientZone.NO_ZONE,
+                0L,
+                1,
+                scheduler);
+        try {
+            ProducerStateManager.PendingAppend firstAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            CompletableFuture<GetResult> pendingMarkerRead = new CompletableFuture<>();
+            snapshotStore.queueGet(deletedTopicMarkerKey, pendingMarkerRead);
+            manager.completeAppend(firstAppend, 0L, 1000L);
+
+            for (int sequence = 1; sequence <= 100; sequence++) {
+                ProducerStateManager.PendingAppend append = ready(manager.prepareAppend(List.of(
+                        batch(1L, (short) 0, sequence, sequence, 1, 1000L + sequence)
+                )).get());
+                manager.completeAppend(append, sequence, 1000L + sequence);
+            }
+            CompletableFuture<Void> latestSnapshot = manager.takeSnapshot("latest");
+            assertSame(latestSnapshot, manager.takeSnapshot("also-latest"));
+
+            verify(snapshotStore.client()).put(eq(snapshotKey), any(byte[].class), anySet());
+            assertFalse(latestSnapshot.isDone());
+
+            pendingMarkerRead.complete(null);
+            latestSnapshot.get();
+
+            ArgumentCaptor<byte[]> payloadCaptor = ArgumentCaptor.forClass(byte[].class);
+            verify(snapshotStore.client(), times(3))
+                    .put(eq(snapshotKey), payloadCaptor.capture(), anySet());
+            List<byte[]> payloads = payloadCaptor.getAllValues();
+            assertTrue(ProducerStateSerDes.deserialize(payloads.get(0)).isEmpty());
+            assertEquals(0, ProducerStateSerDes.deserialize(payloads.get(1)).get(1L).lastSequence());
+            assertEquals(100, ProducerStateSerDes.deserialize(payloads.get(2)).get(1L).lastSequence());
+            manager.cleanup(true).get();
+        } finally {
+            manager.close();
+            scheduler.shutdownNow();
+        }
+    }
+
+    @Test
+    void testNewManagerClaimFencesQueuedWriteFromOldManager() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        ProducerStateManager oldManager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        ProducerStateManager newManager = null;
+        try {
+            ProducerStateManager.PendingAppend oldAppend = ready(oldManager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            oldManager.completeAppend(oldAppend, 0L, 1000L);
+
+            CompletableFuture<GetResult> delayedOldMarkerRead = new CompletableFuture<>();
+            snapshotStore.queueGet(deletedTopicMarkerKey, delayedOldMarkerRead);
+            CompletableFuture<Void> oldSnapshot = oldManager.takeSnapshot("old-owner");
+
+            newManager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+            ProducerStateManager.PrepareResult newOwnerResult = newManager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 1, 1, 1, 2000L)
+            )).get();
+            assertInstanceOf(ProducerStateManager.OutOfOrderSequence.class, newOwnerResult);
+
+            delayedOldMarkerRead.complete(null);
+            ExecutionException oldWriteError = assertThrows(ExecutionException.class, oldSnapshot::get);
+            assertInstanceOf(UnexpectedVersionIdException.class, oldWriteError.getCause());
+            assertTrue(ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).isEmpty());
+
+            ExecutionException fencedError = assertThrows(
+                    ExecutionException.class, () -> oldManager.takeSnapshot("old-owner-again").get());
+            assertInstanceOf(IllegalStateException.class, fencedError.getCause());
+        } finally {
+            oldManager.cleanup(true).get();
+            if (newManager != null) {
+                newManager.cleanup(true).get();
+            }
+        }
+    }
+
+    @Test
+    void testClaimConflictRereadsAndRetries() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        CompletableFuture<PutResult> conflictingClaim = new CompletableFuture<>();
+        snapshotStore.queuePut(snapshotKey, conflictingClaim);
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            ));
+            snapshotStore.data().put(snapshotKey, ProducerStateSerDes.emptySnapshot());
+            conflictingClaim.completeExceptionally(new KeyAlreadyExistsException(snapshotKey));
+
+            ProducerStateManager.PendingAppend append = ready(prepareFuture.get());
+            manager.completeAppend(append, 0L, 1000L);
+            manager.takeSnapshot("after-claim-retry").get();
+
+            assertEquals(0,
+                    ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).get(1L).lastSequence());
+            verify(snapshotStore.client(), times(3))
+                    .put(eq(snapshotKey), any(byte[].class), anySet());
+        } finally {
+            manager.cleanup(true).get();
+        }
+    }
+
+    @Test
+    void testClaimDeletesOnlyItsOwnVersionWhenTopicDeletionRaces() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        CompletableFuture<GetResult> delayedSnapshotRead = new CompletableFuture<>();
+        snapshotStore.queueGet(snapshotKey, delayedSnapshotRead);
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            ));
+            snapshotStore.data().put(deletedTopicMarkerKey, new byte[] {1});
+            delayedSnapshotRead.complete(null);
+
+            ExecutionException recoveryError = assertThrows(ExecutionException.class, prepareFuture::get);
+            assertInstanceOf(IllegalStateException.class, recoveryError.getCause());
+            assertFalse(snapshotStore.data().containsKey(snapshotKey));
+            assertTrue(snapshotStore.data().containsKey(deletedTopicMarkerKey));
+            verify(snapshotStore.client(), never()).delete(snapshotKey);
+            verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
+        } finally {
+            manager.close();
         }
     }
 
@@ -743,31 +1282,114 @@ class ProducerStateManagerTest {
     }
 
     private static final class InMemorySnapshotStore {
-        private static final Version VERSION = new Version(
-            1L, 0L, 0L, 0L, Optional.empty(), Optional.empty());
-
         private final Map<String, byte[]> data = new ConcurrentHashMap<>();
+        private final Map<String, Long> versions = new ConcurrentHashMap<>();
+        private final Map<String, ConcurrentLinkedQueue<CompletableFuture<GetResult>>> queuedGets =
+                new ConcurrentHashMap<>();
+        private final Map<String, ConcurrentLinkedQueue<CompletableFuture<PutResult>>> queuedPuts =
+                new ConcurrentHashMap<>();
+        private final AtomicLong nextVersionId = new AtomicLong();
         private final AsyncOxiaClient client = mock(AsyncOxiaClient.class);
 
         InMemorySnapshotStore() throws Exception {
             when(client.get(anyString())).thenAnswer(invocation -> {
                 String key = invocation.getArgument(0);
-                byte[] value = data.get(key);
-                if (value == null) {
-                    return CompletableFuture.completedFuture(null);
+                ConcurrentLinkedQueue<CompletableFuture<GetResult>> queue = queuedGets.get(key);
+                CompletableFuture<GetResult> queued = queue == null ? null : queue.poll();
+                if (queued != null) {
+                    return queued;
                 }
-                return CompletableFuture.completedFuture(new GetResult(key, value, VERSION));
+                return CompletableFuture.completedFuture(currentValue(key));
             });
-            when(client.put(anyString(), any(byte[].class))).thenAnswer(invocation -> {
+            when(client.put(anyString(), any(byte[].class), anySet())).thenAnswer(invocation -> {
                 String key = invocation.getArgument(0);
+                ConcurrentLinkedQueue<CompletableFuture<PutResult>> queue = queuedPuts.get(key);
+                CompletableFuture<PutResult> queued = queue == null ? null : queue.poll();
+                if (queued != null) {
+                    return queued;
+                }
                 byte[] value = invocation.getArgument(1);
-                data.put(key, value);
-                return CompletableFuture.completedFuture(new PutResult(key, VERSION));
+                Set<PutOption> options = invocation.getArgument(2);
+                synchronized (this) {
+                    long currentVersionId = currentVersionId(key);
+                    Long expectedVersionId = expectedVersionId(options);
+                    if (expectedVersionId != null && expectedVersionId != currentVersionId) {
+                        return CompletableFuture.failedFuture(
+                                new UnexpectedVersionIdException(key, expectedVersionId));
+                    }
+                    long writtenVersionId = nextVersionId.incrementAndGet();
+                    data.put(key, value.clone());
+                    versions.put(key, writtenVersionId);
+                    return CompletableFuture.completedFuture(
+                            new PutResult(key, version(writtenVersionId)));
+                }
             });
             when(client.delete(anyString())).thenAnswer(invocation -> {
-                data.remove(invocation.getArgument(0));
-                return CompletableFuture.completedFuture(true);
+                String key = invocation.getArgument(0);
+                synchronized (this) {
+                    boolean removed = data.remove(key) != null;
+                    versions.remove(key);
+                    return CompletableFuture.completedFuture(removed);
+                }
             });
+            when(client.delete(anyString(), anySet())).thenAnswer(invocation -> {
+                String key = invocation.getArgument(0);
+                Set<DeleteOption> options = invocation.getArgument(1);
+                synchronized (this) {
+                    long currentVersionId = currentVersionId(key);
+                    Long expectedVersionId = expectedVersionId(options);
+                    if (expectedVersionId != null && expectedVersionId != currentVersionId) {
+                        return CompletableFuture.failedFuture(
+                                new UnexpectedVersionIdException(key, expectedVersionId));
+                    }
+                    boolean removed = data.remove(key) != null;
+                    versions.remove(key);
+                    return CompletableFuture.completedFuture(removed);
+                }
+            });
+        }
+
+        private synchronized GetResult currentValue(String key) {
+            byte[] value = data.get(key);
+            if (value == null) {
+                return null;
+            }
+            long versionId = versions.computeIfAbsent(key, ignored -> nextVersionId.incrementAndGet());
+            return new GetResult(key, value.clone(), version(versionId));
+        }
+
+        private synchronized long currentVersionId(String key) {
+            if (!data.containsKey(key)) {
+                return OptionVersionId.KEY_NOT_EXISTS;
+            }
+            return versions.computeIfAbsent(key, ignored -> nextVersionId.incrementAndGet());
+        }
+
+        private static Long expectedVersionId(Set<?> options) {
+            return options.stream()
+                    .filter(OptionVersionId.class::isInstance)
+                    .map(OptionVersionId.class::cast)
+                    .map(OptionVersionId::versionId)
+                    .findFirst()
+                    .orElse(null);
+        }
+
+        private static Version version(long versionId) {
+            return new Version(versionId, 0L, 0L, 0L, Optional.empty(), Optional.empty());
+        }
+
+        void queueGet(String key, CompletableFuture<GetResult> result) {
+            queuedGets.computeIfAbsent(key, ignored -> new ConcurrentLinkedQueue<>()).add(result);
+        }
+
+        void queuePut(String key, CompletableFuture<PutResult> result) {
+            queuedPuts.computeIfAbsent(key, ignored -> new ConcurrentLinkedQueue<>()).add(result);
+        }
+
+        synchronized void storeValue(String key, byte[] value, long versionId) {
+            data.put(key, value.clone());
+            versions.put(key, versionId);
+            nextVersionId.accumulateAndGet(versionId, Math::max);
         }
 
         Map<String, byte[]> data() {

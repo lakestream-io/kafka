@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -77,6 +78,11 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final Map<String, Object> logConfigDefaults;
     private final Function<String, Map<String, String>> topicConfigSupplier;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final Object lifecycleLock = new Object();
+    private final Object producerStateCleanupLock = new Object();
+    private final CompletableFuture<Void> producerStateCleanupDrain = new CompletableFuture<>();
+    private int pendingProducerStateCleanups;
+    private boolean producerStateCleanupRegistrationSealed;
 
     /**
      * Creates UrsaStorageState for production use.
@@ -237,32 +243,37 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     }
 
     UrsaPartitionLog getOrCreatePartitionLog(TopicIdPartition tp) {
-        UrsaPartitionLog partitionLog = partitionLogs.computeIfAbsent(tp,
-                ignored -> new UrsaPartitionLog(
-                        tp,
-                        this,
-                        logMetrics,
-                        openLog(tp),
-                        oxiaClientSupplier,
-                        config.getProducerStateSnapshotIntervalMs(),
-                        config.getProducerStateSnapshotRecordThreshold(),
-                        producerStateScheduler));
-        // An already-failed open can complete in the constructor, before computeIfAbsent
-        // publishes the value and before the init callback can evict it. Remove it after
-        // publication so a subsequent request can retry.
-        if (partitionLog.initializationFailed()) {
-            partitionLogs.remove(tp, partitionLog);
-        } else {
-            try {
-                RetentionConfig retentionConfig = buildRetentionConfig(tp);
-                partitionLog.triggerInitialRetention(
-                        retentionConfig.retentionMs(),
-                        retentionConfig.retentionBytes());
-            } catch (Throwable error) {
-                log.warn("Failed to schedule initial retention for {}", tp, error);
+        synchronized (lifecycleLock) {
+            if (closed.get()) {
+                throw new IllegalStateException("Ursa storage state is closed");
             }
+            UrsaPartitionLog partitionLog = partitionLogs.computeIfAbsent(tp,
+                    ignored -> new UrsaPartitionLog(
+                            tp,
+                            this,
+                            logMetrics,
+                            openLog(tp),
+                            oxiaClientSupplier,
+                            config.getProducerStateSnapshotIntervalMs(),
+                            config.getProducerStateSnapshotRecordThreshold(),
+                            producerStateScheduler));
+            // An already-failed open can complete in the constructor, before computeIfAbsent
+            // publishes the value and before the init callback can evict it. Remove it after
+            // publication so a subsequent request can retry.
+            if (partitionLog.initializationFailed()) {
+                partitionLogs.remove(tp, partitionLog);
+            } else {
+                try {
+                    RetentionConfig retentionConfig = buildRetentionConfig(tp);
+                    partitionLog.triggerInitialRetention(
+                            retentionConfig.retentionMs(),
+                            retentionConfig.retentionBytes());
+                } catch (Throwable error) {
+                    log.warn("Failed to schedule initial retention for {}", tp, error);
+                }
+            }
+            return partitionLog;
         }
-        return partitionLog;
     }
 
     UrsaPartitionLog partitionLog(TopicIdPartition tp) {
@@ -306,16 +317,21 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         if (tp == null) {
             return false;
         }
-        AtomicBoolean cleaned = new AtomicBoolean();
-        partitionLogs.computeIfPresent(tp, (ignored, partitionLog) -> {
-            // Fence the old log while this key is still locked in the map. Otherwise a concurrent
-            // computeIfAbsent can activate a replacement between remove() and close(), after which
-            // the old owner's delayed fence would disable the replacement.
-            partitionLog.close(deletePartition);
-            cleaned.set(true);
-            return null;
-        });
-        return cleaned.get();
+        synchronized (lifecycleLock) {
+            if (closed.get()) {
+                return false;
+            }
+            AtomicBoolean cleaned = new AtomicBoolean();
+            partitionLogs.computeIfPresent(tp, (ignored, partitionLog) -> {
+                // Fence the old log while this key is still locked in the map. Otherwise a concurrent
+                // computeIfAbsent can activate a replacement between remove() and close(), after which
+                // the old owner's delayed fence would disable the replacement.
+                partitionLog.close(deletePartition);
+                cleaned.set(true);
+                return null;
+            });
+            return cleaned.get();
+        }
     }
 
     public boolean cleanupNonOwnedProducerStates(
@@ -352,6 +368,53 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
 
     public Set<TopicIdPartition> snapshotTrackedPartitions() {
         return new LinkedHashSet<>(partitionLogs.keySet());
+    }
+
+    Optional<CompletableFuture<Void>> startProducerStateCleanup(
+            Supplier<CompletableFuture<Void>> cleanupStarter
+    ) {
+        synchronized (producerStateCleanupLock) {
+            if (producerStateCleanupRegistrationSealed) {
+                return Optional.empty();
+            }
+            pendingProducerStateCleanups++;
+        }
+
+        CompletableFuture<Void> cleanupFuture;
+        try {
+            cleanupFuture = cleanupStarter.get();
+            if (cleanupFuture == null) {
+                cleanupFuture = CompletableFuture.failedFuture(
+                        new IllegalStateException("Producer state cleanup returned a null future"));
+            }
+        } catch (Throwable error) {
+            cleanupFuture = CompletableFuture.failedFuture(error);
+        }
+        cleanupFuture.whenComplete((ignored, error) -> completeProducerStateCleanup());
+        return Optional.of(cleanupFuture);
+    }
+
+    private void completeProducerStateCleanup() {
+        boolean completeDrain;
+        synchronized (producerStateCleanupLock) {
+            pendingProducerStateCleanups--;
+            completeDrain = producerStateCleanupRegistrationSealed && pendingProducerStateCleanups == 0;
+        }
+        if (completeDrain) {
+            producerStateCleanupDrain.complete(null);
+        }
+    }
+
+    private CompletableFuture<Void> sealProducerStateCleanups() {
+        boolean completeDrain;
+        synchronized (producerStateCleanupLock) {
+            producerStateCleanupRegistrationSealed = true;
+            completeDrain = pendingProducerStateCleanups == 0;
+        }
+        if (completeDrain) {
+            producerStateCleanupDrain.complete(null);
+        }
+        return producerStateCleanupDrain;
     }
 
     CompletableFuture<Log> maybeApplyRetention(Log logInstance, long retentionMs, long retentionBytes) {
@@ -489,16 +552,27 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
 
     @Override
     public void close() throws IOException {
-        if (!closed.compareAndSet(false, true)) {
-            return;
+        List<UrsaPartitionLog> partitionLogsToClose;
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            retentionTask.cancel(false);
+            partitionLogsToClose = List.copyOf(partitionLogs.values());
+            partitionLogs.clear();
         }
-        retentionTask.cancel(false);
         shutdownScheduler(retentionScheduler);
-        partitionLogs.values().forEach(UrsaPartitionLog::close);
-        partitionLogs.clear();
-        shutdownScheduler(producerStateScheduler);
-        if (lakestreamStorageHolder != null) {
-            lakestreamStorageHolder.close();
+        try {
+            try {
+                partitionLogsToClose.forEach(UrsaPartitionLog::close);
+            } finally {
+                sealProducerStateCleanups().join();
+            }
+        } finally {
+            shutdownScheduler(producerStateScheduler);
+            if (lakestreamStorageHolder != null) {
+                lakestreamStorageHolder.close();
+            }
         }
     }
 
