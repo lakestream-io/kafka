@@ -37,6 +37,12 @@ public interface DisklessTopicLifecycle extends AutoCloseable {
             int partitions,
             Map<String, String> properties);
 
-    /** Unregister the logical topic after its Kafka metadata has been deleted. */
+    /**
+     * Permanently unregister the logical topic after its Kafka metadata has been deleted.
+     *
+     * <p>Kafka topic IDs identify immutable topic incarnations. Implementations must durably fence
+     * this ID so that an already in-flight registration cannot recreate it after this future
+     * completes. A topic recreated with the same name receives a different ID.
+     */
     CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId);
 }

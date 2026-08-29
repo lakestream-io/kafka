@@ -136,9 +136,14 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -621,7 +626,8 @@ public class QuorumControllerTest {
                 QuorumControllerTestEnv controlEnv = new QuorumControllerTestEnv.Builder(clientEnv).
                 setSessionTimeoutMillis(OptionalLong.of(sessionTimeoutMillis)).
                 setBootstrapMetadata(BootstrapMetadata.fromVersion(MetadataVersion.IBP_4_0_IV1, "test-provided bootstrap ELR enabled")).
-                build()
+                build();
+                BrokerHeartbeatTask heartbeatTask = new BrokerHeartbeatTask()
         ) {
             ListenerCollection listeners = new ListenerCollection();
             listeners.add(new Listener().setName("PLAINTEXT").setHost("localhost").setPort(9092));
@@ -650,6 +656,19 @@ public class QuorumControllerTest {
 
             // Unfence all brokers and create a topic foo (min ISR 2)
             sendBrokerHeartbeatToUnfenceBrokers(active, allBrokers, brokerEpochs);
+            AtomicBoolean onlyKeepUnfenced = new AtomicBoolean(false);
+            heartbeatTask.start(() -> {
+                try {
+                    if (onlyKeepUnfenced.get()) {
+                        sendBrokerHeartbeatToUnfenceBrokers(active, brokersToKeepUnfenced, brokerEpochs);
+                    } else {
+                        sendBrokerHeartbeatToUnfenceBrokers(active, allBrokers, brokerEpochs);
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
             CreateTopicsRequestData createTopicsRequestData = new CreateTopicsRequestData().setTopics(
                 new CreatableTopicCollection(List.of(
                     new CreatableTopic().setName("foo").setNumPartitions(1).
@@ -672,8 +691,8 @@ public class QuorumControllerTest {
             RecordTestUtils.replayAll(active.configurationControl(), List.of(new ApiMessageAndVersion(configRecord, (short) 0)));
 
             // Fence brokers
+            onlyKeepUnfenced.set(true);
             TestUtils.waitForCondition(() -> {
-                    sendBrokerHeartbeatToUnfenceBrokers(active, brokersToKeepUnfenced, brokerEpochs);
                     for (Integer brokerId : brokersToFence) {
                         if (active.clusterControl().isUnfenced(brokerId)) {
                             return false;
@@ -684,9 +703,6 @@ public class QuorumControllerTest {
                 "Fencing of brokers did not process within expected time"
             );
 
-            // Send another heartbeat to the brokers we want to keep alive
-            sendBrokerHeartbeatToUnfenceBrokers(active, brokersToKeepUnfenced, brokerEpochs);
-
             // At this point only the brokers we want to fence (broker 2, 3) should be fenced.
             brokersToKeepUnfenced.forEach(brokerId -> {
                 assertTrue(active.clusterControl().isUnfenced(brokerId),
@@ -696,8 +712,6 @@ public class QuorumControllerTest {
                 assertFalse(active.clusterControl().isUnfenced(brokerId),
                     "Broker " + brokerId + " should have been fenced");
             });
-            sendBrokerHeartbeatToUnfenceBrokers(active, brokersToKeepUnfenced, brokerEpochs);
-
             // Verify the isr and elr for the topic partition
             PartitionRegistration partition = active.replicationControl().getPartition(topicIdFoo, 0);
             assertArrayEquals(new int[]{1}, partition.isr, partition.toString());
@@ -732,6 +746,49 @@ public class QuorumControllerTest {
             partition = active.replicationControl().getPartition(topicIdBar, 0);
             assertEquals(0, partition.elr.length, partition.toString());
             assertArrayEquals(new int[]{1}, partition.isr, partition.toString());
+        }
+    }
+
+    private static final class BrokerHeartbeatTask implements AutoCloseable {
+        private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        private final AtomicReference<Throwable> failure = new AtomicReference<>();
+        private ScheduledFuture<?> task;
+
+        void start(Runnable heartbeat) {
+            if (task != null) {
+                throw new IllegalStateException("Broker heartbeat task already started");
+            }
+            task = executor.scheduleAtFixedRate(() -> {
+                try {
+                    heartbeat.run();
+                } catch (RuntimeException | Error e) {
+                    failure.compareAndSet(null, e);
+                    throw e;
+                }
+            }, 0L, 100L, TimeUnit.MILLISECONDS);
+        }
+
+        @Override
+        public void close() throws InterruptedException {
+            if (task != null) {
+                task.cancel(false);
+            }
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                    if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Heartbeat executor did not terminate");
+                    }
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+                throw e;
+            }
+            if (failure.get() != null) {
+                throw new AssertionError("Heartbeat task failed", failure.get());
+            }
         }
     }
 

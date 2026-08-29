@@ -57,7 +57,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
 
     @Override
     public CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId) {
-        return registry.unregisterExternalStream(streamIdentifier(topicName, topicId));
+        return registry.permanentlyDeleteExternalStream(streamIdentifier(topicName, topicId));
     }
 
     @Override

@@ -44,7 +44,7 @@ import org.apache.kafka.security.{CredentialProvider, DelegationTokenManager}
 import org.apache.kafka.server.{ProcessRole, SimpleApiVersionManager}
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.config.ServerLogConfigs.{ALTER_CONFIG_POLICY_CLASS_NAME_CONFIG, CREATE_TOPIC_POLICY_CLASS_NAME_CONFIG}
-import org.apache.kafka.server.common.{ApiMessageAndVersion, DisklessTopicPreCommitHandler, KRaftVersion, NodeToControllerChannelManager}
+import org.apache.kafka.server.common.{ApiMessageAndVersion, KRaftVersion, NodeToControllerChannelManager}
 import org.apache.kafka.server.config.{ConfigType, DelegationTokenManagerConfigs}
 import org.apache.kafka.server.metrics.{KafkaMetricsGroup, KafkaYammerMetrics, LinuxIoMetricsCollector}
 import org.apache.kafka.server.network.{EndpointReadyFutures, KafkaAuthorizerServerInfo}
@@ -264,28 +264,19 @@ class ControllerServer(
           setUncleanLeaderElectionCheckIntervalMs(config.uncleanLeaderElectionCheckIntervalMs).
           setControllerPerformanceSamplePeriodMs(config.controllerPerformanceSamplePeriodMs).
           setControllerPerformanceAlwaysLogThresholdMs(config.controllerPerformanceAlwaysLogThresholdMs).
-          setDisklessStorageSystemEnabled(config.ursaStorageEnable).
-          setDisklessTopicPreCommitHandler({
-            if (config.ursaStorageEnable) {
-              val ursaConfig = UrsaStorageConfig.fromConfigs(config.originals().asInstanceOf[util.Map[String, _]])
-              disklessTopicLifecycle = DisklessTopicLifecycleLoader.load(ursaConfig)
-              try {
-                disklessProducerStateStore = DisklessProducerStateStoreLoader.load(ursaConfig)
-                Optional.of[DisklessTopicPreCommitHandler](
-                  (topicName: String, topicId: Uuid, partitions: Int, configs: util.Map[String, String]) => {
-                    disklessTopicLifecycle.registerTopic(topicName, topicId, partitions, configs)
-                      .get(3000, TimeUnit.MILLISECONDS)
-                  })
-              } catch {
-                case error: Throwable =>
-                  Utils.closeQuietly(disklessTopicLifecycle, "diskless topic lifecycle")
-                  disklessTopicLifecycle = null
-                  throw error
-              }
-            } else {
-              Optional.empty[DisklessTopicPreCommitHandler]()
-            }
-          })
+          setDisklessStorageSystemEnabled(config.ursaStorageEnable)
+      }
+      if (config.ursaStorageEnable) {
+        val ursaConfig = UrsaStorageConfig.fromConfigs(config.originals().asInstanceOf[util.Map[String, _]])
+        disklessTopicLifecycle = DisklessTopicLifecycleLoader.load(ursaConfig)
+        try {
+          disklessProducerStateStore = DisklessProducerStateStoreLoader.load(ursaConfig)
+        } catch {
+          case error: Throwable =>
+            Utils.closeQuietly(disklessTopicLifecycle, "diskless topic lifecycle")
+            disklessTopicLifecycle = null
+            throw error
+        }
       }
       controller = controllerBuilder.build()
 
@@ -356,7 +347,7 @@ class ControllerServer(
         ),
         "controller"))
 
-      // Unregister deleted diskless topics and clean up Kafka-owned producer state.
+      // Reconcile committed diskless topic registrations and clean up deleted topic state.
       if (config.ursaStorageEnable) {
         metadataPublishers.add(new DisklessTopicLifecyclePublisher(
           config.nodeId,

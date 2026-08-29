@@ -95,7 +95,6 @@ import org.apache.kafka.metadata.Replicas;
 import org.apache.kafka.metadata.placement.StripedReplicaPlacer;
 import org.apache.kafka.metadata.placement.UsableBroker;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
-import org.apache.kafka.server.common.DisklessTopicPreCommitHandler;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.common.TopicIdPartition;
@@ -124,9 +123,7 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -179,7 +176,6 @@ public class ReplicationControlManagerTest {
             private MockTime mockTime = new MockTime();
             private boolean isElrEnabled = false;
             private boolean disklessStorageSystemEnabled = false;
-            private Optional<DisklessTopicPreCommitHandler> disklessTopicPreCommitHandler = Optional.empty();
             private final Map<String, Object> staticConfig = new HashMap<>();
 
             Builder setCreateTopicPolicy(CreateTopicPolicy createTopicPolicy) {
@@ -202,11 +198,6 @@ public class ReplicationControlManagerTest {
                 return this;
             }
 
-            Builder setDisklessTopicPreCommitHandler(DisklessTopicPreCommitHandler handler) {
-                this.disklessTopicPreCommitHandler = Optional.of(handler);
-                return this;
-            }
-
             Builder setStaticConfig(String key, Object value) {
                 this.staticConfig.put(key, value);
                 return this;
@@ -223,7 +214,6 @@ public class ReplicationControlManagerTest {
                     mockTime,
                     isElrEnabled,
                     disklessStorageSystemEnabled,
-                    disklessTopicPreCommitHandler,
                     staticConfig);
             }
         }
@@ -250,7 +240,6 @@ public class ReplicationControlManagerTest {
             MockTime time,
             boolean isElrEnabled,
             boolean disklessStorageSystemEnabled,
-            Optional<DisklessTopicPreCommitHandler> disklessTopicPreCommitHandler,
             Map<String, Object> staticConfig
         ) {
             this.time = time;
@@ -296,7 +285,6 @@ public class ReplicationControlManagerTest {
                 setCreateTopicPolicy(createTopicPolicy).
                 setFeatureControl(featureControl).
                 setDisklessStorageSystemEnabled(disklessStorageSystemEnabled).
-                setDisklessTopicPreCommitHandler(disklessTopicPreCommitHandler).
                 build();
             clusterControl.activate();
         }
@@ -3711,108 +3699,4 @@ public class ReplicationControlManagerTest {
         assertTrue(topicResult.errorMessage().contains("diskless storage system is disabled"));
     }
 
-    private ControllerResult<CreateTopicsResponseData> createDisklessTopic(
-            ReplicationControlTestContext ctx, String name, int numPartitions) {
-        CreateTopicsRequestData request = new CreateTopicsRequestData();
-        CreatableTopic topic = new CreatableTopic().setName(name).
-            setNumPartitions(numPartitions).setReplicationFactor((short) -1);
-        topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig().
-            setName(URSA_STORAGE_ENABLE_CONFIG).setValue("true"));
-        request.topics().add(topic);
-        ControllerRequestContext requestContext = anonymousContextFor(ApiKeys.CREATE_TOPICS);
-        return ctx.replicationControl.createTopics(requestContext, request, Set.of(name), false);
-    }
-
-    @Test
-    public void testPreCommitHandlerOnDisklessTopicCreateAndDelete() {
-        AtomicBoolean createCalled = new AtomicBoolean(false);
-        AtomicReference<Uuid> preCommittedTopicId = new AtomicReference<>();
-        DisklessTopicPreCommitHandler handler = new DisklessTopicPreCommitHandler() {
-            @Override
-            public void preCommitCreateTopic(String t, Uuid topicId, int p, Map<String, String> c) {
-                createCalled.set(true);
-                preCommittedTopicId.set(topicId);
-            }
-        };
-        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().
-            setDisklessStorageSystemEnabled(true).setDisklessTopicPreCommitHandler(handler).build();
-        ctx.registerBrokers(0, 1, 2);
-        ctx.unfenceBrokers(0, 1, 2);
-
-        // Create triggers handler
-        ControllerResult<CreateTopicsResponseData> result = createDisklessTopic(ctx, "diskless-topic", 2);
-        assertEquals(NONE.code(), result.response().topics().find("diskless-topic").errorCode());
-        assertTrue(createCalled.get());
-        assertEquals(result.response().topics().find("diskless-topic").topicId(), preCommittedTopicId.get());
-        ctx.replay(result.records());
-
-        // Non-diskless topic does not trigger handler
-        createCalled.set(false);
-        ctx.createTestTopic("normal-topic", 2, (short) 3, NONE.code());
-        assertFalse(createCalled.get());
-
-        // Delete succeeds without pre-commit handler involvement (cleanup is post-commit)
-        Uuid topicId = result.response().topics().find("diskless-topic").topicId();
-        ctx.deleteTopic(anonymousContextFor(ApiKeys.DELETE_TOPICS), topicId);
-    }
-
-    @Test
-    public void testPreCommitHandlerFailureBehavior() {
-        AtomicBoolean failCreate = new AtomicBoolean(true);
-        DisklessTopicPreCommitHandler handler = new DisklessTopicPreCommitHandler() {
-            @Override
-            public void preCommitCreateTopic(String t, Uuid topicId, int p, Map<String, String> c) throws Exception {
-                if (failCreate.get()) throw new RuntimeException("storage catalog unavailable");
-            }
-        };
-        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().
-            setDisklessStorageSystemEnabled(true).setDisklessTopicPreCommitHandler(handler).build();
-        ctx.registerBrokers(0, 1, 2);
-        ctx.unfenceBrokers(0, 1, 2);
-
-        // Create fails when handler throws
-        ControllerResult<CreateTopicsResponseData> result = createDisklessTopic(ctx, "diskless-topic", 2);
-        CreatableTopicResult topicResult = result.response().topics().find("diskless-topic");
-        assertEquals(Errors.UNKNOWN_SERVER_ERROR.code(), topicResult.errorCode());
-        assertTrue(topicResult.errorMessage().contains("storage catalog unavailable"));
-
-        // Now allow create to succeed, then verify delete works without pre-commit handler
-        failCreate.set(false);
-        result = createDisklessTopic(ctx, "diskless-topic", 2);
-        assertEquals(NONE.code(), result.response().topics().find("diskless-topic").errorCode());
-        ctx.replay(result.records());
-        Uuid topicId = result.response().topics().find("diskless-topic").topicId();
-
-        // Delete succeeds (no pre-commit handler involvement for deletion)
-        ctx.deleteTopic(anonymousContextFor(ApiKeys.DELETE_TOPICS), topicId);
-    }
-
-    @Test
-    public void testPreCommitHandlerSkippedForValidateOnly() {
-        AtomicBoolean createCalled = new AtomicBoolean(false);
-        DisklessTopicPreCommitHandler handler = new DisklessTopicPreCommitHandler() {
-            @Override
-            public void preCommitCreateTopic(String t, Uuid topicId, int p, Map<String, String> c) {
-                createCalled.set(true);
-            }
-        };
-        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().
-            setDisklessStorageSystemEnabled(true).setDisklessTopicPreCommitHandler(handler).build();
-        ctx.registerBrokers(0, 1, 2);
-        ctx.unfenceBrokers(0, 1, 2);
-
-        CreateTopicsRequestData request = new CreateTopicsRequestData().setValidateOnly(true);
-        CreatableTopic topic = new CreatableTopic().setName("diskless-topic").
-            setNumPartitions(2).setReplicationFactor((short) -1);
-        topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig().
-            setName(URSA_STORAGE_ENABLE_CONFIG).setValue("true"));
-        request.topics().add(topic);
-        ControllerResult<CreateTopicsResponseData> result =
-            ctx.replicationControl.createTopics(
-                anonymousContextFor(ApiKeys.CREATE_TOPICS), request, Set.of("diskless-topic"), false);
-
-        assertEquals(NONE.code(), result.response().topics().find("diskless-topic").errorCode());
-        assertTrue(result.records().isEmpty(), "validate-only should produce no records");
-        assertFalse(createCalled.get(), "pre-commit handler should not be called for validate-only");
-    }
 }

@@ -94,7 +94,6 @@ import org.apache.kafka.metadata.placement.PlacementSpec;
 import org.apache.kafka.metadata.placement.TopicAssignment;
 import org.apache.kafka.metadata.placement.UsableBroker;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
-import org.apache.kafka.server.common.DisklessTopicPreCommitHandler;
 import org.apache.kafka.server.common.TopicIdPartition;
 import org.apache.kafka.server.mutable.BoundedList;
 import org.apache.kafka.server.policy.CreateTopicPolicy;
@@ -160,7 +159,6 @@ public class ReplicationControlManager {
         private short defaultReplicationFactor = (short) 3;
         private int defaultNumPartitions = 1;
         private boolean disklessStorageSystemEnabled = false;
-        private Optional<DisklessTopicPreCommitHandler> disklessTopicPreCommitHandler = Optional.empty();
 
         private int maxElectionsPerImbalance = MAX_ELECTIONS_PER_IMBALANCE;
         private ConfigurationControlManager configurationControl = null;
@@ -218,11 +216,6 @@ public class ReplicationControlManager {
             return this;
         }
 
-        Builder setDisklessTopicPreCommitHandler(Optional<DisklessTopicPreCommitHandler> handler) {
-            this.disklessTopicPreCommitHandler = handler;
-            return this;
-        }
-
         ReplicationControlManager build() {
             if (configurationControl == null) {
                 throw new IllegalStateException("Configuration control must be set before building");
@@ -243,8 +236,7 @@ public class ReplicationControlManager {
                 clusterControl,
                 createTopicPolicy,
                 featureControl,
-                disklessStorageSystemEnabled,
-                disklessTopicPreCommitHandler);
+                disklessStorageSystemEnabled);
         }
     }
 
@@ -343,11 +335,6 @@ public class ReplicationControlManager {
     private final boolean disklessStorageSystemEnabled;
 
     /**
-     * Optional handler for pre-commit storage registration during diskless topic lifecycle.
-     */
-    private final Optional<DisklessTopicPreCommitHandler> disklessTopicPreCommitHandler;
-
-    /**
      * Maps topic names to topic UUIDs.
      */
     private final TimelineHashMap<String, Uuid> topicsByName;
@@ -415,8 +402,7 @@ public class ReplicationControlManager {
         ClusterControlManager clusterControl,
         Optional<CreateTopicPolicy> createTopicPolicy,
         FeatureControlManager featureControl,
-        boolean disklessStorageSystemEnabled,
-        Optional<DisklessTopicPreCommitHandler> disklessTopicPreCommitHandler
+        boolean disklessStorageSystemEnabled
     ) {
         this.snapshotRegistry = snapshotRegistry;
         this.log = logContext.logger(ReplicationControlManager.class);
@@ -428,7 +414,6 @@ public class ReplicationControlManager {
         this.featureControl = featureControl;
         this.clusterControl = clusterControl;
         this.disklessStorageSystemEnabled = disklessStorageSystemEnabled;
-        this.disklessTopicPreCommitHandler = disklessTopicPreCommitHandler;
         this.topicsByName = new TimelineHashMap<>(snapshotRegistry, 0);
         this.topicsWithCollisionChars = new TimelineHashMap<>(snapshotRegistry, 0);
         this.topics = new TimelineHashMap<>(snapshotRegistry, 0);
@@ -878,15 +863,6 @@ public class ReplicationControlManager {
             return ApiError.fromThrowable(e);
         }
         Uuid topicId = Uuid.randomUuid();
-        if (disklessEnabled && !validateOnly && disklessTopicPreCommitHandler.isPresent()) {
-            try {
-                disklessTopicPreCommitHandler.get().preCommitCreateTopic(
-                    topic.name(), topicId, numPartitions, creationConfigs);
-            } catch (Exception e) {
-                return new ApiError(Errors.UNKNOWN_SERVER_ERROR,
-                    "Failed to register diskless topic with the storage system: " + e.getMessage());
-            }
-        }
         CreatableTopicResult result = new CreatableTopicResult().
             setName(topic.name()).
             setTopicId(topicId).

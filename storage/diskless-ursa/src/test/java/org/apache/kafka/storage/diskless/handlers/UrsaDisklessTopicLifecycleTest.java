@@ -41,7 +41,7 @@ class UrsaDisklessTopicLifecycleTest {
         Map<String, String> properties = Map.of("retention.ms", "60000");
         when(registry.registerExternalStream(identifier, 3, properties))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(registry.unregisterExternalStream(identifier))
+        when(registry.permanentlyDeleteExternalStream(identifier))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(registry)) {
@@ -50,7 +50,7 @@ class UrsaDisklessTopicLifecycleTest {
         }
 
         verify(registry).registerExternalStream(identifier, 3, properties);
-        verify(registry).unregisterExternalStream(identifier);
+        verify(registry).permanentlyDeleteExternalStream(identifier);
         verify(registry).close();
     }
 
