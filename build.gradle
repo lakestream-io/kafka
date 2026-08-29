@@ -229,6 +229,10 @@ allprojects {
           libs.jacksonDataformatYaml,
           libs.commonsLang,
 
+          // SpotBugs annotations 4.9.8 publishes a runtime dependency on the JUnit 5.14 BOM.
+          // Keep the test engine and platform aligned with Kafka's pinned JUnit version.
+          "org.junit:junit-bom:$versions.junit",
+
           // Keep the logging implementation aligned with Kafka's runtime.
           libs.slf4jLog4j2,
           libs.log4j2Api,
@@ -1090,15 +1094,9 @@ project(':server') {
     testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
     testImplementation 'org.testcontainers:localstack:1.21.4'
     testImplementation 'org.awaitility:awaitility:4.2.0'
-    testImplementation "io.lakestream:lakestream-api:$ursaStorageVersion"
     testImplementation("io.lakestream:ursa-storage-core:$ursaStorageVersion") {
       exclude group: 'io.confluent', module: 'kafka-schema-registry-client'
       exclude group: 'org.apache.kafka', module: 'kafka-clients'
-    }
-    // Kafka compaction E2E opens the catalog through the same Lakestream provider used by brokers.
-    testRuntimeOnly("io.lakestream:ursa-storage-kafka-runtime:$ursaStorageVersion") {
-      exclude group: 'org.apache.kafka', module: 'kafka-clients'
-      exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
     }
     testRuntimeOnly runtimeTestLibs
   }

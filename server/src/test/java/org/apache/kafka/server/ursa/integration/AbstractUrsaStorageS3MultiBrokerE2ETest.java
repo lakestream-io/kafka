@@ -741,12 +741,20 @@ abstract class AbstractUrsaStorageS3MultiBrokerE2ETest extends UrsaStorageE2ETes
             int zoneAOwnerBrokerId,
             int zoneBOwnerBrokerId
     ) throws Exception {
-        waitForBrokerPartitionLogState(zoneAOwnerBrokerId, topicIdPartition, true);
-        waitForBrokerPartitionLogState(zoneBOwnerBrokerId, topicIdPartition, true);
+        int unzonedOwnerBrokerId = selectOwnerBroker(
+                topicIdPartition.topicId(),
+                topicIdPartition.partition(),
+                brokerNodesWithRacks());
+        Set<Integer> expectedOwnerBrokerIds = new HashSet<>();
+        expectedOwnerBrokerIds.add(zoneAOwnerBrokerId);
+        expectedOwnerBrokerIds.add(zoneBOwnerBrokerId);
+        expectedOwnerBrokerIds.add(unzonedOwnerBrokerId);
+
         for (int brokerId = 0; brokerId < NUM_BROKERS; brokerId++) {
-            if (brokerId != zoneAOwnerBrokerId && brokerId != zoneBOwnerBrokerId) {
-                waitForBrokerPartitionLogState(brokerId, topicIdPartition, false);
-            }
+            waitForBrokerPartitionLogState(
+                    brokerId,
+                    topicIdPartition,
+                    expectedOwnerBrokerIds.contains(brokerId));
         }
     }
 }

@@ -797,6 +797,7 @@ class UrsaSDTInterceptorTest {
         var topicId = Uuid.randomUuid();
         var topicIdPartition = new TopicIdPartition(
                 topicId, new TopicPartition("serialized-switch-topic", 0));
+        var publisherKey = "serialized-switch-topic-partition-0";
         var firstEventSelected = new CountDownLatch(1);
         var releaseFirstEvent = new CountDownLatch(1);
         var blockFirstEvent = new AtomicBoolean(true);
@@ -824,7 +825,7 @@ class UrsaSDTInterceptorTest {
                 assertTrue(releaseFirstEvent.await(10, TimeUnit.SECONDS));
             }
             return null;
-        }).when(interceptor).beforePublisherFence("serialized-switch-topic-partition-0");
+        }).when(interceptor).beforePublisherFence(publisherKey);
 
         CompletableFuture<Void> classic = CompletableFuture.runAsync(
                 () -> interceptor.onAppend(null, null, partition, 1L));
@@ -835,10 +836,25 @@ class UrsaSDTInterceptorTest {
         classic.get(10, TimeUnit.SECONDS);
         diskless.get(10, TimeUnit.SECONDS);
 
-        assertFalse(interceptor.hasClassicPublisher("serialized-switch-topic-partition-0"));
-        assertTrue(interceptor.hasDisklessPublisher("serialized-switch-topic-partition-0"));
-        verify(executor).scheduleAtFixedRate(
-                any(Runnable.class), eq(1L), eq(1L), eq(TimeUnit.SECONDS));
+        assertFalse(interceptor.hasClassicPublisher(publisherKey));
+        assertTrue(interceptor.hasDisklessPublisher(publisherKey));
+        assertTrue(interceptor.hasPublisherEvent(publisherKey));
+
+        // Once the first event releases the selection lock, either its publisher update runs
+        // before the diskless event is selected, or it observes that newer event and exits.
+        // Both serializations are valid, but a classic publisher that did start must be fenced.
+        var scheduledTasks = ArgumentCaptor.forClass(Runnable.class);
+        verify(executor, atLeastOnce()).scheduleAtFixedRate(
+                scheduledTasks.capture(), eq(1L), eq(1L), eq(TimeUnit.SECONDS));
+        int publisherStartCount = scheduledTasks.getAllValues().size();
+        assertTrue(publisherStartCount <= 2,
+                "Expected one active diskless publisher and at most one fenced classic publisher");
+        if (publisherStartCount == 2) {
+            verify(firstFuture).cancel(false);
+            verify(secondFuture, never()).cancel(false);
+        } else {
+            verify(firstFuture, never()).cancel(false);
+        }
     }
 
     @Test

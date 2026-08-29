@@ -360,7 +360,8 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                 assertNotEquals(originalOwnerBrokerId, failoverOwnerBrokerId,
                         "Ownership should move away from the shut down broker");
 
-                waitForDisklessLogMetrics(topicName, 0, false);
+                waitForExclusivePartitionLogState(
+                        survivingBrokerIds, failoverOwnerBrokerId, topicIdPartition);
                 consumeAndVerifyRecords(brokerBootstrap(failoverOwnerBrokerId), topicName, 0, numRecords);
                 waitForExclusivePartitionLogState(survivingBrokerIds, failoverOwnerBrokerId, topicIdPartition);
                 waitForDisklessLogMetrics(topicName, 0, true);
@@ -373,7 +374,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                     waitForPartitionLeadership(admin, topicName, 0, originalOwnerBrokerId);
                 }
 
-                waitForDisklessLogMetrics(topicName, 0, false);
+                waitForExclusivePartitionLogState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
                 consumeAndVerifyRecords(brokerBootstrap(originalOwnerBrokerId), topicName, 0, numRecords);
                 waitForExclusivePartitionLogState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
                 waitForDisklessLogMetrics(topicName, 0, true);

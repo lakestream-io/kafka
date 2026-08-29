@@ -44,7 +44,6 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
@@ -127,10 +126,10 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                         "Zone-b metadata should expose the expected broker rack");
             }
 
-            String zoneANonOwnerBootstrap = brokerBootstrap(zoneAOwnerBrokerId);
+            String zoneABootstrap = brokerBootstrap(zoneAOwnerBrokerId);
 
             try (Producer<byte[], byte[]> producer =
-                         createMultiBrokerProducer(zoneANonOwnerBootstrap, zoneBClientId)) {
+                         createMultiBrokerProducer(zoneABootstrap, zoneBClientId)) {
                 for (int i = 0; i < numRecords; i++) {
                     ProducerRecord<byte[], byte[]> record = new ProducerRecord<>(
                             topicName, partition,
@@ -141,10 +140,11 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                 producer.flush();
             }
 
-            waitForBrokerPartitionLogState(zoneBOwnerBrokerId, topicIdPartition, true);
+            verifyPartitionLogStateForZoneOwners(
+                    topicIdPartition, zoneAOwnerBrokerId, zoneBOwnerBrokerId);
 
             try (Consumer<byte[], byte[]> consumer = createMultiBrokerConsumer(
-                    zoneANonOwnerBootstrap,
+                    zoneABootstrap,
                     "rack-topology-zone-b-group-" + System.currentTimeMillis(),
                     zoneBClientId)) {
                 consumer.assign(Collections.singletonList(topicPartition));
@@ -161,9 +161,8 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                 }
             }
 
-            waitForBrokerPartitionLogState(zoneBOwnerBrokerId, topicIdPartition, true);
-            assertFalse(brokerHasPartitionLogState(zoneAOwnerBrokerId, topicIdPartition),
-                    "Zone-a bootstrap broker should not retain local partition log state for a zone-b client");
+            verifyPartitionLogStateForZoneOwners(
+                    topicIdPartition, zoneAOwnerBrokerId, zoneBOwnerBrokerId);
         }
 
         @Test

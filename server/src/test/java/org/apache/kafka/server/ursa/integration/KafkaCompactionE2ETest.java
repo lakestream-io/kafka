@@ -58,12 +58,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-import io.lakestream.api.Log;
-import io.lakestream.api.LogId;
-import io.lakestream.api.Stream;
-import io.lakestream.api.StreamCatalog;
-import io.lakestream.api.StreamCatalogLoader;
-import io.lakestream.api.StreamIdentifier;
 import io.oxia.testcontainers.OxiaContainer;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -208,32 +202,28 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
 
     private void verifyReadsUseParquetIndexes(String topicName, Uuid topicId) throws Exception {
         TopicIdPartition topicIdPartition = topicIdPartition(topicName, topicId);
-        StreamIdentifier identifier = StreamIdentifier.of(
-                KafkaLogNaming.NAMESPACE,
-                KafkaLogNaming.streamName(topicIdPartition));
+        String streamName = KafkaLogNaming.streamName(topicIdPartition);
         String catalogUri = compactionStorageConfig.getProperty("metadataStoreUrl");
 
-        try (StreamCatalog catalog = StreamCatalogLoader.open(catalogUri, compactionStorageConfig);
-             Stream stream = catalog.loadStream(identifier).get(30, TimeUnit.SECONDS)) {
-            LogId logId = stream.layout().logIds().get(30, TimeUnit.SECONDS).get(topicIdPartition.partition());
-            Log partitionLog = stream.getLog(logId);
-            var lastEntry = partitionLog.getLastOffset().get(30, TimeUnit.SECONDS);
+        try (IsolatedLakestreamCatalogProbe catalog =
+                     IsolatedLakestreamCatalogProbe.open(cluster, catalogUri, compactionStorageConfig)) {
+            IsolatedLakestreamCatalogProbe.LogIndexSummary summary = catalog.readLogIndexSummary(
+                    KafkaLogNaming.NAMESPACE,
+                    streamName,
+                    topicIdPartition.partition(),
+                    30,
+                    TimeUnit.SECONDS);
 
-            assertTrue(lastEntry.offset() >= 0,
+            assertTrue(summary.lastOffset() >= 0,
                     "Expected stream to have data, but last entry was NOT_FOUND");
 
-            long lastOffset = lastEntry.offset() + lastEntry.numberOfRecords();
-            var indexes = partitionLog.readIndexRange(0, lastOffset).get(30, TimeUnit.SECONDS);
-            assertTrue(!indexes.isEmpty(), "Expected indexes to be present for logId=" + logId.id());
-
-            var parquetIndexes = indexes.stream()
-                    .filter(idx -> "PARQUET".equals(idx.position().fileType().name()))
-                    .toList();
-            assertTrue(!parquetIndexes.isEmpty(),
-                    "Expected at least one PARQUET index after compaction, logId=" + logId.id());
+            assertTrue(summary.indexCount() > 0,
+                    "Expected indexes to be present for logId=" + summary.logId());
+            assertTrue(summary.parquetIndexCount() > 0,
+                    "Expected at least one PARQUET index after compaction, logId=" + summary.logId());
 
             log.info("Verified PARQUET index usage: {} of {} indexes are PARQUET for logId={}",
-                    parquetIndexes.size(), indexes.size(), logId.id());
+                    summary.parquetIndexCount(), summary.indexCount(), summary.logId());
         }
     }
 

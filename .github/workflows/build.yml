@@ -137,7 +137,6 @@ jobs:
 
       # Install ursa-storage artifacts into mavenLocal so :storage can resolve
       - name: Checkout ursa-storage
-        if: ${{ !inputs.is-public-fork }}
         uses: actions/checkout@v5
         with:
           repository: lakestream-io/ursa-storage
@@ -146,21 +145,18 @@ jobs:
           persist-credentials: false
 
       - name: Setup Java (for ursa-storage build)
-        if: ${{ !inputs.is-public-fork }}
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install ursa-storage into Maven Local
-        if: ${{ !inputs.is-public-fork }}
         working-directory: ursa-storage
         run: mvn -ntp -B -DskipTests install -U
 
       # Ensure the checked-out ursa-storage source tree does not affect Rat/license checks
       # executed as part of the Gradle build in this repo.
       - name: Remove ursa-storage source tree
-        if: ${{ !inputs.is-public-fork }}
         run: rm -rf ursa-storage
 
       - name: Setup Gradle
@@ -243,7 +239,6 @@ jobs:
 
       # Install ursa-storage artifacts into mavenLocal so tests can resolve
       - name: Checkout ursa-storage
-        if: ${{ !inputs.is-public-fork }}
         uses: actions/checkout@v5
         with:
           repository: lakestream-io/ursa-storage
@@ -252,21 +247,18 @@ jobs:
           persist-credentials: false
 
       - name: Setup Java (for ursa-storage build)
-        if: ${{ !inputs.is-public-fork }}
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install ursa-storage into Maven Local
-        if: ${{ !inputs.is-public-fork }}
         working-directory: ursa-storage
         run: mvn -ntp -B -DskipTests install -U
 
       # Ensure the checked-out ursa-storage source tree does not affect Rat/license checks
       # executed as part of the Gradle build in this repo.
       - name: Remove ursa-storage source tree
-        if: ${{ !inputs.is-public-fork }}
         run: rm -rf ursa-storage
 
       - name: Setup Gradle
@@ -359,7 +351,6 @@ jobs:
 
       # Install ursa-storage artifacts into mavenLocal so tests can resolve
       - name: Checkout ursa-storage
-        if: ${{ !inputs.is-public-fork }}
         uses: actions/checkout@v5
         with:
           repository: lakestream-io/ursa-storage
@@ -368,21 +359,18 @@ jobs:
           persist-credentials: false
 
       - name: Setup Java (for ursa-storage build)
-        if: ${{ !inputs.is-public-fork }}
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
       - name: Install ursa-storage into Maven Local
-        if: ${{ !inputs.is-public-fork }}
         working-directory: ursa-storage
         run: mvn -ntp -B -DskipTests install -U
 
       # Ensure the checked-out ursa-storage source tree does not affect Rat/license checks
       # executed as part of the Gradle build in this repo.
       - name: Remove ursa-storage source tree
-        if: ${{ !inputs.is-public-fork }}
         run: rm -rf ursa-storage
 
       - name: Setup Gradle
@@ -398,7 +386,7 @@ jobs:
         uses: ./.github/actions/run-gradle
         with:
           # Restrict to relevant modules to avoid compiling/running tests across the whole repo.
-          test-task: :server:test :storage:test :metadata:test
+          test-task: :server:test :storage:test :metadata:test :storage:storage-diskless-api:test :storage:storage-diskless-ursa:test
           timeout-minutes: 180  # 3 hours
           test-catalog-path: ""
           build-scan-artifact-name: build-scan-isolated-17
