@@ -146,6 +146,19 @@ class KafkaConfigTest {
   }
 
   @Test
+  def testDisklessLogConfigIncludesBrokerRetentionCheckInterval(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, port = 8181)
+    props.setProperty(ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, "1234")
+
+    val cfg = KafkaConfig.fromProps(props)
+    assertFalse(cfg.extractLogConfigMap.containsKey(ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG))
+    assertEquals(1234L, cfg.extractDisklessLogConfigMap
+      .get(ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG)
+      .asInstanceOf[java.lang.Long]
+      .longValue())
+  }
+
+  @Test
   def testLogRetentionTimeBothMinutesAndHoursProvided(): Unit = {
     val props = TestUtils.createBrokerConfig(0, port = 8181)
     props.setProperty(ServerLogConfigs.LOG_RETENTION_TIME_MINUTES_CONFIG, "30")

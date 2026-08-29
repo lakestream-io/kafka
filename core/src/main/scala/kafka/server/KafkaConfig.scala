@@ -740,7 +740,6 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _], enforceProv
     logProps.put(TopicConfig.FLUSH_MS_CONFIG, logFlushIntervalMs)
     logProps.put(TopicConfig.RETENTION_BYTES_CONFIG, logRetentionBytes)
     logProps.put(TopicConfig.RETENTION_MS_CONFIG, logRetentionTimeMillis: java.lang.Long)
-    logProps.put(ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, logCleanupIntervalMs: java.lang.Long)
     logProps.put(TopicConfig.MAX_MESSAGE_BYTES_CONFIG, messageMaxBytes)
     logProps.put(TopicConfig.INDEX_INTERVAL_BYTES_CONFIG, logIndexIntervalBytes)
     logProps.put(TopicConfig.DELETE_RETENTION_MS_CONFIG, logCleanerDeleteRetentionMs)
@@ -761,6 +760,16 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _], enforceProv
     logProps.put(TopicConfig.MESSAGE_TIMESTAMP_AFTER_MAX_MS_CONFIG, logMessageTimestampAfterMaxMs: java.lang.Long)
     logProps.put(TopicConfig.LOCAL_LOG_RETENTION_MS_CONFIG, remoteLogManagerConfig.logLocalRetentionMs: java.lang.Long)
     logProps.put(TopicConfig.LOCAL_LOG_RETENTION_BYTES_CONFIG, remoteLogManagerConfig.logLocalRetentionBytes: java.lang.Long)
+    logProps
+  }
+
+  /**
+   * Adds broker-only settings consumed by the diskless runtime. This map must not be used to construct a topic
+   * [[LogConfig]], because those settings would then be exposed by topic DescribeConfigs.
+   */
+  private[server] def extractDisklessLogConfigMap: java.util.Map[String, Object] = {
+    val logProps = new java.util.HashMap[String, Object](extractLogConfigMap)
+    logProps.put(ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, logCleanupIntervalMs: java.lang.Long)
     logProps
   }
 }
