@@ -149,6 +149,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: maven
+          cache-dependency-path: 'ursa-storage/**/pom.xml'
 
       - name: Install ursa-storage into Maven Local
         working-directory: ursa-storage
@@ -251,6 +253,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: maven
+          cache-dependency-path: 'ursa-storage/**/pom.xml'
 
       - name: Install ursa-storage into Maven Local
         working-directory: ursa-storage
@@ -363,6 +367,8 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: maven
+          cache-dependency-path: 'ursa-storage/**/pom.xml'
 
       - name: Install ursa-storage into Maven Local
         working-directory: ursa-storage

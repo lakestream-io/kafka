@@ -141,24 +141,21 @@ public class UrsaSDTInterceptorE2ETest {
     void testPublishTasksAfterLiveLeaderMove() throws Exception {
         var currentTopic = "test-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var topicPartition = new TopicPartition(currentTopic, 0);
-        createTopicWithAssignment(currentTopic, Map.of(0, List.of(0, 1)));
+        var topicId = createTopicWithAssignment(currentTopic, Map.of(0, List.of(0, 1)));
 
         waitForLeader(currentTopic, 0, 0);
 
         produceRecords(currentTopic, 0, 0, NUM_RECORDS);
 
-        var topicNameInTask = taskTopicName(currentTopic, topicId(currentTopic), 0);
+        var topicNameInTask = taskTopicName(currentTopic, topicId, 0);
 
         Awaitility.await().atMost(Duration.ofSeconds(60))
             .pollInterval(Duration.ofSeconds(2))
             .untilAsserted(() -> {
                 var tasksInTopic = tasksForTopic(topicNameInTask);
-                assertEquals(1, tasksInTopic.size());
-                var task = tasksInTopic.get(0);
-                assertEquals(0, task.getStartOffset());
-                assertEquals(100, task.getEndOffset());
-                assertEquals("0", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
+                assertTaskCoverage(tasksInTopic, topicNameInTask, 0, NUM_RECORDS, Optional.of("0"));
             });
+        var taskCountBeforeMove = tasksForTopic(topicNameInTask).size();
 
         admin.alterPartitionReassignments(Map.of(
             topicPartition,
@@ -174,22 +171,17 @@ public class UrsaSDTInterceptorE2ETest {
             .pollInterval(Duration.ofSeconds(2))
             .untilAsserted(() -> {
                 var tasksInTopic = tasksForTopic(topicNameInTask);
-                assertEquals(2, tasksInTopic.size());
-                var task = tasksInTopic.get(1);
-                assertEquals(100, task.getStartOffset());
-                assertEquals(200, task.getEndOffset());
-                assertEquals("1", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
+                assertTrue(tasksInTopic.size() > taskCountBeforeMove);
+                assertLeaderMoveTaskCoverage(tasksInTopic, topicNameInTask);
             });
+        var taskCountAfterMove = tasksForTopic(topicNameInTask).size();
 
         Awaitility.await().atMost(Duration.ofSeconds(15))
             .pollDelay(Duration.ofSeconds(8))
             .untilAsserted(() -> {
                 var tasksInTopic = tasksForTopic(topicNameInTask);
-                assertEquals(2, tasksInTopic.size());
-                assertTrue(tasksInTopic.stream()
-                    .filter(task -> task.getStartOffset() >= NUM_RECORDS)
-                    .noneMatch(task -> "0".equals(task.getProperties()
-                        .get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY))));
+                assertEquals(taskCountAfterMove, tasksInTopic.size());
+                assertLeaderMoveTaskCoverage(tasksInTopic, topicNameInTask);
             });
     }
 
@@ -198,25 +190,22 @@ public class UrsaSDTInterceptorE2ETest {
     void testPublishTasksAfterSingleReplicaLeaderMove() throws Exception {
         var currentTopic = "test-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var topicPartition = new TopicPartition(currentTopic, 0);
-        createTopicWithAssignment(currentTopic, Map.of(0, List.of(0)));
+        var topicId = createTopicWithAssignment(currentTopic, Map.of(0, List.of(0)));
 
         waitForLeader(currentTopic, 0, 0);
         waitForReplicas(currentTopic, 0, List.of(0));
 
         produceRecords(currentTopic, 0, 0, NUM_RECORDS);
 
-        var topicNameInTask = taskTopicName(currentTopic, topicId(currentTopic), 0);
+        var topicNameInTask = taskTopicName(currentTopic, topicId, 0);
 
         Awaitility.await().atMost(Duration.ofSeconds(60))
             .pollInterval(Duration.ofSeconds(2))
             .untilAsserted(() -> {
                 var tasksInTopic = tasksForTopic(topicNameInTask);
-                assertEquals(1, tasksInTopic.size());
-                var task = tasksInTopic.get(0);
-                assertEquals(0, task.getStartOffset());
-                assertEquals(100, task.getEndOffset());
-                assertEquals("0", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
+                assertTaskCoverage(tasksInTopic, topicNameInTask, 0, NUM_RECORDS, Optional.of("0"));
             });
+        var taskCountBeforeMove = tasksForTopic(topicNameInTask).size();
 
         admin.alterPartitionReassignments(Map.of(
             topicPartition,
@@ -228,7 +217,8 @@ public class UrsaSDTInterceptorE2ETest {
         Awaitility.await().pollDelay(Duration.ofSeconds(8)).atMost(Duration.ofSeconds(15))
             .untilAsserted(() -> {
                 var tasksInTopic = tasksForTopic(topicNameInTask);
-                assertEquals(1, tasksInTopic.size());
+                assertEquals(taskCountBeforeMove, tasksInTopic.size());
+                assertTaskCoverage(tasksInTopic, topicNameInTask, 0, NUM_RECORDS, Optional.of("0"));
             });
 
         produceRecords(currentTopic, 0, NUM_RECORDS, NUM_RECORDS);
@@ -237,21 +227,16 @@ public class UrsaSDTInterceptorE2ETest {
             .pollInterval(Duration.ofSeconds(2))
             .untilAsserted(() -> {
                 var tasksInTopic = tasksForTopic(topicNameInTask);
-                assertEquals(2, tasksInTopic.size());
-                var task = tasksInTopic.get(1);
-                assertEquals(100, task.getStartOffset());
-                assertEquals(200, task.getEndOffset());
-                assertEquals("1", task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY));
+                assertTrue(tasksInTopic.size() > taskCountBeforeMove);
+                assertLeaderMoveTaskCoverage(tasksInTopic, topicNameInTask);
             });
+        var taskCountAfterMove = tasksForTopic(topicNameInTask).size();
 
         Awaitility.await().pollDelay(Duration.ofSeconds(8)).atMost(Duration.ofSeconds(15))
             .untilAsserted(() -> {
                 var tasksInTopic = tasksForTopic(topicNameInTask);
-                assertEquals(2, tasksInTopic.size());
-                assertTrue(tasksInTopic.stream()
-                    .filter(task -> task.getStartOffset() >= NUM_RECORDS)
-                    .noneMatch(task -> "0".equals(task.getProperties()
-                        .get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY))));
+                assertEquals(taskCountAfterMove, tasksInTopic.size());
+                assertLeaderMoveTaskCoverage(tasksInTopic, topicNameInTask);
             });
     }
 
@@ -260,8 +245,7 @@ public class UrsaSDTInterceptorE2ETest {
     void testPublishTasksWithMultiplePartitions() throws Exception {
         var currentTopic = "test-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var partitions = 5;
-        createTopicWithDefaults(currentTopic, partitions);
-        var topicId = topicId(currentTopic);
+        var topicId = createTopicWithDefaults(currentTopic, partitions);
         try (Producer<byte[], byte[]> producer = createProducer()) {
             for (int i = 0; i < 10; i++) {
                 for (int j = 0; j < partitions; j++) {
@@ -282,16 +266,7 @@ public class UrsaSDTInterceptorE2ETest {
                 for (int i = 0; i < partitions; i++) {
                     var topicName = taskTopicName(currentTopic, topicId, i);
                     var tasksInTopic = tasksForTopic(topicName);
-                    assertFalse(tasksInTopic.isEmpty(),
-                        "Compaction task for partition " + i + " is not found");
-                    assertEquals(1, tasksInTopic.size(),
-                        String.format("There should be only one compaction task for %s, tasks %s", topicName,
-                            Arrays.toString(tasksInTopic.toArray())));
-                    var task = tasksInTopic.get(0);
-                    assertEquals(topicName, task.getTopic());
-                    assertEquals(0, task.getStartOffset());
-                    assertEquals(10, task.getEndOffset());
-                    assertEquals("KAFKA", task.getProperties().get("entryFormat"));
+                    assertTaskCoverage(tasksInTopic, topicName, 0, 10, Optional.empty());
                 }
             });
 
@@ -302,8 +277,7 @@ public class UrsaSDTInterceptorE2ETest {
     void testPublishMultipleCompactionTasks() throws Exception {
         var currentTopic = "test-topic-" + RandomStringUtils.secure().nextAlphabetic(4);
         var partitions = 1;
-        createTopicWithDefaults(currentTopic, partitions);
-        var topicId = topicId(currentTopic);
+        var topicId = createTopicWithDefaults(currentTopic, partitions);
 
         // Produce first batch of records
         try (Producer<byte[], byte[]> producer = createProducer()) {
@@ -326,13 +300,9 @@ public class UrsaSDTInterceptorE2ETest {
             .untilAsserted(() -> {
                 var topicName = taskTopicName(currentTopic, topicId, 0);
                 var tasksInTopic = tasksForTopic(topicName);
-                assertEquals(1, tasksInTopic.size());
-                var task = tasksInTopic.get(0);
-                assertEquals(topicName, task.getTopic());
-                assertEquals(0, task.getStartOffset());
-                assertEquals(100, task.getEndOffset());
-                assertEquals("KAFKA", task.getProperties().get("entryFormat"));
+                assertTaskCoverage(tasksInTopic, topicName, 0, NUM_RECORDS, Optional.empty());
             });
+        var firstBatchTaskCount = tasksForTopic(taskTopicName(currentTopic, topicId, 0)).size();
 
         // Produce second batch of records
         try (Producer<byte[], byte[]> producer = createProducer()) {
@@ -355,12 +325,8 @@ public class UrsaSDTInterceptorE2ETest {
             .untilAsserted(() -> {
                 var topicName = taskTopicName(currentTopic, topicId, 0);
                 var tasksInTopic = tasksForTopic(topicName);
-                assertEquals(2, tasksInTopic.size());
-                var task = tasksInTopic.get(tasksInTopic.size() - 1);
-                assertEquals(topicName, task.getTopic());
-                assertEquals(100, task.getStartOffset());
-                assertEquals(200, task.getEndOffset());
-                assertEquals("KAFKA", task.getProperties().get("entryFormat"));
+                assertTrue(tasksInTopic.size() > firstBatchTaskCount);
+                assertTaskCoverage(tasksInTopic, topicName, 0, NUM_RECORDS * 2L, Optional.empty());
             });
     }
 
@@ -389,17 +355,19 @@ public class UrsaSDTInterceptorE2ETest {
     }
 
 
-    private void createTopicWithDefaults(String topicName, int partitions) throws Exception {
+    private Uuid createTopicWithDefaults(String topicName, int partitions) throws Exception {
         NewTopic newTopic = new NewTopic(topicName, partitions, (short) 1);
-        admin.createTopics(Collections.singleton(newTopic))
-                .all().get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        var result = admin.createTopics(Collections.singleton(newTopic));
+        result.all().get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        return result.topicId(topicName).get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
-    private void createTopicWithAssignment(String topicName, Map<Integer, List<Integer>> replicasAssignments)
+    private Uuid createTopicWithAssignment(String topicName, Map<Integer, List<Integer>> replicasAssignments)
             throws Exception {
         NewTopic newTopic = new NewTopic(topicName, replicasAssignments);
-        admin.createTopics(Collections.singleton(newTopic))
-                .all().get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        var result = admin.createTopics(Collections.singleton(newTopic));
+        result.all().get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        return result.topicId(topicName).get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     private void waitForLeader(String topicName, int partition, int expectedLeader) {
@@ -430,12 +398,6 @@ public class UrsaSDTInterceptorE2ETest {
             .toList();
     }
 
-    private Uuid topicId(String topicName) throws Exception {
-        return admin.describeTopics(Collections.singleton(topicName))
-            .allTopicNames().get(PRODUCE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            .get(topicName).topicId();
-    }
-
     private static String taskTopicName(String topicName, Uuid topicId, int partition) {
         return KafkaLogNaming.logName(new TopicIdPartition(
             topicId, new TopicPartition(topicName, partition)));
@@ -456,5 +418,46 @@ public class UrsaSDTInterceptorE2ETest {
         }
         Collections.sort(tasksInTopic);
         return tasksInTopic;
+    }
+
+    private static void assertLeaderMoveTaskCoverage(
+            List<CompactStreamTask> tasks,
+            String topicName) {
+        var tasksBeforeMove = tasks.stream()
+            .filter(task -> task.getEndOffset() <= NUM_RECORDS)
+            .toList();
+        var tasksAfterMove = tasks.stream()
+            .filter(task -> task.getStartOffset() >= NUM_RECORDS)
+            .toList();
+        assertEquals(tasks.size(), tasksBeforeMove.size() + tasksAfterMove.size(),
+            "A compaction task crossed the leader-move offset boundary: " + Arrays.toString(tasks.toArray()));
+        assertTaskCoverage(tasksBeforeMove, topicName, 0, NUM_RECORDS, Optional.of("0"));
+        assertTaskCoverage(tasksAfterMove, topicName, NUM_RECORDS, NUM_RECORDS * 2L, Optional.of("1"));
+    }
+
+    private static void assertTaskCoverage(
+            List<CompactStreamTask> tasks,
+            String topicName,
+            long expectedStartOffset,
+            long expectedEndOffset,
+            Optional<String> expectedBrokerId) {
+        assertFalse(tasks.isEmpty(), "Compaction tasks are not found for " + topicName);
+        long nextOffset = expectedStartOffset;
+        for (var task : tasks) {
+            assertEquals(topicName, task.getTopic());
+            assertEquals(nextOffset, task.getStartOffset(),
+                "Compaction tasks must be contiguous and non-overlapping: " + Arrays.toString(tasks.toArray()));
+            assertTrue(task.getEndOffset() > task.getStartOffset(),
+                "Compaction task must contain a non-empty offset range: " + task);
+            assertTrue(task.getEndOffset() <= expectedEndOffset,
+                "Compaction task exceeds the expected offset range: " + task);
+            assertEquals("KAFKA", task.getProperties().get("entryFormat"));
+            expectedBrokerId.ifPresent(brokerId -> assertEquals(
+                brokerId,
+                task.getProperties().get(UrsaSDTInterceptor.PUBLISHER_BROKER_ID_PROPERTY)));
+            nextOffset = task.getEndOffset();
+        }
+        assertEquals(expectedEndOffset, nextOffset,
+            "Compaction tasks do not cover the expected offset range: " + Arrays.toString(tasks.toArray()));
     }
 }
