@@ -21,6 +21,7 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
@@ -52,6 +53,7 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
     private final Method listStreamsMethod;
     private final Method streamExistsMethod;
     private final Method loadStreamMethod;
+    private final Method getLayoutMethod;
     private final Method streamPartitioningMethod;
     private final Method partitionCountMethod;
     private final Method streamLayoutMethod;
@@ -103,6 +105,7 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
         listStreamsMethod = catalogClass.getMethod("listStreams", String.class);
         streamExistsMethod = catalogClass.getMethod("streamExists", identifierClass);
         loadStreamMethod = catalogClass.getMethod("loadStream", identifierClass);
+        getLayoutMethod = catalogClass.getMethod("getLayout", identifierClass);
         streamPartitioningMethod = streamClass.getMethod("partitioning");
         partitionCountMethod = partitioningClass.getMethod("numPartitions");
         streamLayoutMethod = streamClass.getMethod("layout");
@@ -161,6 +164,28 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
             } finally {
                 closeResource(stream);
             }
+        });
+    }
+
+    List<Long> partitionLogIds(
+            String namespace,
+            String streamName,
+            long timeout,
+            TimeUnit unit
+    ) throws Exception {
+        return withContextClassLoader(() -> {
+            Object layout = result(
+                    getLayoutMethod,
+                    catalog,
+                    timeout,
+                    unit,
+                    identifier(namespace, streamName));
+            List<?> logIds = result(layoutLogIdsMethod, layout, timeout, unit);
+            List<Long> values = new ArrayList<>(logIds.size());
+            for (Object logId : logIds) {
+                values.add(((Number) invoke(logIdValueMethod, logId)).longValue());
+            }
+            return List.copyOf(values);
         });
     }
 
