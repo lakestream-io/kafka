@@ -90,8 +90,8 @@ if grep -F -q "During compact error" <<< "$compactor_logs"; then
   echo "The compactor logged a task failure; inspect its logs before retrying." >&2
   exit 1
 fi
-if ! grep -F -q "Internal compaction task publisher is disabled" <<< "$compactor_logs"; then
-  echo "The compactor did not enter external task-publication mode." >&2
+if grep -F -q "Internal compaction task publisher is disabled" <<< "$compactor_logs"; then
+  echo "The compactor unexpectedly disabled its internal task publisher." >&2
   exit 1
 fi
 

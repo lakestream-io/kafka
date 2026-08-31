@@ -1143,7 +1143,7 @@ project(':server') {
 // Resolve Ursa's private runtime independently from Kafka project dependencies. The Ursa
 // parent POM is the version contract for Oxia, gRPC, Protobuf, Jackson, OpenTelemetry, and
 // the remaining provider-side libraries packaged under ./ursa-storage/.
-def createIsolatedUrsaRuntimeClasspath = { Project runtimeProject ->
+def createIsolatedUrsaRuntimeClasspath = { Project runtimeProject, List<String> runtimeDependencies ->
   def runtimeConfiguration = runtimeProject.configurations.create('ursaRuntimeClasspath') {
     canBeConsumed = false
     canBeResolved = true
@@ -1158,22 +1158,19 @@ def createIsolatedUrsaRuntimeClasspath = { Project runtimeProject ->
     runtimeConfiguration.name,
     runtimeProject.dependencies.enforcedPlatform("io.lakestream:ursa-storage:$ursaStorageVersion")
   )
-  runtimeProject.dependencies.add(
-    runtimeConfiguration.name,
-    "io.lakestream:ursa-storage-kafka-runtime:$ursaStorageVersion"
-  ) {
-    // Kafka and logging APIs are supplied by the parent Kafka runtime.
-    exclude group: 'org.apache.kafka', module: 'kafka-clients'
-    exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
+  runtimeDependencies.each { runtimeDependency ->
+    runtimeProject.dependencies.add(runtimeConfiguration.name, runtimeDependency) {
+      // Kafka and logging APIs are supplied by the parent Kafka runtime.
+      exclude group: 'org.apache.kafka', module: 'kafka-clients'
+      exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j2-impl'
+    }
   }
   runtimeConfiguration
 }
 
 def storageDisklessUrsaRuntimeClasspath = createIsolatedUrsaRuntimeClasspath(
-  project(':storage:storage-diskless-ursa')
-)
-def coreSdtUrsaRuntimeClasspath = createIsolatedUrsaRuntimeClasspath(
-  project(':core:core-sdt-ursa')
+  project(':storage:storage-diskless-ursa'),
+  ["io.lakestream:ursa-storage-kafka-runtime:$ursaStorageVersion"]
 )
 
 def kafkaRuntimeProvidedJarPatterns = [
@@ -1217,21 +1214,6 @@ def syncStorageDisklessUrsaRuntimeClasspath = registerIsolatedUrsaRuntimeClasspa
   storageDisklessUrsaRuntimeClasspath,
   'syncDisklessUrsaRuntimeClasspath',
   'diskless-ursa-runtime-classpath'
-)
-
-def syncCoreSdtUrsaRuntimeClasspath = registerIsolatedUrsaRuntimeClasspathSync(
-  project(':core:core-sdt-ursa'),
-  coreSdtUrsaRuntimeClasspath,
-  'syncCoreSdtUrsaRuntimeClasspath',
-  'core-sdt-ursa-runtime-classpath'
-)
-
-def syncCoreSdtUrsaTestRuntimeClasspath = registerIsolatedUrsaRuntimeClasspathSync(
-  project(':core:core-sdt-ursa'),
-  coreSdtUrsaRuntimeClasspath,
-  'syncCoreSdtUrsaTestRuntimeClasspath',
-  'core-sdt-ursa-test-runtime-classpath',
-  ['hessian-lite-*']
 )
 
 def isolatedUrsaRuntimeFileNames = providers.provider {
@@ -1534,8 +1516,6 @@ project(':core') {
     from(project(':streams:test-utils').configurations.runtimeClasspath) { into("libs/") }
     from(project(':streams:examples').jar) { into("libs/") }
     from(project(':streams:examples').configurations.runtimeClasspath) { into("libs/") }
-    from(project(':core:core-sdt-ursa').jar) { into("ursa-storage/") }
-    from(syncCoreSdtUrsaRuntimeClasspath) { into("ursa-storage/") }
     from(project(':storage:storage-diskless-ursa').jar) { into("ursa-storage/") }
     from(syncStorageDisklessUrsaRuntimeClasspath) { into("ursa-storage/") }
     eachFile { fileCopyDetails ->
@@ -1602,69 +1582,6 @@ project(':core') {
         srcDirs = ["src/test/java", "src/test/scala"]
       }
     }
-  }
-}
-
-project(':core:core-sdt-ursa') {
-  base {
-    archivesName = "kafka-core-sdt-ursa"
-  }
-
-  dependencies {
-    implementation platform("io.lakestream:ursa-storage:$ursaStorageVersion")
-    implementation project(':core')
-    implementation project(':metadata')
-    implementation project(':server')
-    implementation project(':server-common')
-    implementation project(':storage')
-    implementation project(':storage:storage-diskless-api')
-    implementation libs.commonsLang
-    implementation libs.guava
-    implementation libs.slf4jApi
-    implementation("io.lakestream:ursa-storage-common:$ursaStorageVersion") {
-      transitive = false
-    }
-    implementation("io.lakestream:ursa-storage-core:$ursaStorageVersion") {
-      transitive = false
-    }
-    implementation "io.lakestream:lakestream-api:$ursaStorageVersion"
-    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'
-    implementation 'com.fasterxml.jackson.module:jackson-module-parameter-names'
-    implementation 'io.github.oxia-db:oxia-client-api'
-    runtimeOnly 'io.github.oxia-db:oxia-client'
-    runtimeOnly 'org.apache.dubbo:hessian-lite'
-    testImplementation project(':clients').sourceSets.test.output
-    testImplementation project(':server-common').sourceSets.test.output
-    testImplementation project(':test-common:test-common-internal-api')
-    testImplementation project(':test-common:test-common-runtime')
-    testImplementation libs.commonsLang
-    testImplementation libs.junitJupiter
-    testImplementation libs.mockitoCore
-    testImplementation testLog4j2Libs
-    testImplementation 'io.github.oxia-db:oxia-testcontainers:0.7.4'
-    testImplementation 'org.testcontainers:testcontainers:1.21.4'
-    testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
-    testImplementation 'org.awaitility:awaitility:4.2.0'
-
-    testRuntimeOnly runtimeTestLibs
-  }
-
-  tasks.named('test') {
-    dependsOn syncCoreSdtUrsaTestRuntimeClasspath
-    systemProperty(
-      "ursa.sdt.test.class.path",
-      sourceSets.main.output.classesDirs.asPath
-        + File.pathSeparator
-        + isolatedRuntimeClasspathWildcard(project(':core:core-sdt-ursa'), 'core-sdt-ursa-test-runtime-classpath')
-    )
-  }
-
-  javadoc {
-    enabled = false
-  }
-
-  checkstyle {
-    configProperties = checkstyleConfigProperties("import-control-core.xml")
   }
 }
 

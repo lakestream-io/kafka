@@ -137,7 +137,7 @@ class LakestreamStorageHolderTest {
         StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> updatedConfig = Map.of("keep", "new", "added", "value");
 
-        when(catalog.openExternalPartition(identifier, 0, Map.of()))
+        when(catalog.openExternalPartition(identifier, 0, streamProperties(tp, Map.of())))
                 .thenReturn(CompletableFuture.completedFuture(log));
         when(catalog.streamExists(identifier))
                 .thenReturn(CompletableFuture.completedFuture(true))
@@ -148,7 +148,9 @@ class LakestreamStorageHolderTest {
                 .thenReturn(Map.of("keep", "old", "stale", "remove"));
         when(catalog.removeStreamProperties(identifier, List.of("stale")))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.setStreamProperties(identifier, updatedConfig))
+        when(catalog.setStreamProperties(identifier, streamProperties(tp, Map.of())))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.setStreamProperties(identifier, streamProperties(tp, updatedConfig)))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null);
@@ -156,7 +158,7 @@ class LakestreamStorageHolderTest {
         holder.asyncUpdateTopicConfig(tp, updatedConfig).get();
 
         verify(catalog).removeStreamProperties(identifier, List.of("stale"));
-        verify(catalog).setStreamProperties(identifier, updatedConfig);
+        verify(catalog).setStreamProperties(identifier, streamProperties(tp, updatedConfig));
     }
 
     @Test
@@ -181,7 +183,7 @@ class LakestreamStorageHolderTest {
         TopicIdPartition tp = topicIdPartition("test-topic");
         StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
 
-        when(catalog.openExternalPartition(identifier, 0, Map.of()))
+        when(catalog.openExternalPartition(identifier, 0, streamProperties(tp, Map.of())))
                 .thenReturn(CompletableFuture.completedFuture(log));
         when(catalog.streamExists(identifier))
                 .thenReturn(CompletableFuture.completedFuture(false))
@@ -208,7 +210,7 @@ class LakestreamStorageHolderTest {
         TopicIdPartition tp = topicIdPartition("failed-delete-topic");
         StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
 
-        when(catalog.openExternalPartition(identifier, 0, Map.of()))
+        when(catalog.openExternalPartition(identifier, 0, streamProperties(tp, Map.of())))
                 .thenReturn(CompletableFuture.completedFuture(log));
         when(catalog.streamExists(identifier))
                 .thenReturn(CompletableFuture.completedFuture(false))
@@ -236,12 +238,12 @@ class LakestreamStorageHolderTest {
         Stream deletedStream = mock(Stream.class);
         Stream recreatedStream = mock(Stream.class);
 
-        when(catalog.openExternalPartition(deletedIdentifier, 0, staleConfig))
+        when(catalog.openExternalPartition(deletedIdentifier, 0, streamProperties(deletedTp, staleConfig)))
                 .thenReturn(CompletableFuture.completedFuture(deletedLog));
         when(catalog.streamExists(deletedIdentifier))
                 .thenReturn(CompletableFuture.completedFuture(false))
                 .thenReturn(CompletableFuture.completedFuture(true));
-        when(catalog.openExternalPartition(recreatedIdentifier, 0, recreatedConfig))
+        when(catalog.openExternalPartition(recreatedIdentifier, 0, streamProperties(recreatedTp, recreatedConfig)))
                 .thenReturn(CompletableFuture.completedFuture(recreatedLog));
         when(catalog.streamExists(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(true));
         when(catalog.loadStream(deletedIdentifier)).thenReturn(CompletableFuture.completedFuture(deletedStream));
@@ -250,7 +252,7 @@ class LakestreamStorageHolderTest {
         when(recreatedStream.properties()).thenReturn(Map.of());
         when(catalog.removeStreamProperties(deletedIdentifier, List.of("stale")))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.setStreamProperties(recreatedIdentifier, recreatedConfig))
+        when(catalog.setStreamProperties(recreatedIdentifier, streamProperties(recreatedTp, recreatedConfig)))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null);
@@ -260,8 +262,10 @@ class LakestreamStorageHolderTest {
 
         InOrder order = inOrder(catalog);
         order.verify(catalog).removeStreamProperties(deletedIdentifier, List.of("stale"));
-        order.verify(catalog).openExternalPartition(recreatedIdentifier, 0, recreatedConfig);
-        order.verify(catalog).setStreamProperties(recreatedIdentifier, recreatedConfig);
+        order.verify(catalog).openExternalPartition(
+                recreatedIdentifier, 0, streamProperties(recreatedTp, recreatedConfig));
+        order.verify(catalog).setStreamProperties(
+                recreatedIdentifier, streamProperties(recreatedTp, recreatedConfig));
         verify(catalog, never()).openExternalPartition(recreatedIdentifier, 0, staleConfig);
         verify(catalog, never()).dropStream(deletedIdentifier, false);
     }
@@ -281,9 +285,9 @@ class LakestreamStorageHolderTest {
         Log recreatedLog = mock(Log.class);
         Stream deletedStream = mock(Stream.class);
 
-        when(catalog.openExternalPartition(deletedIdentifier, 0, deletedConfig))
+        when(catalog.openExternalPartition(deletedIdentifier, 0, streamProperties(deletedTp, deletedConfig)))
                 .thenReturn(CompletableFuture.completedFuture(deletedLog));
-        when(catalog.openExternalPartition(recreatedIdentifier, 0, recreatedConfig))
+        when(catalog.openExternalPartition(recreatedIdentifier, 0, streamProperties(recreatedTp, recreatedConfig)))
                 .thenReturn(CompletableFuture.completedFuture(recreatedLog));
         when(catalog.streamExists(deletedIdentifier))
                 .thenReturn(CompletableFuture.completedFuture(false))
@@ -301,7 +305,8 @@ class LakestreamStorageHolderTest {
 
         verify(catalog).removeStreamProperties(deletedIdentifier, List.of("stale"));
         verify(catalog, never()).loadStream(recreatedIdentifier);
-        verify(catalog).openExternalPartition(recreatedIdentifier, 0, recreatedConfig);
+        verify(catalog).openExternalPartition(
+                recreatedIdentifier, 0, streamProperties(recreatedTp, recreatedConfig));
     }
 
     @Test
@@ -319,19 +324,19 @@ class LakestreamStorageHolderTest {
         Stream stream = mock(Stream.class);
         CompletableFuture<Boolean> deleteStreamExistsFuture = new CompletableFuture<>();
 
-        when(catalog.openExternalPartition(deletedIdentifier, 0, Map.of()))
+        when(catalog.openExternalPartition(deletedIdentifier, 0, streamProperties(deletedTp, Map.of())))
                 .thenReturn(CompletableFuture.completedFuture(deletedLog));
         when(catalog.streamExists(deletedIdentifier))
                 .thenReturn(CompletableFuture.completedFuture(false))
                 .thenReturn(deleteStreamExistsFuture);
-        when(catalog.openExternalPartition(recreatedIdentifier, 0, recreatedConfig))
+        when(catalog.openExternalPartition(recreatedIdentifier, 0, streamProperties(recreatedTp, recreatedConfig)))
                 .thenReturn(CompletableFuture.completedFuture(recreatedLog));
         when(catalog.streamExists(recreatedIdentifier))
                 .thenReturn(CompletableFuture.completedFuture(false))
                 .thenReturn(CompletableFuture.completedFuture(true));
         when(catalog.loadStream(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
-        when(catalog.setStreamProperties(recreatedIdentifier, recreatedConfig))
+        when(catalog.setStreamProperties(recreatedIdentifier, streamProperties(recreatedTp, recreatedConfig)))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null);
@@ -349,8 +354,10 @@ class LakestreamStorageHolderTest {
                 recreatedTp, Map.of("stale", "snapshot")).get());
 
         InOrder order = inOrder(catalog);
-        order.verify(catalog).openExternalPartition(recreatedIdentifier, 0, recreatedConfig);
-        order.verify(catalog).setStreamProperties(recreatedIdentifier, recreatedConfig);
+        order.verify(catalog).openExternalPartition(
+                recreatedIdentifier, 0, streamProperties(recreatedTp, recreatedConfig));
+        order.verify(catalog).setStreamProperties(
+                recreatedIdentifier, streamProperties(recreatedTp, recreatedConfig));
         verify(catalog, never()).dropStream(deletedIdentifier, false);
     }
 
@@ -379,13 +386,13 @@ class LakestreamStorageHolderTest {
         Map<String, String> latestConfig = Map.of("retention.ms", "2000");
         CompletableFuture<Log> opening = new CompletableFuture<>();
 
-        when(catalog.openExternalPartition(identifier, 0, initialConfig)).thenReturn(opening);
+        when(catalog.openExternalPartition(identifier, 0, streamProperties(tp, initialConfig))).thenReturn(opening);
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(true));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
-        when(catalog.setStreamProperties(identifier, initialConfig))
+        when(catalog.setStreamProperties(identifier, streamProperties(tp, initialConfig)))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.setStreamProperties(identifier, latestConfig))
+        when(catalog.setStreamProperties(identifier, streamProperties(tp, latestConfig)))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null);
@@ -399,9 +406,9 @@ class LakestreamStorageHolderTest {
         updateFuture.get();
 
         InOrder order = inOrder(catalog);
-        order.verify(catalog).openExternalPartition(identifier, 0, initialConfig);
-        order.verify(catalog).setStreamProperties(identifier, initialConfig);
-        order.verify(catalog).setStreamProperties(identifier, latestConfig);
+        order.verify(catalog).openExternalPartition(identifier, 0, streamProperties(tp, initialConfig));
+        order.verify(catalog).setStreamProperties(identifier, streamProperties(tp, initialConfig));
+        order.verify(catalog).setStreamProperties(identifier, streamProperties(tp, latestConfig));
     }
 
     @Test
@@ -413,7 +420,7 @@ class LakestreamStorageHolderTest {
         RuntimeException configError = new RuntimeException("catalog unavailable");
         RuntimeException closeError = new RuntimeException("close failed");
 
-        when(catalog.openExternalPartition(identifier, 0, Map.of()))
+        when(catalog.openExternalPartition(identifier, 0, streamProperties(tp, Map.of())))
                 .thenReturn(CompletableFuture.completedFuture(log));
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.failedFuture(configError));
         doThrow(closeError).when(log).close();
@@ -436,7 +443,7 @@ class LakestreamStorageHolderTest {
         StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         CompletableFuture<Log> opening = new CompletableFuture<>();
 
-        when(catalog.openExternalPartition(identifier, 0, Map.of())).thenReturn(opening);
+        when(catalog.openExternalPartition(identifier, 0, streamProperties(tp, Map.of()))).thenReturn(opening);
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(false));
         when(catalog.deleteExternalPartition(identifier, 0))
                 .thenReturn(CompletableFuture.completedFuture(null));
@@ -456,7 +463,7 @@ class LakestreamStorageHolderTest {
         CompletableFuture<Log> lateOpen = holder.openPartition(tp, Map.of());
         assertThrows(ExecutionException.class, lateOpen::get);
         InOrder order = inOrder(catalog);
-        order.verify(catalog).openExternalPartition(identifier, 0, Map.of());
+        order.verify(catalog).openExternalPartition(identifier, 0, streamProperties(tp, Map.of()));
         order.verify(catalog).deleteExternalPartition(identifier, 0);
     }
 
@@ -488,11 +495,11 @@ class LakestreamStorageHolderTest {
         Log recreatedLog = mock(Log.class);
         RuntimeException deleteError = new RuntimeException("delete failed");
 
-        when(catalog.openExternalPartition(deletedIdentifier, 0, Map.of()))
+        when(catalog.openExternalPartition(deletedIdentifier, 0, streamProperties(deletedTp, Map.of())))
                 .thenReturn(CompletableFuture.completedFuture(deletedLog));
         when(catalog.deleteExternalPartition(deletedIdentifier, 0))
                 .thenReturn(CompletableFuture.failedFuture(deleteError));
-        when(catalog.openExternalPartition(recreatedIdentifier, 0, Map.of()))
+        when(catalog.openExternalPartition(recreatedIdentifier, 0, streamProperties(recreatedTp, Map.of())))
                 .thenReturn(CompletableFuture.completedFuture(recreatedLog));
         when(catalog.streamExists(deletedIdentifier)).thenReturn(CompletableFuture.completedFuture(false));
         when(catalog.streamExists(recreatedIdentifier)).thenReturn(CompletableFuture.completedFuture(false));
@@ -506,8 +513,8 @@ class LakestreamStorageHolderTest {
 
         assertSame(recreatedLog, holder.openPartition(recreatedTp, Map.of()).get());
         assertNotEquals(deletedIdentifier, recreatedIdentifier);
-        verify(catalog).openExternalPartition(deletedIdentifier, 0, Map.of());
-        verify(catalog).openExternalPartition(recreatedIdentifier, 0, Map.of());
+        verify(catalog).openExternalPartition(deletedIdentifier, 0, streamProperties(deletedTp, Map.of()));
+        verify(catalog).openExternalPartition(recreatedIdentifier, 0, streamProperties(recreatedTp, Map.of()));
     }
 
     @Test
@@ -543,5 +550,11 @@ class LakestreamStorageHolderTest {
 
     private static TopicIdPartition topicIdPartition(String topic) {
         return new TopicIdPartition(Uuid.randomUuid(), new TopicPartition(topic, 0));
+    }
+
+    private static Map<String, String> streamProperties(
+            TopicIdPartition topicIdPartition,
+            Map<String, String> topicConfig) {
+        return KafkaLogNaming.streamProperties(topicIdPartition.topic(), topicConfig);
     }
 }

@@ -136,7 +136,7 @@ In this LIP, diskless topics are handled by the Lakestream-backed implementation
 │   │  │              │                   │                   │      │    │   │
 │   │  │              ▼                   ▼                   ▼      │    │   │
 │   │  │    ┌─────────────────┐ ┌─────────────────┐ ┌────────────┐   │    │   │
-│   │  │    │UrsaML Writer    │ │UrsaML Reader    │ │ Classic Log│   │    │   │
+│   │  │    │Lakestream Writer│ │Lakestream Reader│ │ Classic Log│   │    │   │
 │   │  │    └────────┬────────┘ └────────┬────────┘ └─────┬──────┘   │    │   │
 │   │  └─────────────┼───────────────────┼────────────────┼──────────┘    │   │
 │   └────────────────┼───────────────────┼────────────────┼───────────────┘   │
@@ -657,13 +657,15 @@ Diskless topics support **external compaction** via the Ursa compactor. In this 
 
 This external compaction is **not** Kafka key/value log compaction and does **not** change consumer semantics for diskless topics. Kafka-side K/V log compaction remains unsupported for diskless topics (see **Limitations** → **No K/V Compaction**).
 
+Compaction-task ownership follows the storage boundary. For diskless topics, the standalone Ursa compactor discovers Lakestream partition logs and publishes its own tasks; Kafka brokers do not run a compaction-task publisher. The compactor reads the WAL through the Storage API and decodes the Kafka `MemoryRecords` carried by each entry. Classic-topic lakehouse ingestion is outside this integration and will use a separate StreamCatalog-based source-reader design.
+
 The Ursa storage runtime reads the V2 `KAFKA_BATCHED_RAW_PARQUET` format behind the Lakestream API. Kafka broker code neither selects nor instantiates the compacted-object reader implementation. The runtime fails fast for legacy V1 lakehouse indexes.
 
 **Architecture**:
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │  Kafka Broker   │────▶│   Ursa WAL      │────▶│  Ursa Compactor │
-│  (writes data)  │     │   (S3/Local)    │     │  (external)     │
+│  (writes data)  │     │   (S3/Local)    │     │ (tasks + data)  │
 └─────────────────┘     └─────────────────┘     └────────┬────────┘
                                                          │
                                                          ▼
@@ -710,10 +712,14 @@ the reusable topic name. For topic ID `<uuid>`, the canonical identities are:
 - catalog log metadata: `/streams/default/<topic>-topic-id-<uuid>-partition-N`
 - keyed stream-ID mapping: `/stream-id-generator/default/<topic>-topic-id-<uuid>-partition-N`
 
-The name-only publisher cache key remains `<topic>-partition-N` so a same-name recreation fences
-the old publisher, while all persisted identities use the topic ID. If deletion cleanup fails, the
-old metadata can remain orphaned, but a recreated topic receives a distinct log, catalog stream,
-publication cursor, and object path and cannot attach to the orphan.
+Kafka also stores the stable logical topic name in the aggregate stream property
+`lakestream.kafka.topic.name`. Ursa materialization uses that value for Schema Registry subjects;
+it must not infer the logical topic from the UUID-qualified physical stream name.
+
+The Ursa compactor publishes diskless tasks from these incarnation-qualified Lakestream identities;
+there is no Kafka-side diskless publisher cache. If deletion cleanup fails, the old metadata can
+remain orphaned, but a recreated topic receives a distinct log, catalog stream, publication cursor,
+and object path and cannot attach to the orphan.
 
 In-place rolling upgrades from earlier experimental name-only diskless-storage metadata layouts are
 not supported. Deploy this version with an empty Oxia namespace, or perform an offline metadata and

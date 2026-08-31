@@ -26,7 +26,8 @@ property() {
 # Lakestream catalog, WAL metadata, and compaction task coordination.
 property metadataStoreUrl "$URSA_METADATA_STORE_URL"
 property oxiaStorageUrl "$URSA_OXIA_STORAGE_URL"
-property dataSourceForCompaction URSA
+# WAL entries contain Kafka MemoryRecords, which the materialization layer
+# decodes before writing table rows.
 
 # Ursa WAL in MinIO.
 property backendStorageType S3
@@ -58,9 +59,9 @@ property commitThreadNum "${URSA_COMMIT_THREAD_NUM:-2}"
 property maxCommitIntervalInSeconds "${URSA_MAX_COMMIT_INTERVAL_SECONDS:-2}"
 property metastoreRequestRateLimitPerSecond "${URSA_METASTORE_RATE_LIMIT:-500}"
 
-# Kafka publishes compaction ranges with the source topic and entry format that
-# materialization needs. Do not also publish the same ranges from CompactionMain.
-property internalCompactionTaskPublisherEnabled false
+# Diskless compaction-task ownership stays inside Ursa. The compactor discovers
+# Lakestream logs and publishes each range before materializing it.
+property internalCompactionTaskPublisherEnabled true
 
 # Fan each Ursa WAL read out to both the managed Kafka compacted-object sink
 # and an external Iceberg table registered in Polaris.

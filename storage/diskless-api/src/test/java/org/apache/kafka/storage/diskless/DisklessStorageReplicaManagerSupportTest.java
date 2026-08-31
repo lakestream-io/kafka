@@ -38,7 +38,6 @@ import org.apache.kafka.storage.internals.log.UnifiedLog;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetAddress;
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -46,17 +45,12 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -527,364 +521,18 @@ class DisklessStorageReplicaManagerSupportTest {
         try (DisklessStorageReplicaManagerSupport support =
                      new DisklessStorageReplicaManagerSupport(metadataView, localBrokerId, selector, new TestDisklessStorageEngine(writer, reader, ursaState))) {
             support.handleAppend(Map.of(tp, MemoryRecords.EMPTY), null).join();
-            long initialGeneration = support.currentDisklessOwnershipGeneration(tp);
-            assertTrue(initialGeneration > 0);
             clearInvocations(selector);
             when(selector.activeZones()).thenReturn(Set.of(DisklessClientZone.NO_ZONE));
             when(selector.selectBrokerForZone(tp.topicId(), tp.partition(), DisklessClientZone.NO_ZONE)).thenReturn(
                     java.util.OptionalInt.of(localBrokerId + 1));
 
-            AtomicInteger ownershipLossCount = new AtomicInteger();
-            AtomicLong lostGeneration = new AtomicLong();
-            support.reconcileTrackedPartitions(Set.of(), ignored -> { }, (lostPartition, generation) -> {
-                assertEquals(tp, lostPartition);
-                verify(ursaState, never()).cleanupPartition(tp, false);
-                ownershipLossCount.incrementAndGet();
-                lostGeneration.set(generation);
-            });
+            support.reconcileTrackedPartitions(Set.of(), ignored -> { });
 
             verify(ursaState).cleanupPartition(tp, false);
             verify(ursaState, never()).deletePartitionData(tp);
-            assertEquals(1, ownershipLossCount.get());
-            assertTrue(lostGeneration.get() > initialGeneration);
-            assertFalse(support.isCurrentDisklessOwnershipGeneration(tp, initialGeneration));
-            assertEquals(0, support.ownershipGenerationCount());
-
-            when(selector.selectBrokerForZone(tp.topicId(), tp.partition(), DisklessClientZone.NO_ZONE))
-                    .thenReturn(java.util.OptionalInt.of(localBrokerId));
-            long reacquiredGeneration = support.currentDisklessOwnershipGeneration(tp);
-            assertTrue(reacquiredGeneration > lostGeneration.get());
-            assertTrue(support.isCurrentDisklessOwnershipGeneration(tp, reacquiredGeneration));
             assertTrue(support.snapshotTrackedPartitions().isEmpty());
         } catch (Exception e) {
             throw new RuntimeException(e);
-        }
-    }
-
-    @Test
-    void testReconcilePublicationOwnershipWakesUntrackedTailAndFencesTransfer() throws Exception {
-        int localBrokerId = 1;
-        TopicIdPartition tp = topicIdPartition("diskless-publication-owner-topic", 0);
-        DisklessStorageMetadataView metadataView = mock(DisklessStorageMetadataView.class);
-        DisklessBrokerSelector selector = mock(DisklessBrokerSelector.class);
-        AtomicInteger selectedBroker = new AtomicInteger(localBrokerId);
-        when(metadataView.getTopicId(tp.topic())).thenReturn(tp.topicId());
-        when(metadataView.isDisklessStorageTopic(tp.topic())).thenReturn(true);
-        when(selector.activeZones()).thenReturn(Set.of(DisklessClientZone.NO_ZONE));
-        when(selector.selectBrokerForZone(tp.topicId(), tp.partition(), DisklessClientZone.NO_ZONE))
-                .thenAnswer(ignored -> java.util.OptionalInt.of(selectedBroker.get()));
-
-        try (DisklessStorageReplicaManagerSupport support =
-                 new DisklessStorageReplicaManagerSupport(
-                     metadataView, localBrokerId, selector, mock(DisklessStorageEngine.class))) {
-            AtomicInteger acquisitionCount = new AtomicInteger();
-            AtomicInteger lossCount = new AtomicInteger();
-            AtomicLong acquiredGeneration = new AtomicLong();
-            AtomicLong lostGeneration = new AtomicLong();
-
-            support.reconcilePublicationOwnership(
-                    Set.of(tp),
-                    (partition, generation) -> {
-                        assertEquals(tp, partition);
-                        lossCount.incrementAndGet();
-                        lostGeneration.set(generation);
-                    },
-                    (partition, generation) -> {
-                        assertEquals(tp, partition);
-                        acquisitionCount.incrementAndGet();
-                        acquiredGeneration.set(generation);
-                    });
-
-            assertEquals(1, acquisitionCount.get());
-            assertEquals(0, lossCount.get());
-            assertTrue(acquiredGeneration.get() > 0);
-            assertTrue(support.isCurrentDisklessOwnershipGeneration(tp, acquiredGeneration.get()));
-            assertTrue(support.snapshotTrackedPartitions().isEmpty());
-
-            support.reconcilePublicationOwnership(
-                    Set.of(tp),
-                    (partition, generation) -> lossCount.incrementAndGet(),
-                    (partition, generation) -> acquisitionCount.incrementAndGet());
-            assertEquals(1, acquisitionCount.get());
-            assertEquals(0, lossCount.get());
-
-            selectedBroker.set(localBrokerId + 1);
-            support.reconcilePublicationOwnership(
-                    Set.of(tp),
-                    (partition, generation) -> {
-                        lossCount.incrementAndGet();
-                        lostGeneration.set(generation);
-                    },
-                    (partition, generation) -> acquisitionCount.incrementAndGet());
-
-            assertEquals(1, acquisitionCount.get());
-            assertEquals(1, lossCount.get());
-            assertTrue(lostGeneration.get() > acquiredGeneration.get());
-            assertFalse(support.isCurrentDisklessOwnershipGeneration(tp, acquiredGeneration.get()));
-            assertEquals(0, support.ownershipGenerationCount());
-
-            selectedBroker.set(localBrokerId);
-            support.reconcilePublicationOwnership(
-                    Set.of(tp),
-                    (partition, generation) -> lossCount.incrementAndGet(),
-                    (partition, generation) -> {
-                        acquisitionCount.incrementAndGet();
-                        acquiredGeneration.set(generation);
-                    });
-
-            assertEquals(2, acquisitionCount.get());
-            assertEquals(1, lossCount.get());
-            assertTrue(acquiredGeneration.get() > lostGeneration.get());
-        }
-    }
-
-    @Test
-    void testGenerationAwareLogMetadataRejectsLossBeforeLazyOpen() throws Exception {
-        int localBrokerId = 1;
-        TopicIdPartition tp = topicIdPartition("diskless-metadata-loss-before-open", 0);
-        DisklessStorageMetadataView metadataView = mock(DisklessStorageMetadataView.class);
-        DisklessBrokerSelector selector = mock(DisklessBrokerSelector.class);
-        DisklessStorageEngine engine = mock(DisklessStorageEngine.class);
-        AtomicInteger selectedBroker = new AtomicInteger(localBrokerId);
-        when(metadataView.getTopicId(tp.topic())).thenReturn(tp.topicId());
-        when(metadataView.isDisklessStorageTopic(tp.topic())).thenReturn(true);
-        when(selector.activeZones()).thenReturn(Set.of(DisklessClientZone.NO_ZONE));
-        when(selector.selectBrokerForZone(tp.topicId(), tp.partition(), DisklessClientZone.NO_ZONE))
-                .thenAnswer(ignored -> java.util.OptionalInt.of(selectedBroker.get()));
-
-        try (DisklessStorageReplicaManagerSupport support =
-                 new DisklessStorageReplicaManagerSupport(
-                     metadataView, localBrokerId, selector, engine)) {
-            long generation = support.currentDisklessOwnershipGeneration(tp);
-            selectedBroker.set(localBrokerId + 1);
-            support.reconcilePublicationOwnership(Set.of(tp), (ignored, lost) -> { }, (ignored, acquired) -> { });
-
-            assertTrue(support.logMetadata(tp, generation).join().isEmpty());
-            verify(engine, never()).logMetadata(tp);
-        }
-    }
-
-    @Test
-    void testGenerationAwareLogMetadataRegistersLazyOpenBeforeOwnershipLoss() throws Exception {
-        int localBrokerId = 1;
-        TopicIdPartition tp = topicIdPartition("diskless-metadata-open-before-loss", 0);
-        DisklessStorageMetadataView metadataView = mock(DisklessStorageMetadataView.class);
-        DisklessBrokerSelector selector = mock(DisklessBrokerSelector.class);
-        DisklessStorageEngine engine = mock(DisklessStorageEngine.class);
-        AtomicInteger selectedBroker = new AtomicInteger(localBrokerId);
-        CountDownLatch openStarted = new CountDownLatch(1);
-        CountDownLatch releaseOpen = new CountDownLatch(1);
-        CountDownLatch lossStarted = new CountDownLatch(1);
-        AtomicBoolean trackedLog = new AtomicBoolean();
-        AtomicInteger lossCount = new AtomicInteger();
-        when(metadataView.getTopicId(tp.topic())).thenReturn(tp.topicId());
-        when(metadataView.isDisklessStorageTopic(tp.topic())).thenReturn(true);
-        when(selector.activeZones()).thenReturn(Set.of(DisklessClientZone.NO_ZONE));
-        when(selector.selectBrokerForZone(tp.topicId(), tp.partition(), DisklessClientZone.NO_ZONE))
-                .thenAnswer(ignored -> java.util.OptionalInt.of(selectedBroker.get()));
-        when(engine.logMetadata(tp)).thenAnswer(ignored -> {
-            trackedLog.set(true);
-            openStarted.countDown();
-            assertTrue(releaseOpen.await(10, TimeUnit.SECONDS));
-            return CompletableFuture.completedFuture(Optional.of(new DisklessLogMetadata(73L, 10L)));
-        });
-        when(engine.snapshotTrackedPartitions()).thenAnswer(
-                ignored -> trackedLog.get() ? Set.of(tp) : Set.of());
-        when(engine.cleanupPartition(tp, false)).thenAnswer(ignored -> {
-            assertTrue(trackedLog.get());
-            trackedLog.set(false);
-            return true;
-        });
-
-        try (DisklessStorageReplicaManagerSupport support =
-                 new DisklessStorageReplicaManagerSupport(
-                     metadataView, localBrokerId, selector, engine)) {
-            long generation = support.currentDisklessOwnershipGeneration(tp);
-            CompletableFuture<CompletableFuture<Optional<DisklessLogMetadata>>> metadataCall =
-                    CompletableFuture.supplyAsync(() -> support.logMetadata(tp, generation));
-            assertTrue(openStarted.await(10, TimeUnit.SECONDS));
-
-            selectedBroker.set(localBrokerId + 1);
-            CompletableFuture<Void> ownershipLoss = CompletableFuture.runAsync(() -> {
-                lossStarted.countDown();
-                Set<TopicIdPartition> fenced = support.reconcilePublicationOwnership(
-                        Set.of(tp),
-                        (ignored, lost) -> lossCount.incrementAndGet(),
-                        (ignored, acquired) -> { });
-                support.reconcileTrackedPartitions(
-                        Set.of(),
-                        ignored -> { },
-                        (ignored, lost) -> lossCount.incrementAndGet(),
-                        fenced);
-            });
-            assertTrue(lossStarted.await(10, TimeUnit.SECONDS));
-            try {
-                assertThrows(TimeoutException.class, () -> ownershipLoss.get(200, TimeUnit.MILLISECONDS));
-            } finally {
-                releaseOpen.countDown();
-            }
-
-            assertEquals(73L, metadataCall.get(10, TimeUnit.SECONDS).join().orElseThrow().streamId());
-            ownershipLoss.get(10, TimeUnit.SECONDS);
-            assertFalse(support.isCurrentDisklessOwnershipGeneration(tp, generation));
-            assertFalse(trackedLog.get());
-            assertTrue(support.snapshotTrackedPartitions().isEmpty());
-            assertEquals(0, support.ownershipGenerationCount());
-            assertEquals(1, lossCount.get());
-            verify(engine).cleanupPartition(tp, false);
-        } finally {
-            releaseOpen.countDown();
-        }
-    }
-
-    @Test
-    void testReconcilePublicationOwnershipFencesOldUuidBeforeAcquiringReplacement() throws Exception {
-        int localBrokerId = 1;
-        String topic = "diskless-publication-recreation-topic";
-        TopicIdPartition oldPartition = new TopicIdPartition(
-                Uuid.randomUuid(), new TopicPartition(topic, 0));
-        TopicIdPartition newPartition = new TopicIdPartition(
-                Uuid.randomUuid(), new TopicPartition(topic, 0));
-        DisklessStorageMetadataView metadataView = mock(DisklessStorageMetadataView.class);
-        DisklessBrokerSelector selector = mock(DisklessBrokerSelector.class);
-        AtomicReference<Uuid> currentTopicId = new AtomicReference<>(oldPartition.topicId());
-        when(metadataView.getTopicId(topic)).thenAnswer(ignored -> currentTopicId.get());
-        when(metadataView.isDisklessStorageTopic(topic)).thenReturn(true);
-        when(selector.activeZones()).thenReturn(Set.of(DisklessClientZone.NO_ZONE));
-        when(selector.selectBrokerForZone(any(), eq(0), eq(DisklessClientZone.NO_ZONE)))
-                .thenReturn(java.util.OptionalInt.of(localBrokerId));
-
-        try (DisklessStorageReplicaManagerSupport support =
-                 new DisklessStorageReplicaManagerSupport(
-                     metadataView, localBrokerId, selector, mock(DisklessStorageEngine.class))) {
-            AtomicLong initialGeneration = new AtomicLong();
-            support.reconcilePublicationOwnership(
-                    Set.of(oldPartition),
-                    (partition, generation) -> { },
-                    (partition, generation) -> initialGeneration.set(generation));
-
-            currentTopicId.set(newPartition.topicId());
-            List<String> events = new ArrayList<>();
-            AtomicLong lostGeneration = new AtomicLong();
-            AtomicLong replacementGeneration = new AtomicLong();
-            support.reconcilePublicationOwnership(
-                    Set.of(newPartition),
-                    (partition, generation) -> {
-                        events.add("lost:" + partition.topicId());
-                        lostGeneration.set(generation);
-                    },
-                    (partition, generation) -> {
-                        events.add("acquired:" + partition.topicId());
-                        replacementGeneration.set(generation);
-                    });
-
-            assertEquals(List.of(
-                    "lost:" + oldPartition.topicId(),
-                    "acquired:" + newPartition.topicId()), events);
-            assertTrue(lostGeneration.get() > initialGeneration.get());
-            assertTrue(replacementGeneration.get() > lostGeneration.get());
-        }
-    }
-
-    @Test
-    void testReconcilePublicationOwnershipRemovesRetainedClassicFenceAfterDeletion() throws Exception {
-        int localBrokerId = 1;
-        String topic = "diskless-classic-deletion-topic";
-        TopicIdPartition oldPartition = new TopicIdPartition(
-                Uuid.randomUuid(), new TopicPartition(topic, 0));
-        TopicIdPartition newPartition = new TopicIdPartition(
-                Uuid.randomUuid(), new TopicPartition(topic, 0));
-        DisklessStorageMetadataView metadataView = mock(DisklessStorageMetadataView.class);
-        DisklessBrokerSelector selector = mock(DisklessBrokerSelector.class);
-        AtomicReference<Uuid> currentTopicId = new AtomicReference<>(oldPartition.topicId());
-        AtomicBoolean diskless = new AtomicBoolean(true);
-        when(metadataView.getTopicId(topic)).thenAnswer(ignored -> currentTopicId.get());
-        when(metadataView.isDisklessStorageTopic(topic)).thenAnswer(ignored -> diskless.get());
-        when(selector.activeZones()).thenReturn(Set.of(DisklessClientZone.NO_ZONE));
-        when(selector.selectBrokerForZone(any(), eq(0), eq(DisklessClientZone.NO_ZONE)))
-                .thenReturn(java.util.OptionalInt.of(localBrokerId));
-
-        try (DisklessStorageReplicaManagerSupport support =
-                 new DisklessStorageReplicaManagerSupport(
-                     metadataView, localBrokerId, selector, mock(DisklessStorageEngine.class))) {
-            AtomicInteger lossCount = new AtomicInteger();
-            AtomicInteger acquisitionCount = new AtomicInteger();
-            support.reconcilePublicationOwnership(
-                    Set.of(oldPartition),
-                    (partition, generation) -> lossCount.incrementAndGet(),
-                    (partition, generation) -> acquisitionCount.incrementAndGet());
-
-            diskless.set(false);
-            support.reconcilePublicationOwnership(
-                    Set.of(),
-                    (partition, generation) -> lossCount.incrementAndGet(),
-                    (partition, generation) -> acquisitionCount.incrementAndGet());
-            assertEquals(1, lossCount.get());
-            assertEquals(1, support.ownershipGenerationCount());
-
-            currentTopicId.set(Uuid.ZERO_UUID);
-            support.reconcilePublicationOwnership(
-                    Set.of(),
-                    (partition, generation) -> lossCount.incrementAndGet(),
-                    (partition, generation) -> acquisitionCount.incrementAndGet());
-            assertEquals(1, lossCount.get());
-            assertEquals(0, support.ownershipGenerationCount());
-
-            currentTopicId.set(newPartition.topicId());
-            diskless.set(true);
-            support.reconcilePublicationOwnership(
-                    Set.of(newPartition),
-                    (partition, generation) -> lossCount.incrementAndGet(),
-                    (partition, generation) -> acquisitionCount.incrementAndGet());
-            assertEquals(1, lossCount.get());
-            assertEquals(2, acquisitionCount.get());
-            assertEquals(1, support.ownershipGenerationCount());
-        }
-    }
-
-    @Test
-    void testClassicPublisherGenerationFencesDisklessOwnershipAndReacquisition() throws Exception {
-        int localBrokerId = 1;
-        TopicIdPartition tp = topicIdPartition("storage-mode-generation-topic", 0);
-        DisklessStorageMetadataView metadataView = mock(DisklessStorageMetadataView.class);
-        DisklessBrokerSelector selector = mock(DisklessBrokerSelector.class);
-        when(metadataView.getTopicId(tp.topic())).thenReturn(tp.topicId());
-        when(metadataView.isDisklessStorageTopic(tp.topic())).thenReturn(true, false, false, true, true);
-        stubNoZoneSelection(selector, tp, localBrokerId);
-
-        try (DisklessStorageReplicaManagerSupport support =
-                 new DisklessStorageReplicaManagerSupport(
-                     metadataView, localBrokerId, selector, mock(DisklessStorageEngine.class))) {
-            long disklessGeneration = support.currentDisklessOwnershipGeneration(tp);
-            long classicGeneration = support.currentClassicPublisherGeneration(tp);
-
-            assertTrue(classicGeneration > disklessGeneration);
-            assertEquals(classicGeneration, support.currentClassicPublisherGeneration(tp));
-
-            long reacquiredGeneration = support.currentDisklessOwnershipGeneration(tp);
-            assertTrue(reacquiredGeneration > classicGeneration);
-            assertTrue(support.isCurrentDisklessOwnershipGeneration(tp, reacquiredGeneration));
-        }
-    }
-
-    @Test
-    void testPureClassicPublisherGenerationDoesNotCreateDisklessOwnershipState() throws Exception {
-        TopicIdPartition tp = topicIdPartition("pure-classic-generation-topic", 0);
-        DisklessStorageMetadataView metadataView = mock(DisklessStorageMetadataView.class);
-        when(metadataView.getTopicId(tp.topic())).thenReturn(tp.topicId());
-        when(metadataView.isDisklessStorageTopic(tp.topic())).thenReturn(false);
-
-        try (DisklessStorageReplicaManagerSupport support =
-                 new DisklessStorageReplicaManagerSupport(
-                     metadataView,
-                     1,
-                     mock(DisklessBrokerSelector.class),
-                     mock(DisklessStorageEngine.class))) {
-            long firstGeneration = support.currentClassicPublisherGeneration(tp);
-            long secondGeneration = support.currentClassicPublisherGeneration(tp);
-            assertTrue(firstGeneration > 0);
-            assertTrue(secondGeneration > firstGeneration);
-            assertEquals(0, support.ownershipGenerationCount());
         }
     }
 
@@ -1043,16 +691,13 @@ class DisklessStorageReplicaManagerSupportTest {
             diskless.set(false);
 
             AtomicInteger callbackCount = new AtomicInteger(0);
-            AtomicInteger ownershipLossCount = new AtomicInteger();
             support.reconcileTrackedPartitions(
                     Set.of(),
-                    ignored -> callbackCount.incrementAndGet(),
-                    ignored -> ownershipLossCount.incrementAndGet());
+                    ignored -> callbackCount.incrementAndGet());
 
             verify(ursaState, times(1)).cleanupPartition(tp, false);
             verify(ursaState, never()).deletePartitionData(tp);
             assertEquals(0, callbackCount.get());
-            assertEquals(1, ownershipLossCount.get());
             assertEquals(Set.of(tp), support.snapshotTrackedPartitions());
         } catch (Exception e) {
             throw new RuntimeException(e);

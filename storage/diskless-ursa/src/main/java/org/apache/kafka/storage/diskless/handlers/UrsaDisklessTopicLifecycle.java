@@ -50,7 +50,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
             Uuid topicId,
             int partitions,
             Map<String, String> properties) {
-        Map<String, String> propertySnapshot = properties == null ? Map.of() : Map.copyOf(properties);
+        Map<String, String> propertySnapshot = KafkaLogNaming.streamProperties(topicName, properties);
         return registry.registerExternalStream(
                 streamIdentifier(topicName, topicId), partitions, propertySnapshot);
     }

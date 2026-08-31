@@ -77,7 +77,7 @@ import java.io.File
 import java.lang.{Long => JLong}
 import java.nio.file.{Files, Paths}
 import java.util
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, Future, RejectedExecutionException, TimeUnit}
 import java.util.{Collections, Optional, OptionalInt, OptionalLong}
 import java.util.function.Consumer
@@ -209,17 +209,6 @@ class ReplicaManager(val config: KafkaConfig,
       shareFetchPurgatoryName, delayedShareFetchTimer, config.brokerId,
       config.shareGroupConfig.shareFetchPurgatoryPurgeIntervalRequests))
   private[server] val interceptor: ReplicaManagerInterceptor = createInterceptor()
-
-  private val pendingDisklessAppendNotifications =
-    new ConcurrentHashMap[TopicIdPartition, PendingDisklessAppendNotification]()
-  private val disklessAppendNotificationsClosing = new AtomicBoolean()
-
-  private final class PendingDisklessAppendNotification(val ownershipGeneration: Long) {
-    val version = new AtomicLong()
-    val inFlight = new AtomicBoolean()
-    val retryScheduled = new AtomicBoolean()
-    val retryFailures = new AtomicInteger()
-  }
 
   /* epoch of the controller that last changed the leader */
   protected val localBrokerId = config.brokerId
@@ -735,8 +724,6 @@ class ReplicaManager(val config: KafkaConfig,
         }
 
         updateDisklessProduceStats(disklessEntries, disklessResult)
-        notifySuccessfulDisklessAppends(disklessResult)
-
         // Preserve the original request order (as much as the input Map provides).
         val combinedSeq = requestOrder.map { tp =>
           tp -> disklessResult.getOrElse(tp, classicResultScala.getOrElse(tp, new PartitionResponse(Errors.UNKNOWN_SERVER_ERROR)))
@@ -804,195 +791,6 @@ class ReplicaManager(val config: KafkaConfig,
       }
     }
   }
-
-  private[server] def notifySuccessfulDisklessAppends(
-    disklessResult: Map[TopicIdPartition, PartitionResponse]
-  ): Unit = {
-    if (disklessAppendNotificationsClosing.get()) {
-      return
-    }
-    disklessResult.foreach { case (topicIdPartition, response) =>
-      val ownershipGeneration =
-        if (response.error == Errors.NONE)
-          disklessStorageSupport.currentDisklessOwnershipGeneration(topicIdPartition)
-        else -1L
-      if (ownershipGeneration >= 0) {
-        enqueueDisklessLogMetadataNotification(topicIdPartition, ownershipGeneration)
-      }
-    }
-  }
-
-  private[server] def notifyDisklessOwnershipAcquired(
-    topicIdPartition: TopicIdPartition,
-    ownershipGeneration: Long
-  ): Unit = {
-    if (ownershipGeneration >= 0) {
-      enqueueDisklessLogMetadataNotification(topicIdPartition, ownershipGeneration)
-    }
-  }
-
-  private[server] def onDisklessPartitionOwnershipLost(
-    topicIdPartition: TopicIdPartition,
-    ownershipGeneration: Long
-  ): Unit = {
-    val pending = pendingDisklessAppendNotifications.get(topicIdPartition)
-    if (pending != null && pending.ownershipGeneration < ownershipGeneration &&
-        pendingDisklessAppendNotifications.remove(topicIdPartition, pending)) {
-      pending.inFlight.set(false)
-      pending.retryScheduled.set(false)
-    }
-    interceptor.onPartitionOwnershipLost(topicIdPartition, ownershipGeneration)
-  }
-
-  private def enqueueDisklessLogMetadataNotification(
-    topicIdPartition: TopicIdPartition,
-    ownershipGeneration: Long
-  ): Unit = {
-    if (disklessAppendNotificationsClosing.get()) {
-      return
-    }
-    val pending = pendingDisklessAppendNotifications.compute(
-      topicIdPartition,
-      (_, current) => {
-        if (current == null || current.ownershipGeneration < ownershipGeneration)
-          new PendingDisklessAppendNotification(ownershipGeneration)
-        else current
-      })
-    if (pending.ownershipGeneration == ownershipGeneration) {
-      pending.version.incrementAndGet()
-      requestDisklessLogMetadata(topicIdPartition, pending)
-    }
-  }
-
-  private def requestDisklessLogMetadata(
-    topicIdPartition: TopicIdPartition,
-    pending: PendingDisklessAppendNotification
-  ): Unit = {
-    if (disklessAppendNotificationsClosing.get() ||
-        pendingDisklessAppendNotifications.get(topicIdPartition) != pending ||
-        !pending.inFlight.compareAndSet(false, true)) {
-      return
-    }
-
-    val requestedVersion = pending.version.get()
-    if (!isCurrentDisklessPublisherOwner(topicIdPartition, pending)) {
-      discardDisklessAppendNotification(topicIdPartition, pending)
-      return
-    }
-
-    try {
-      val metadataFuture = disklessStorageSupport.logMetadata(
-        topicIdPartition, pending.ownershipGeneration)
-      if (metadataFuture == null) {
-        retryDisklessLogMetadata(topicIdPartition, pending,
-          new IllegalStateException("Diskless log metadata future was null"))
-        return
-      }
-      metadataFuture.whenComplete { case (metadata, metadataError) =>
-        if (metadataError != null) {
-          retryDisklessLogMetadata(topicIdPartition, pending, metadataError)
-        } else if (!isCurrentDisklessPublisherOwner(topicIdPartition, pending)) {
-          discardDisklessAppendNotification(topicIdPartition, pending)
-        } else if (pending.version.get() != requestedVersion) {
-          pending.inFlight.set(false)
-          requestDisklessLogMetadata(topicIdPartition, pending)
-        } else if (metadata == null || metadata.isEmpty) {
-          retryDisklessLogMetadata(topicIdPartition, pending,
-            new IllegalStateException("Diskless log metadata was unavailable"))
-        } else {
-          try {
-            val logMetadata = metadata.get()
-            interceptor.onDisklessAppend(
-              topicIdPartition,
-              logMetadata.streamId(),
-              logMetadata.highWatermark(),
-              pending.ownershipGeneration)
-            completeDisklessAppendNotification(topicIdPartition, pending, requestedVersion)
-          } catch {
-            case t: Throwable => retryDisklessLogMetadata(topicIdPartition, pending, t)
-          }
-        }
-      }
-    } catch {
-      case t: Throwable => retryDisklessLogMetadata(topicIdPartition, pending, t)
-    }
-  }
-
-  private def completeDisklessAppendNotification(
-    topicIdPartition: TopicIdPartition,
-    pending: PendingDisklessAppendNotification,
-    requestedVersion: Long
-  ): Unit = {
-    pending.inFlight.set(false)
-    if (pending.version.get() == requestedVersion &&
-        pendingDisklessAppendNotifications.remove(topicIdPartition, pending)) {
-      // Re-enqueue if an append raced with the conditional removal.
-      if (pending.version.get() != requestedVersion) {
-        val replacement = pendingDisklessAppendNotifications.computeIfAbsent(
-          topicIdPartition, _ => new PendingDisklessAppendNotification(pending.ownershipGeneration))
-        replacement.version.incrementAndGet()
-        requestDisklessLogMetadata(topicIdPartition, replacement)
-      }
-    } else {
-      requestDisklessLogMetadata(topicIdPartition, pending)
-    }
-  }
-
-  private def retryDisklessLogMetadata(
-    topicIdPartition: TopicIdPartition,
-    pending: PendingDisklessAppendNotification,
-    error: Throwable
-  ): Unit = {
-    pending.inFlight.set(false)
-    if (disklessAppendNotificationsClosing.get() ||
-        pendingDisklessAppendNotifications.get(topicIdPartition) != pending ||
-        !isCurrentDisklessPublisherOwner(topicIdPartition, pending)) {
-      discardDisklessAppendNotification(topicIdPartition, pending)
-      return
-    }
-    val failureCount = pending.retryFailures.incrementAndGet()
-    val retryDelayMs = Math.min(30000L, 1000L << Math.min(failureCount - 1, 5))
-    if (failureCount == 1 || failureCount % 10 == 0) {
-      warn(s"Failed to deliver diskless log metadata for $topicIdPartition; " +
-        s"retrying in $retryDelayMs ms (failure $failureCount)", error)
-    } else {
-      debug(s"Failed to deliver diskless log metadata for $topicIdPartition; " +
-        s"retrying in $retryDelayMs ms (failure $failureCount): ${error.getMessage}")
-    }
-    if (pending.retryScheduled.compareAndSet(false, true)) {
-      try {
-        scheduler.scheduleOnce(s"retry-diskless-log-metadata-$topicIdPartition", () => {
-          pending.retryScheduled.set(false)
-          requestDisklessLogMetadata(topicIdPartition, pending)
-        }, retryDelayMs)
-      } catch {
-        case t: Throwable =>
-          pending.retryScheduled.set(false)
-          warn(s"Failed to schedule diskless log metadata retry for $topicIdPartition", t)
-          discardDisklessAppendNotification(topicIdPartition, pending)
-      }
-    }
-  }
-
-  private def discardDisklessAppendNotification(
-    topicIdPartition: TopicIdPartition,
-    pending: PendingDisklessAppendNotification
-  ): Unit = {
-    pending.inFlight.set(false)
-    pendingDisklessAppendNotifications.remove(topicIdPartition, pending)
-  }
-
-  private def isCurrentDisklessPublisherOwner(
-    topicIdPartition: TopicIdPartition,
-    pending: PendingDisklessAppendNotification
-  ): Boolean = {
-    !disklessAppendNotificationsClosing.get() &&
-      disklessStorageSupport.isCurrentDisklessOwnershipGeneration(
-      topicIdPartition, pending.ownershipGeneration)
-  }
-
-  private[server] def pendingDisklessAppendNotificationCount: Int =
-    pendingDisklessAppendNotifications.size()
 
   private def countRecords(records: MemoryRecords): Long = {
     var total = 0L
@@ -1770,11 +1568,7 @@ class ReplicaManager(val config: KafkaConfig,
               verificationGuards.getOrElse(topicIdPartition.topicPartition(), VerificationGuard.SENTINEL), transactionVersion)
           val numAppendedMessages = info.numMessages
           if (partition.isLeader) {
-            val publisherGeneration =
-              disklessStorageSupport.currentClassicPublisherGeneration(topicIdPartition)
-            if (publisherGeneration >= 0) {
-              interceptor.onAppend(records, info, partition, publisherGeneration)
-            }
+            interceptor.onAppend(records, info, partition)
           }
 
           // update stats for successfully appended bytes and messages as bytesInRate and messageInRate
@@ -2820,8 +2614,6 @@ class ReplicaManager(val config: KafkaConfig,
   // High watermark do not need to be checkpointed only when under unit tests
   def shutdown(checkpointHW: Boolean = true): Unit = {
     info("Shutting down")
-    disklessAppendNotificationsClosing.set(true)
-    pendingDisklessAppendNotifications.clear()
     removeMetrics()
     if (logDirFailureHandler != null)
       logDirFailureHandler.shutdown()
@@ -3046,26 +2838,8 @@ class ReplicaManager(val config: KafkaConfig,
         getOrCreatePartition(tp, delta, info.topicId).foreach { case (partition, isNew) =>
           try {
             val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
-            val becameLeader = partition.makeLeader(
+            partition.makeLeader(
               info.partition, isNew, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
-
-            // A stale metadata delta can make makeLeader return false. Do not let such a delta
-            // fence the current compaction publisher or install one for a partition which this
-            // broker did not actually acquire.
-            if (becameLeader && partition.isLeader && partition.topicId.contains(info.topicId)) {
-              val topicIdPartition = new TopicIdPartition(info.topicId, tp)
-              val publisherGeneration =
-                disklessStorageSupport.currentClassicPublisherGeneration(topicIdPartition)
-              if (publisherGeneration >= 0) {
-                try {
-                  interceptor.onLeadershipAcquired(partition, publisherGeneration)
-                } catch {
-                  case error: Throwable =>
-                    stateChangeLogger.error(
-                      s"Failed to notify the replica manager interceptor that $tp became leader", error)
-                }
-              }
-            }
 
             changedPartitions.add(partition)
           } catch {
@@ -3108,18 +2882,7 @@ class ReplicaManager(val config: KafkaConfig,
             //   is unavailable. This is required to ensure that we include the partition's
             //   high watermark in the checkpoint file (see KAFKA-1647).
             val partitionAssignedDirectoryId = directoryIds.find(_._1.topicPartition() == tp).map(_._2)
-            val wasLeader = partition.isLeader
             val isNewLeaderEpoch = partition.makeFollower(info.partition, isNew, offsetCheckpoints, Some(info.topicId), partitionAssignedDirectoryId)
-
-            if (wasLeader && isNewLeaderEpoch && !partition.isLeader && partition.topicId.contains(info.topicId)) {
-              try {
-                interceptor.onLeadershipLost(new TopicIdPartition(info.topicId, tp))
-              } catch {
-                case error: Throwable =>
-                  stateChangeLogger.error(
-                    s"Failed to notify the replica manager interceptor that $tp lost leadership", error)
-              }
-            }
 
             if (isInControlledShutdown && (info.partition.leader == NO_LEADER ||
                 !info.partition.isr.contains(config.brokerId))) {

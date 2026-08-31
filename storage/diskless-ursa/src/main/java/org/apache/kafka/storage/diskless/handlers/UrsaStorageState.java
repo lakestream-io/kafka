@@ -20,7 +20,6 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.config.ServerLogConfigs;
-import org.apache.kafka.storage.diskless.DisklessLogMetadata;
 import org.apache.kafka.storage.diskless.DisklessStorageStateOperations;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
@@ -278,12 +277,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
 
     UrsaPartitionLog partitionLog(TopicIdPartition tp) {
         return partitionLogs.get(tp);
-    }
-
-    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(TopicIdPartition tp) {
-        UrsaPartitionLog partitionLog = getOrCreatePartitionLog(tp);
-        return partitionLog.logMetadata().thenApply(metadata ->
-                partitionLogs.get(tp) == partitionLog ? Optional.of(metadata) : Optional.empty());
     }
 
     void removePartitionLog(TopicIdPartition tp, UrsaPartitionLog partitionLog) {

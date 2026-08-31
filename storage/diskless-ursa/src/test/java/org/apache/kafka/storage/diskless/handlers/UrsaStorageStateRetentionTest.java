@@ -226,12 +226,16 @@ class UrsaStorageStateRetentionTest {
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
 
-        when(catalog.openExternalPartition(identifier, 0, Map.of()))
+        Map<String, String> initialProperties = KafkaLogNaming.streamProperties(tp.topic(), Map.of());
+        Map<String, String> updatedProperties = KafkaLogNaming.streamProperties(tp.topic(), updatedConfig);
+        when(catalog.openExternalPartition(identifier, 0, initialProperties))
                 .thenReturn(CompletableFuture.completedFuture(logInstance));
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(true));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
-        when(catalog.setStreamProperties(identifier, updatedConfig))
+        when(catalog.setStreamProperties(identifier, initialProperties))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.setStreamProperties(identifier, updatedProperties))
                 .thenReturn(CompletableFuture.completedFuture(null));
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
@@ -269,13 +273,16 @@ class UrsaStorageStateRetentionTest {
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
 
-        when(catalog.openExternalPartition(identifier, 0, Map.of()))
+        Map<String, String> initialProperties = KafkaLogNaming.streamProperties(tp.topic(), Map.of());
+        when(catalog.openExternalPartition(identifier, 0, initialProperties))
                 .thenReturn(CompletableFuture.completedFuture(logInstance));
         when(catalog.streamExists(identifier))
                 .thenReturn(CompletableFuture.completedFuture(true))
                 .thenReturn(CompletableFuture.failedFuture(new RuntimeException("catalog unavailable")));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
+        when(catalog.setStreamProperties(identifier, initialProperties))
+                .thenReturn(CompletableFuture.completedFuture(null));
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))

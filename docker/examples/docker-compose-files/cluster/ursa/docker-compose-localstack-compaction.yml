@@ -85,8 +85,6 @@ services:
       # Catalog, WAL indexes, and log discovery
       URSA_METADATA_STORE_URL: oxia://oxia:6648/default
       URSA_OXIA_STORAGE_URL: oxia://oxia:6648/default
-      URSA_DATA_SOURCE_FOR_COMPACTION: URSA
-      URSA_ENTRY_FORMAT: KAFKA
       URSA_ENTRY_SERDE_TYPE: KAFKA_BATCHED_RAW_PARQUET
       URSA_METASTORE_RATE_LIMIT: "500"
       URSA_REFRESH_LOG_INTERVAL_SECONDS: "5"
@@ -137,8 +135,6 @@ services:
         property compactionBucket "$$URSA_COMPACTION_BUCKET"
         property compactionPrefix "$$URSA_COMPACTION_PREFIX"
         property compactionBucketRegion "$$URSA_COMPACTION_BUCKET_REGION"
-        property dataSourceForCompaction "$$URSA_DATA_SOURCE_FOR_COMPACTION"
-        property entryFormat "$$URSA_ENTRY_FORMAT"
         property entrySerDeType "$$URSA_ENTRY_SERDE_TYPE"
         property compactedFileSizeLimit "$$URSA_COMPACTED_FILE_SIZE_LIMIT"
         property tailCompactDataVisibilityIntervalInSeconds "$$URSA_TAIL_VISIBILITY_INTERVAL_SECONDS"

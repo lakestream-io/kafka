@@ -275,8 +275,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
         properties.setProperty("region", region);
         properties.setProperty("s3AccessKeyId", "test");
         properties.setProperty("s3SecretAccessKey", "test");
-        properties.setProperty("dataSourceForCompaction", "URSA");
-        properties.setProperty("entryFormat", "KAFKA");
         properties.setProperty("entrySerDeType", "KAFKA_BATCHED_RAW_PARQUET");
         properties.setProperty("compactedFileSizeLimit", String.valueOf(10 * 1024));
         properties.setProperty("tailCompactDataVisibilityIntervalInSeconds", "5");
@@ -320,8 +318,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 .withEnv("URSA_COMPACTION_BUCKET", bucket)
                 .withEnv("URSA_COMPACTION_PREFIX", s3Prefix)
                 .withEnv("URSA_COMPACTION_BUCKET_REGION", region)
-                .withEnv("URSA_DATA_SOURCE_FOR_COMPACTION", "URSA")
-                .withEnv("URSA_ENTRY_FORMAT", "KAFKA")
                 .withEnv("URSA_ENTRY_SERDE_TYPE", "KAFKA_BATCHED_RAW_PARQUET")
                 .withEnv("URSA_COMPACTED_FILE_SIZE_LIMIT", String.valueOf(10 * 1024))
                 .withEnv("URSA_TAIL_VISIBILITY_INTERVAL_SECONDS", "5")
@@ -369,8 +365,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 property compactionBucket "$URSA_COMPACTION_BUCKET"
                 property compactionPrefix "$URSA_COMPACTION_PREFIX"
                 property compactionBucketRegion "$URSA_COMPACTION_BUCKET_REGION"
-                property dataSourceForCompaction "$URSA_DATA_SOURCE_FOR_COMPACTION"
-                property entryFormat "$URSA_ENTRY_FORMAT"
                 property entrySerDeType "$URSA_ENTRY_SERDE_TYPE"
                 property compactedFileSizeLimit "$URSA_COMPACTED_FILE_SIZE_LIMIT"
                 property tailCompactDataVisibilityIntervalInSeconds "$URSA_TAIL_VISIBILITY_INTERVAL_SECONDS"

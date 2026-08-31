@@ -19,7 +19,6 @@ package kafka.server;
 import kafka.cluster.Partition;
 
 import org.apache.kafka.common.KafkaException;
-import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.utils.KafkaPluginClassLoader;
 import org.apache.kafka.metadata.ConfigRepository;
@@ -90,118 +89,6 @@ public class ClassLoaderAwareReplicaManagerInterceptor implements ReplicaManager
         try {
             withClassLoader(classLoader, () -> {
                 delegate.onAppend(records, appendInfo, partition);
-                return null;
-            });
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke replica manager interceptor", e);
-        }
-    }
-
-    @Override
-    public void onAppend(
-            MemoryRecords records,
-            LogAppendInfo appendInfo,
-            Partition partition,
-            long publisherGeneration) {
-        try {
-            withClassLoader(classLoader, () -> {
-                delegate.onAppend(records, appendInfo, partition, publisherGeneration);
-                return null;
-            });
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke replica manager interceptor", e);
-        }
-    }
-
-    @Override
-    public void onLeadershipAcquired(Partition partition, long publisherGeneration) {
-        try {
-            withClassLoader(classLoader, () -> {
-                delegate.onLeadershipAcquired(partition, publisherGeneration);
-                return null;
-            });
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke replica manager interceptor", e);
-        }
-    }
-
-    @Override
-    public void onLeadershipLost(TopicIdPartition topicIdPartition) {
-        try {
-            withClassLoader(classLoader, () -> {
-                delegate.onLeadershipLost(topicIdPartition);
-                return null;
-            });
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke replica manager interceptor", e);
-        }
-    }
-
-    @Override
-    public void onDisklessAppend(
-            TopicIdPartition topicIdPartition,
-            long streamId,
-            long highWatermark) {
-        try {
-            withClassLoader(classLoader, () -> {
-                delegate.onDisklessAppend(topicIdPartition, streamId, highWatermark);
-                return null;
-            });
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke replica manager interceptor", e);
-        }
-    }
-
-    @Override
-    public void onDisklessAppend(
-            TopicIdPartition topicIdPartition,
-            long streamId,
-            long highWatermark,
-            long ownershipGeneration) {
-        try {
-            withClassLoader(classLoader, () -> {
-                delegate.onDisklessAppend(
-                        topicIdPartition, streamId, highWatermark, ownershipGeneration);
-                return null;
-            });
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke replica manager interceptor", e);
-        }
-    }
-
-    @Override
-    public void onPartitionOwnershipLost(TopicIdPartition topicIdPartition) {
-        try {
-            withClassLoader(classLoader, () -> {
-                delegate.onPartitionOwnershipLost(topicIdPartition);
-                return null;
-            });
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke replica manager interceptor", e);
-        }
-    }
-
-    @Override
-    public void onPartitionOwnershipLost(
-            TopicIdPartition topicIdPartition,
-            long ownershipGeneration) {
-        try {
-            withClassLoader(classLoader, () -> {
-                delegate.onPartitionOwnershipLost(topicIdPartition, ownershipGeneration);
                 return null;
             });
         } catch (RuntimeException | Error e) {

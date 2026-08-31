@@ -22,6 +22,8 @@ import org.apache.kafka.common.Uuid;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -63,5 +65,14 @@ class KafkaLogNamingTest {
         TopicIdPartition tp = new TopicIdPartition(Uuid.ZERO_UUID, new TopicPartition("test-topic", 0));
 
         assertThrows(IllegalArgumentException.class, () -> KafkaLogNaming.logName(tp));
+    }
+
+    @Test
+    void testStreamPropertiesPreserveLogicalKafkaTopicName() {
+        Map<String, String> properties = KafkaLogNaming.streamProperties(
+                "orders", Map.of("retention.ms", "60000"));
+
+        assertEquals("orders", properties.get(KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY));
+        assertEquals("60000", properties.get("retention.ms"));
     }
 }

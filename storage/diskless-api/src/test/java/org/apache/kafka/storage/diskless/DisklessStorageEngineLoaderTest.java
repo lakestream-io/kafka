@@ -38,7 +38,6 @@ import java.nio.file.StandardCopyOption;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -217,7 +216,6 @@ class DisklessStorageEngineLoaderTest {
             engine.write(Map.of(), "").get();
             engine.fetch(null, Map.of()).get();
             engine.listOffsets(Map.of()).get();
-            engine.logMetadata(null).get();
             engine.cleanupPartition(null, false);
             engine.deletePartitionData(null);
             engine.snapshotTrackedPartitions();
@@ -276,7 +274,6 @@ class DisklessStorageEngineLoaderTest {
                 import org.apache.kafka.common.utils.Time;
                 import org.apache.kafka.server.storage.log.FetchParams;
                 import org.apache.kafka.server.storage.log.FetchPartitionData;
-                import org.apache.kafka.storage.diskless.DisklessLogMetadata;
                 import org.apache.kafka.storage.diskless.DisklessStorageEngine;
                 import org.apache.kafka.storage.diskless.ListOffsetsPartitionRequest;
                 import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
@@ -285,7 +282,6 @@ class DisklessStorageEngineLoaderTest {
 
                 import java.io.IOException;
                 import java.util.Map;
-                import java.util.Optional;
                 import java.util.Set;
                 import java.util.concurrent.CompletableFuture;
                 import java.util.function.Function;
@@ -322,13 +318,6 @@ class DisklessStorageEngineLoaderTest {
                             Map<TopicIdPartition, ListOffsetsPartitionRequest> requests) {
                         requirePluginResource("listOffsets");
                         return CompletableFuture.completedFuture(Map.of());
-                    }
-
-                    @Override
-                    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(
-                            TopicIdPartition topicIdPartition) {
-                        requirePluginResource("logMetadata");
-                        return CompletableFuture.completedFuture(Optional.empty());
                     }
 
                     @Override
@@ -411,12 +400,6 @@ class DisklessStorageEngineLoaderTest {
                 FetchParams params,
                 Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos) {
             return CompletableFuture.completedFuture(Map.of());
-        }
-
-        @Override
-        public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(
-                TopicIdPartition topicIdPartition) {
-            return CompletableFuture.completedFuture(Optional.empty());
         }
 
         @Override

@@ -35,53 +35,21 @@ import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 public class DisklessStateReconcilerPublisher implements MetadataPublisher {
 
     private final DisklessStorageReplicaManagerSupport disklessStorageSupport;
     private final Consumer<String> onTopicMaybeEmptied;
-    private final BiConsumer<TopicIdPartition, Long> onPartitionOwnershipLost;
-    private final BiConsumer<TopicIdPartition, Long> onPartitionOwnershipAcquired;
 
     public DisklessStateReconcilerPublisher(
             DisklessStorageReplicaManagerSupport disklessStorageSupport,
             Consumer<String> onTopicMaybeEmptied
     ) {
-        this(
-                disklessStorageSupport,
-                onTopicMaybeEmptied,
-                (ignored, generation) -> { },
-                (ignored, generation) -> { });
-    }
-
-    public DisklessStateReconcilerPublisher(
-            DisklessStorageReplicaManagerSupport disklessStorageSupport,
-            Consumer<String> onTopicMaybeEmptied,
-            BiConsumer<TopicIdPartition, Long> onPartitionOwnershipLost
-    ) {
-        this(
-                disklessStorageSupport,
-                onTopicMaybeEmptied,
-                onPartitionOwnershipLost,
-                (ignored, generation) -> { });
-    }
-
-    public DisklessStateReconcilerPublisher(
-            DisklessStorageReplicaManagerSupport disklessStorageSupport,
-            Consumer<String> onTopicMaybeEmptied,
-            BiConsumer<TopicIdPartition, Long> onPartitionOwnershipLost,
-            BiConsumer<TopicIdPartition, Long> onPartitionOwnershipAcquired
-    ) {
         this.disklessStorageSupport = Objects.requireNonNull(
                 disklessStorageSupport, "disklessStorageSupport cannot be null");
         this.onTopicMaybeEmptied = Objects.requireNonNull(
                 onTopicMaybeEmptied, "onTopicMaybeEmptied cannot be null");
-        this.onPartitionOwnershipLost = Objects.requireNonNull(
-                onPartitionOwnershipLost, "onPartitionOwnershipLost cannot be null");
-        this.onPartitionOwnershipAcquired = Objects.requireNonNull(
-                onPartitionOwnershipAcquired, "onPartitionOwnershipAcquired cannot be null");
     }
 
     @Override
@@ -96,21 +64,7 @@ public class DisklessStateReconcilerPublisher implements MetadataPublisher {
             LoaderManifest manifest
     ) {
         Set<TopicIdPartition> deletedPartitions = deletedDisklessPartitions(delta);
-        Set<TopicIdPartition> alreadyFencedOwnershipLosses = Collections.emptySet();
-        if (publicationOwnershipMayHaveChanged(delta, newImage)) {
-            Set<TopicIdPartition> fenced = disklessStorageSupport.reconcilePublicationOwnership(
-                    currentDisklessPartitions(newImage),
-                    onPartitionOwnershipLost,
-                    onPartitionOwnershipAcquired);
-            if (fenced != null) {
-                alreadyFencedOwnershipLosses = fenced;
-            }
-        }
-        disklessStorageSupport.reconcileTrackedPartitions(
-                deletedPartitions,
-                onTopicMaybeEmptied,
-                onPartitionOwnershipLost,
-                alreadyFencedOwnershipLosses);
+        disklessStorageSupport.reconcileTrackedPartitions(deletedPartitions, onTopicMaybeEmptied);
 
         Set<TopicIdPartition> deletedTopics = new LinkedHashSet<>();
         for (TopicIdPartition deletedPartition : deletedPartitions) {
@@ -119,38 +73,6 @@ public class DisklessStateReconcilerPublisher implements MetadataPublisher {
                     new TopicPartition(deletedPartition.topic(), 0)));
         }
         deletedTopics.forEach(disklessStorageSupport::deleteTopicConfig);
-    }
-
-    private boolean publicationOwnershipMayHaveChanged(MetadataDelta delta, MetadataImage newImage) {
-        if (delta.clusterDelta() != null || delta.topicsDelta() != null) {
-            return true;
-        }
-        if (delta.configsDelta() == null) {
-            return false;
-        }
-        for (ConfigResource resource : delta.configsDelta().changes().keySet()) {
-            if (resource.type() == ConfigResource.Type.TOPIC
-                    && isDisklessTopic(delta.image(), resource.name())
-                    != isDisklessTopic(newImage, resource.name())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private Set<TopicIdPartition> currentDisklessPartitions(MetadataImage image) {
-        Set<TopicIdPartition> partitions = new LinkedHashSet<>();
-        for (TopicImage topic : image.topics().topicsById().values()) {
-            if (!isDisklessTopic(image, topic.name())) {
-                continue;
-            }
-            for (Integer partitionId : topic.partitions().keySet()) {
-                partitions.add(new TopicIdPartition(
-                        topic.id(),
-                        new TopicPartition(topic.name(), partitionId)));
-            }
-        }
-        return partitions;
     }
 
     private Set<TopicIdPartition> deletedDisklessPartitions(MetadataDelta delta) {

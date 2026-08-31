@@ -46,10 +46,6 @@ x-kafka-environment: &kafka-environment
   KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE: "4096"
   KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS: "100"
 
-  # This class lives in the isolated Ursa runtime shipped under
-  # /opt/kafka/ursa-storage, not on Kafka's main classpath.
-  KAFKA_KAFKA_SERVER_INTERCEPTOR_CLASS_NAME: "kafka.server.ursa.sdt.UrsaSDTInterceptor"
-
 x-kafka-service: &kafka-service
   image: ${IMAGE:-kafka-diskless:latest}
   restart: unless-stopped
@@ -209,7 +205,6 @@ services:
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-1:19092,PLAINTEXT_HOST://localhost:29092"
     volumes:
       - kafka-1-data:/var/lib/kafka/data
-      - ./lakehouse/kafka-server.properties:/mnt/shared/config/server.properties:ro
 
   kafka-2:
     <<: *kafka-service
@@ -222,7 +217,6 @@ services:
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-2:19092,PLAINTEXT_HOST://localhost:39092"
     volumes:
       - kafka-2-data:/var/lib/kafka/data
-      - ./lakehouse/kafka-server.properties:/mnt/shared/config/server.properties:ro
 
   kafka-3:
     <<: *kafka-service
@@ -235,7 +229,6 @@ services:
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-3:19092,PLAINTEXT_HOST://localhost:49092"
     volumes:
       - kafka-3-data:/var/lib/kafka/data
-      - ./lakehouse/kafka-server.properties:/mnt/shared/config/server.properties:ro
 
   # DuckDB is an on-demand tool rather than a daemon. Start the stack, then run:
   # docker compose -f docker-compose-lakehouse.yml --profile tools run --rm duckdb

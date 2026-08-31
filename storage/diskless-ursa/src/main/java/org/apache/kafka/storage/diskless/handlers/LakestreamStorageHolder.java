@@ -76,7 +76,7 @@ final class LakestreamStorageHolder implements Closeable {
             return CompletableFuture.failedFuture(
                     new IllegalStateException("Kafka topic incarnation is already deleted: " + tp));
         }
-        Map<String, String> suppliedConfig = topicConfig != null ? Map.copyOf(topicConfig) : Map.of();
+        Map<String, String> suppliedConfig = KafkaLogNaming.streamProperties(tp.topic(), topicConfig);
         return enqueueTopicOperation(identifier, operations -> operations.enqueueOpen(
                 suppliedConfig,
                 currentConfig -> {
@@ -101,7 +101,8 @@ final class LakestreamStorageHolder implements Closeable {
         if (deletedTopicStreams.contains(identifier)) {
             return CompletableFuture.completedFuture(null);
         }
-        Map<String, String> configSnapshot = topicConfig != null ? Map.copyOf(topicConfig) : Map.of();
+        Map<String, String> configSnapshot = KafkaLogNaming.streamProperties(
+                topicIdPartition.topic(), topicConfig);
         return enqueueTopicOperation(identifier, operations -> operations.enqueueConfigUpdate(
                 configSnapshot,
                 () -> deletedTopicStreams.contains(identifier)

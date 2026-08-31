@@ -25,7 +25,6 @@ import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.metadata.RemoveTopicRecord;
 import org.apache.kafka.image.AclsImage;
 import org.apache.kafka.image.ClientQuotasImage;
-import org.apache.kafka.image.ClusterDelta;
 import org.apache.kafka.image.ClusterImage;
 import org.apache.kafka.image.ConfigurationImage;
 import org.apache.kafka.image.ConfigurationsImage;
@@ -49,7 +48,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -58,7 +56,6 @@ import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 class DisklessStateReconcilerPublisherTest {
 
@@ -67,10 +64,8 @@ class DisklessStateReconcilerPublisherTest {
         DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
         @SuppressWarnings("unchecked")
         Consumer<String> callback = mock(Consumer.class);
-        @SuppressWarnings("unchecked")
-        BiConsumer<TopicIdPartition, Long> ownershipLost = mock(BiConsumer.class);
         DisklessStateReconcilerPublisher publisher =
-                new DisklessStateReconcilerPublisher(support, callback, ownershipLost);
+                new DisklessStateReconcilerPublisher(support, callback);
 
         publisher.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
@@ -78,39 +73,8 @@ class DisklessStateReconcilerPublisherTest {
                 mock(LoaderManifest.class)
         );
 
-        verify(support).reconcileTrackedPartitions(
-                eq(Collections.emptySet()), same(callback), same(ownershipLost), eq(Collections.emptySet()));
-        verify(support, never()).reconcilePublicationOwnership(any(), any(), any());
+        verify(support).reconcileTrackedPartitions(eq(Collections.emptySet()), same(callback));
         verify(support, never()).deleteTopicConfig(any());
-    }
-
-    @Test
-    void testBrokerOnlyMetadataUpdateReconcilesCurrentDisklessPublicationOwnership() {
-        Uuid topicId = Uuid.randomUuid();
-        String topicName = "diskless-owner-transfer-topic";
-        MetadataImage newImage = metadataImage(topicName, topicId, 2, true);
-        MetadataDelta delta = mock(MetadataDelta.class);
-        when(delta.clusterDelta()).thenReturn(mock(ClusterDelta.class));
-
-        DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
-        @SuppressWarnings("unchecked")
-        Consumer<String> callback = mock(Consumer.class);
-        @SuppressWarnings("unchecked")
-        BiConsumer<TopicIdPartition, Long> ownershipLost = mock(BiConsumer.class);
-        @SuppressWarnings("unchecked")
-        BiConsumer<TopicIdPartition, Long> ownershipAcquired = mock(BiConsumer.class);
-        DisklessStateReconcilerPublisher publisher = new DisklessStateReconcilerPublisher(
-                support, callback, ownershipLost, ownershipAcquired);
-
-        publisher.onMetadataUpdate(delta, newImage, mock(LoaderManifest.class));
-
-        Set<TopicIdPartition> expectedPartitions = Set.of(
-                new TopicIdPartition(topicId, new TopicPartition(topicName, 0)),
-                new TopicIdPartition(topicId, new TopicPartition(topicName, 1)));
-        verify(support).reconcileTrackedPartitions(
-                eq(Collections.emptySet()), same(callback), same(ownershipLost), eq(Collections.emptySet()));
-        verify(support).reconcilePublicationOwnership(
-                eq(expectedPartitions), same(ownershipLost), same(ownershipAcquired));
     }
 
     @Test
@@ -125,10 +89,8 @@ class DisklessStateReconcilerPublisherTest {
         DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
         @SuppressWarnings("unchecked")
         Consumer<String> callback = mock(Consumer.class);
-        @SuppressWarnings("unchecked")
-        BiConsumer<TopicIdPartition, Long> ownershipLost = mock(BiConsumer.class);
         DisklessStateReconcilerPublisher publisher =
-                new DisklessStateReconcilerPublisher(support, callback, ownershipLost);
+                new DisklessStateReconcilerPublisher(support, callback);
 
         publisher.onMetadataUpdate(delta, MetadataImage.EMPTY, mock(LoaderManifest.class));
 
@@ -137,8 +99,7 @@ class DisklessStateReconcilerPublisherTest {
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 1)),
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 2))
         );
-        verify(support).reconcileTrackedPartitions(
-                eq(deletedPartitions), same(callback), same(ownershipLost), eq(Collections.emptySet()));
+        verify(support).reconcileTrackedPartitions(eq(deletedPartitions), same(callback));
         verify(support).deleteTopicConfig(
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 0)));
     }
@@ -154,15 +115,12 @@ class DisklessStateReconcilerPublisherTest {
         DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
         @SuppressWarnings("unchecked")
         Consumer<String> callback = mock(Consumer.class);
-        @SuppressWarnings("unchecked")
-        BiConsumer<TopicIdPartition, Long> ownershipLost = mock(BiConsumer.class);
         DisklessStateReconcilerPublisher publisher =
-                new DisklessStateReconcilerPublisher(support, callback, ownershipLost);
+                new DisklessStateReconcilerPublisher(support, callback);
 
         publisher.onMetadataUpdate(delta, MetadataImage.EMPTY, mock(LoaderManifest.class));
 
-        verify(support).reconcileTrackedPartitions(
-                eq(Collections.emptySet()), same(callback), same(ownershipLost), eq(Collections.emptySet()));
+        verify(support).reconcileTrackedPartitions(eq(Collections.emptySet()), same(callback));
         verify(support, never()).deleteTopicConfig(any());
     }
 
@@ -207,4 +165,5 @@ class DisklessStateReconcilerPublisherTest {
                 new ConfigurationImage(resource, Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true"))
         ));
     }
+
 }

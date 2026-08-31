@@ -46,15 +46,17 @@ This directory contains Docker Compose configuration for running Kafka with **Di
 - the standalone Ursa compactor to materialize Kafka records into an external Iceberg table;
 - DuckDB as an on-demand SQL engine and automated E2E verifier.
 
-Kafka owns compaction-task publication in this stack so each range carries the
-Kafka entry format and source-topic metadata exactly once. The standalone Ursa
-compactor only consumes those tasks and writes the managed and Iceberg outputs.
+The standalone Ursa compactor owns compaction-task publication for diskless
+topics. It discovers the Lakestream partition logs, publishes their ranges,
+decodes the Kafka `MemoryRecords` stored in the Ursa WAL, and writes the managed
+and Iceberg outputs. Classic local-log ingestion is not part of this diskless
+demo and will use a separate StreamCatalog-based integration.
 
 ```text
 Kafka producer -> Kafka broker -> Ursa WAL (MinIO)
                                      |
                                      v
-                             Ursa compactor
+                     Ursa compactor (publishes tasks)
                               |           |
                               v           v
                     managed objects   Iceberg table

@@ -23,7 +23,6 @@ import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.storage.log.FetchParams;
 import org.apache.kafka.server.storage.log.FetchPartitionData;
-import org.apache.kafka.storage.diskless.DisklessLogMetadata;
 import org.apache.kafka.storage.diskless.DisklessStorageEngine;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionRequest;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
@@ -31,7 +30,6 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
 import java.io.IOException;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
@@ -79,11 +77,6 @@ public class UrsaStorageEngineImpl implements DisklessStorageEngine {
     public CompletableFuture<Map<TopicIdPartition, ListOffsetsPartitionResponse>> listOffsets(
             Map<TopicIdPartition, ListOffsetsPartitionRequest> requests) {
         return reader.listOffsets(requests);
-    }
-
-    @Override
-    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(TopicIdPartition topicIdPartition) {
-        return state.logMetadata(topicIdPartition);
     }
 
     @Override

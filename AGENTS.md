@@ -33,7 +33,6 @@ Design document: `docs/LIP-diskless-storage-with-ursa-integration.md`
 ./gradlew :server:test --tests "org.apache.kafka.server.ursa.integration.UrsaStorageE2ETest"
 ./gradlew :storage:storage-diskless-api:test --tests "org.apache.kafka.storage.diskless.DisklessStorageEngineLoaderTest"
 ./gradlew :storage:storage-diskless-ursa:test --tests "org.apache.kafka.storage.diskless.handlers.UrsaStorageStateTest"
-./gradlew :core:core-sdt-ursa:test --tests "kafka.server.ursa.sdt.UrsaSDTInterceptorTest"
 
 # Run a specific test method
 ./gradlew :core:test --tests "kafka.api.ProducerFailureHandlingTest.testCannotSendToInternalTopic"
@@ -81,7 +80,6 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 | `storage/diskless-api/` | Java | Generic diskless SPI/common classes used by broker code |
 | `storage/diskless-ursa/` | Java | Ursa implementation: Lakestream writer/reader, Oxia store, producer state |
 | `core/` | Scala | Broker: `ReplicaManager`, `KafkaApis`, `SocketServer`, `BrokerServer` |
-| `core/sdt-ursa/` | Java | Ursa SDT interceptor implementation and compaction task publisher |
 | `server/` | Java | Server configs (`SocketServerConfigs`), Ursa E2E integration tests |
 | `clients/` | Java | Network layer plus generic plugin classloader utilities |
 
@@ -113,10 +111,6 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 - `BrokerServer.scala` — Initializes diskless storage support
 - `ReplicaFetcherThread.scala` — Skips fetching for diskless partitions
 
-**Ursa SDT interceptor** (`core/sdt-ursa/src/main/java/kafka/server/ursa/sdt/`):
-- `UrsaSDTInterceptor.java` — ReplicaManager interceptor implementation for Ursa SDT
-- `TopicCompactionTaskPublisher.java` — Publishes compaction tasks
-
 **Network / Pipelining** (`core/src/main/scala/kafka/network/`):
 - `SocketServer.scala` — Request pipelining support (`socket.server.enable.request.pipelining`)
 
@@ -138,7 +132,7 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 ## Critical Patterns
 
 ### Ursa Dependencies
-Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` and `core:core-sdt-ursa` runtimes, not in `storage` or `core`.
+Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` runtime, not in `storage` or `core`.
 
 The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.lakestream.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state metadata and the controller's existing diskless metadata-store adapter.
 

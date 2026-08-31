@@ -26,7 +26,6 @@ import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
 import org.apache.kafka.server.storage.log.FetchPartitionData;
-import org.apache.kafka.storage.diskless.DisklessLogMetadata;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionRequest;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
 import org.apache.kafka.storage.diskless.LogEntryUtils;
@@ -341,11 +340,6 @@ final class UrsaPartitionLog {
             }
             return handleTimestampSearch(logInstance, timestamp);
         }).exceptionally(error -> ListOffsetsPartitionResponse.error(topicIdPartition, mapException(error)));
-    }
-
-    CompletableFuture<DisklessLogMetadata> logMetadata() {
-        return initialized().thenCompose(logInstance -> getHighWatermark(logInstance)
-                .thenApply(highWatermark -> new DisklessLogMetadata(logInstance.id().id(), highWatermark)));
     }
 
     CompletableFuture<PartitionResponse> appendIdempotentRecords(

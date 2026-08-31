@@ -39,7 +39,8 @@ class UrsaDisklessTopicLifecycleTest {
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
         Map<String, String> properties = Map.of("retention.ms", "60000");
-        when(registry.registerExternalStream(identifier, 3, properties))
+        Map<String, String> streamProperties = KafkaLogNaming.streamProperties("orders", properties);
+        when(registry.registerExternalStream(identifier, 3, streamProperties))
                 .thenReturn(CompletableFuture.completedFuture(null));
         when(registry.permanentlyDeleteExternalStream(identifier))
                 .thenReturn(CompletableFuture.completedFuture(null));
@@ -49,7 +50,7 @@ class UrsaDisklessTopicLifecycleTest {
             lifecycle.unregisterTopic("orders", topicId).get();
         }
 
-        verify(registry).registerExternalStream(identifier, 3, properties);
+        verify(registry).registerExternalStream(identifier, 3, streamProperties);
         verify(registry).permanentlyDeleteExternalStream(identifier);
         verify(registry).close();
     }

@@ -19,6 +19,8 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.Uuid;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -27,6 +29,7 @@ import java.util.Objects;
 public final class KafkaLogNaming {
 
     public static final String NAMESPACE = "default";
+    public static final String KAFKA_TOPIC_NAME_PROPERTY = "lakestream.kafka.topic.name";
 
     private KafkaLogNaming() {
     }
@@ -47,7 +50,7 @@ public final class KafkaLogNaming {
         return tp.topic() + "-topic-id-" + tp.topicId();
     }
 
-    /** Stable physical partition name used by the existing SDT publication contract. */
+    /** Stable physical partition name used by the Lakestream storage/catalog contract. */
     public static String logName(TopicIdPartition tp) {
         return NAMESPACE + "/" + partitionName(tp);
     }
@@ -55,6 +58,16 @@ public final class KafkaLogNaming {
     /** Physical partition-name component used by {@link #logName}. */
     public static String partitionName(TopicIdPartition tp) {
         return streamName(tp) + "-partition-" + tp.partition();
+    }
+
+    /** Adds Kafka's stable logical topic name to the external stream metadata. */
+    public static Map<String, String> streamProperties(
+            String topicName,
+            Map<String, String> topicConfig) {
+        Objects.requireNonNull(topicName, "topicName must not be null");
+        Map<String, String> properties = new HashMap<>(topicConfig == null ? Map.of() : topicConfig);
+        properties.put(KAFKA_TOPIC_NAME_PROPERTY, topicName);
+        return Map.copyOf(properties);
     }
 
 }

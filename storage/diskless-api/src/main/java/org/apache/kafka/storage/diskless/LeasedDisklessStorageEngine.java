@@ -26,7 +26,6 @@ import org.apache.kafka.server.storage.log.FetchPartitionData;
 
 import java.io.IOException;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
@@ -59,11 +58,6 @@ final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
     public CompletableFuture<Map<TopicIdPartition, ListOffsetsPartitionResponse>> listOffsets(
             Map<TopicIdPartition, ListOffsetsPartitionRequest> requests) {
         return callWithClassLoader(() -> delegate.listOffsets(requests));
-    }
-
-    @Override
-    public CompletableFuture<Optional<DisklessLogMetadata>> logMetadata(TopicIdPartition topicIdPartition) {
-        return callWithClassLoader(() -> delegate.logMetadata(topicIdPartition));
     }
 
     @Override

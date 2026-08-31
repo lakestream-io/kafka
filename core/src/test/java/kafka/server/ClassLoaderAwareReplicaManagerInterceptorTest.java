@@ -18,7 +18,6 @@ package kafka.server;
 
 import kafka.cluster.Partition;
 
-import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.utils.KafkaPluginClassLoader;
 import org.apache.kafka.metadata.ConfigRepository;
@@ -57,23 +56,6 @@ class ClassLoaderAwareReplicaManagerInterceptorTest {
 
         interceptor.onAppend(null, null, null);
         assertSame(classLoader, delegate.onAppendClassLoader.get());
-        delegate.onAppendClassLoader.set(null);
-        interceptor.onAppend(null, null, null, 13L);
-        assertSame(classLoader, delegate.onAppendClassLoader.get());
-        interceptor.onLeadershipAcquired(null, 15L);
-        assertSame(classLoader, delegate.onLeadershipAcquiredClassLoader.get());
-        interceptor.onLeadershipLost(null);
-        assertSame(classLoader, delegate.onLeadershipLostClassLoader.get());
-        interceptor.onDisklessAppend(null, 17L, 29L);
-        assertSame(classLoader, delegate.onDisklessAppendClassLoader.get());
-        delegate.onDisklessAppendClassLoader.set(null);
-        interceptor.onDisklessAppend(null, 17L, 29L, 31L);
-        assertSame(classLoader, delegate.onDisklessAppendClassLoader.get());
-        interceptor.onPartitionOwnershipLost(null);
-        assertSame(classLoader, delegate.onPartitionOwnershipLostClassLoader.get());
-        delegate.onPartitionOwnershipLostClassLoader.set(null);
-        interceptor.onPartitionOwnershipLost(null, 32L);
-        assertSame(classLoader, delegate.onPartitionOwnershipLostClassLoader.get());
 
         interceptor.close();
         assertSame(classLoader, delegate.closeClassLoader.get());
@@ -170,38 +152,11 @@ class ClassLoaderAwareReplicaManagerInterceptorTest {
 
     private static final class CapturingInterceptor implements ReplicaManagerInterceptor {
         private final AtomicReference<ClassLoader> onAppendClassLoader = new AtomicReference<>();
-        private final AtomicReference<ClassLoader> onLeadershipAcquiredClassLoader = new AtomicReference<>();
-        private final AtomicReference<ClassLoader> onLeadershipLostClassLoader = new AtomicReference<>();
-        private final AtomicReference<ClassLoader> onDisklessAppendClassLoader = new AtomicReference<>();
-        private final AtomicReference<ClassLoader> onPartitionOwnershipLostClassLoader = new AtomicReference<>();
         private final AtomicReference<ClassLoader> closeClassLoader = new AtomicReference<>();
 
         @Override
         public void onAppend(MemoryRecords records, LogAppendInfo appendInfo, Partition partition) {
             onAppendClassLoader.set(Thread.currentThread().getContextClassLoader());
-        }
-
-        @Override
-        public void onLeadershipAcquired(Partition partition, long publisherGeneration) {
-            onLeadershipAcquiredClassLoader.set(Thread.currentThread().getContextClassLoader());
-        }
-
-        @Override
-        public void onLeadershipLost(TopicIdPartition topicIdPartition) {
-            onLeadershipLostClassLoader.set(Thread.currentThread().getContextClassLoader());
-        }
-
-        @Override
-        public void onDisklessAppend(
-                TopicIdPartition topicIdPartition,
-                long streamId,
-                long highWatermark) {
-            onDisklessAppendClassLoader.set(Thread.currentThread().getContextClassLoader());
-        }
-
-        @Override
-        public void onPartitionOwnershipLost(TopicIdPartition topicIdPartition) {
-            onPartitionOwnershipLostClassLoader.set(Thread.currentThread().getContextClassLoader());
         }
 
         @Override

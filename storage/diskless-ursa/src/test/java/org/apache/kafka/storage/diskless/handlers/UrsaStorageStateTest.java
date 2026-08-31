@@ -38,7 +38,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.lakestream.api.Log;
-import io.lakestream.api.LogId;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
@@ -106,22 +105,6 @@ class UrsaStorageStateTest {
 
             assertFalse(state.cleanupPartition(tp));
             verify(catalog, never()).openExternalPartition(any(), anyInt(), any());
-        }
-    }
-
-    @Test
-    void testLogMetadataUsesActualLakestreamIdAndEndExclusiveHighWatermark() throws Exception {
-        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("metadata-topic", 2));
-        Log logInstance = mockLog(5L, 41L, 3, 500L, 100, 1_400L, 200);
-        when(logInstance.id()).thenReturn(LogId.of(73L));
-        StreamCatalog catalog = mockCatalogWithLog(logInstance);
-
-        try (UrsaStorageState state = newState(catalog)) {
-            var metadata = state.logMetadata(tp).join().orElseThrow();
-            assertEquals(73L, metadata.streamId());
-            assertEquals(44L, metadata.highWatermark());
-            assertNotNull(state.partitionLog(tp));
-            verify(catalog).openExternalPartition(any(), anyInt(), any());
         }
     }
 
@@ -552,15 +535,17 @@ class UrsaStorageStateTest {
         StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> initialConfig = Map.of("retention.ms", "1000");
         Map<String, String> latestConfig = Map.of("retention.ms", "2000");
+        Map<String, String> initialProperties = KafkaLogNaming.streamProperties(tp.topic(), initialConfig);
+        Map<String, String> latestProperties = KafkaLogNaming.streamProperties(tp.topic(), latestConfig);
         CompletableFuture<Log> opening = new CompletableFuture<>();
 
-        when(catalog.openExternalPartition(identifier, 0, initialConfig)).thenReturn(opening);
+        when(catalog.openExternalPartition(identifier, 0, initialProperties)).thenReturn(opening);
         when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(true));
         when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
         when(stream.properties()).thenReturn(Map.of());
-        when(catalog.setStreamProperties(identifier, initialConfig))
+        when(catalog.setStreamProperties(identifier, initialProperties))
                 .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.setStreamProperties(identifier, latestConfig))
+        when(catalog.setStreamProperties(identifier, latestProperties))
                 .thenReturn(CompletableFuture.completedFuture(null));
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null);
         try (UrsaStorageState state = new UrsaStorageState(
@@ -580,9 +565,9 @@ class UrsaStorageStateTest {
 
             assertSame(logInstance, openFuture.get());
             updateFuture.get();
-            verify(catalog, times(1)).setStreamProperties(identifier, initialConfig);
-            verify(catalog, times(1)).setStreamProperties(identifier, latestConfig);
-            verify(catalog).openExternalPartition(identifier, 0, initialConfig);
+            verify(catalog, times(1)).setStreamProperties(identifier, initialProperties);
+            verify(catalog, times(1)).setStreamProperties(identifier, latestProperties);
+            verify(catalog).openExternalPartition(identifier, 0, initialProperties);
         }
     }
 
