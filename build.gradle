@@ -1095,6 +1095,7 @@ project(':server') {
     testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
     testImplementation 'org.testcontainers:localstack:1.21.4'
     testImplementation 'org.awaitility:awaitility:4.2.0'
+    testRuntimeOnly 'commons-codec:commons-codec:1.17.1'
     testRuntimeOnly runtimeTestLibs
   }
 
