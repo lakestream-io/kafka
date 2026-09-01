@@ -19,11 +19,13 @@ package org.apache.kafka.storage.diskless;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Uuid;
 
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 final class LeasedDisklessProducerStateStore implements DisklessProducerStateStore {
     private final DisklessProducerStateStore delegate;
     private final DisklessClassLoaderRegistry.Lease classLoaderLease;
+    private boolean closed;
 
     LeasedDisklessProducerStateStore(
             DisklessProducerStateStore delegate,
@@ -33,20 +35,31 @@ final class LeasedDisklessProducerStateStore implements DisklessProducerStateSto
     }
 
     @Override
+    public CompletableFuture<Void> reconcileTopic(String topicName, Uuid topicId, long sourceRevision) {
+        return callWithClassLoader(() -> delegate.reconcileTopic(topicName, topicId, sourceRevision));
+    }
+
+    @Override
+    public CompletableFuture<List<ManagedProducerStateTopic>> listManagedTopics() {
+        return callWithClassLoader(delegate::listManagedTopics);
+    }
+
+    @Override
     public CompletableFuture<Void> deleteTopicSnapshots(Uuid topicId) {
         return callWithClassLoader(() -> delegate.deleteTopicSnapshots(topicId));
     }
 
     @Override
-    public void close() throws Exception {
-        try {
-            DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
-                delegate.close();
-                return null;
-            });
-        } finally {
-            classLoaderLease.close();
+    public synchronized void close() throws Exception {
+        if (closed) {
+            return;
         }
+        DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
+            delegate.close();
+            return null;
+        });
+        classLoaderLease.close();
+        closed = true;
     }
 
     private <T> T callWithClassLoader(DisklessClassLoaderContext.Action<T> action) {

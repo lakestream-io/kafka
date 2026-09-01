@@ -25,25 +25,28 @@ import org.apache.kafka.server.config.ServerLogConfigs;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
+import java.util.stream.LongStream;
 
 import io.lakestream.api.Log;
+import io.lakestream.api.LogId;
 import io.lakestream.api.LogOffset;
-import io.lakestream.api.Stream;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamLayout;
+import io.lakestream.api.StreamMetadata;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -57,9 +60,7 @@ class UrsaStorageStateRetentionTest {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("retention-test-topic", 0));
         StreamCatalog catalog = mock(StreamCatalog.class);
         Log logInstance = mock(Log.class);
-        when(catalog.openExternalPartition(
-                LakestreamStorageHolder.streamIdentifier(tp), tp.partition(), Map.of()))
-                .thenReturn(CompletableFuture.completedFuture(logInstance));
+        stubCatalogLog(catalog, tp, logInstance);
 
         try (UrsaStorageState state = newState(catalog)) {
             Log result = state.openLog(tp).get(5, TimeUnit.SECONDS);
@@ -182,9 +183,7 @@ class UrsaStorageStateRetentionTest {
         Log logInstance = mock(Log.class);
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
-        when(catalog.openExternalPartition(
-                LakestreamStorageHolder.streamIdentifier(tp), tp.partition(), Map.of()))
-                .thenReturn(CompletableFuture.completedFuture(logInstance));
+        stubCatalogLog(catalog, tp, logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset())
                 .thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND))
@@ -219,24 +218,12 @@ class UrsaStorageStateRetentionTest {
     void testTopicConfigUpdateTriggersRetentionForOpenPartition() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("dynamic-retention", 0));
         StreamCatalog catalog = mock(StreamCatalog.class);
-        Stream stream = mock(Stream.class);
         Log logInstance = mock(Log.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
         Map<String, String> updatedConfig = Map.of(TopicConfig.RETENTION_MS_CONFIG, "120000");
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
 
-        Map<String, String> initialProperties = KafkaLogNaming.streamProperties(tp.topic(), Map.of());
-        Map<String, String> updatedProperties = KafkaLogNaming.streamProperties(tp.topic(), updatedConfig);
-        when(catalog.openExternalPartition(identifier, 0, initialProperties))
-                .thenReturn(CompletableFuture.completedFuture(logInstance));
-        when(catalog.streamExists(identifier)).thenReturn(CompletableFuture.completedFuture(true));
-        when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
-        when(stream.properties()).thenReturn(Map.of());
-        when(catalog.setStreamProperties(identifier, initialProperties))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        when(catalog.setStreamProperties(identifier, updatedProperties))
-                .thenReturn(CompletableFuture.completedFuture(null));
+        stubCatalogLog(catalog, tp, logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
@@ -263,55 +250,7 @@ class UrsaStorageStateRetentionTest {
     }
 
     @Test
-    void testTopicConfigPersistenceFailureDoesNotSuppressRetention() throws Exception {
-        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("retention-config-failure", 0));
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Stream stream = mock(Stream.class);
-        Log logInstance = mock(Log.class);
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
-        Map<String, String> updatedConfig = Map.of(TopicConfig.RETENTION_MS_CONFIG, "120000");
-        LogOffset firstOffset = mockOffset(5L);
-        LogOffset lastOffset = mockOffset(42L);
-
-        Map<String, String> initialProperties = KafkaLogNaming.streamProperties(tp.topic(), Map.of());
-        when(catalog.openExternalPartition(identifier, 0, initialProperties))
-                .thenReturn(CompletableFuture.completedFuture(logInstance));
-        when(catalog.streamExists(identifier))
-                .thenReturn(CompletableFuture.completedFuture(true))
-                .thenReturn(CompletableFuture.failedFuture(new RuntimeException("catalog unavailable")));
-        when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(stream));
-        when(stream.properties()).thenReturn(Map.of());
-        when(catalog.setStreamProperties(identifier, initialProperties))
-                .thenReturn(CompletableFuture.completedFuture(null));
-        when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
-        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
-        when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
-                .thenReturn(CompletableFuture.completedFuture(10L));
-        when(logInstance.softTrim(10L)).thenReturn(CompletableFuture.completedFuture(11L));
-
-        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, null);
-        try (UrsaStorageState state = new UrsaStorageState(
-                Time.SYSTEM,
-                1,
-                mock(UrsaStorageConfig.class),
-                mock(BrokerTopicStats.class),
-                holder,
-                Map.of(
-                        TopicConfig.RETENTION_MS_CONFIG, -1L,
-                        TopicConfig.RETENTION_BYTES_CONFIG, -1L,
-                        ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, 60_000L),
-                ignored -> Map.of())) {
-            state.getOrCreatePartitionLog(tp);
-
-            assertThrows(
-                    ExecutionException.class,
-                    () -> state.updateTopicConfigAsync(tp, updatedConfig).get(5, TimeUnit.SECONDS));
-            verify(logInstance).softTrim(10L);
-        }
-    }
-
-    @Test
-    void testCleanupWaitsForSubmittedTrimBeforeFencingLog() throws Exception {
+    void testCleanupWaitsForSubmittedTrimBeforeClosingLeasedLog() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("in-flight-trim", 0));
         StreamCatalog catalog = mock(StreamCatalog.class);
         Log logInstance = mock(Log.class);
@@ -327,9 +266,7 @@ class UrsaStorageStateRetentionTest {
             }
         };
 
-        when(catalog.openExternalPartition(
-                LakestreamStorageHolder.streamIdentifier(tp), tp.partition(), Map.of()))
-                .thenReturn(CompletableFuture.completedFuture(logInstance));
+        stubCatalogLog(catalog, tp, logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
@@ -355,16 +292,15 @@ class UrsaStorageStateRetentionTest {
                     () -> state.cleanupPartition(tp, false));
             assertTrue(trimAwaited.await(5, TimeUnit.SECONDS));
             assertFalse(cleanupFuture.isDone());
-            verify(logInstance, never()).fence();
             verify(logInstance, never()).close();
 
             trimResult.complete(11L);
             assertTrue(cleanupFuture.get(5, TimeUnit.SECONDS));
 
-            org.mockito.InOrder closeOrder = org.mockito.Mockito.inOrder(logInstance);
+            InOrder closeOrder = inOrder(logInstance);
             closeOrder.verify(logInstance).softTrim(10L);
-            closeOrder.verify(logInstance).fence();
             closeOrder.verify(logInstance).close();
+            verify(logInstance, never()).fence();
         }
     }
 
@@ -377,9 +313,7 @@ class UrsaStorageStateRetentionTest {
         LogOffset lastOffset = mockOffset(42L);
         CompletableFuture<Long> trimOffset = new CompletableFuture<>();
 
-        when(catalog.openExternalPartition(
-                LakestreamStorageHolder.streamIdentifier(tp), tp.partition(), Map.of()))
-                .thenReturn(CompletableFuture.completedFuture(logInstance));
+        stubCatalogLog(catalog, tp, logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
         when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
         when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(trimOffset);
@@ -413,6 +347,24 @@ class UrsaStorageStateRetentionTest {
                 mock(UrsaStorageConfig.class),
                 mock(BrokerTopicStats.class),
                 catalog);
+    }
+
+    private static void stubCatalogLog(
+            StreamCatalog catalog,
+            TopicIdPartition tp,
+            Log logInstance) {
+        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
+        LogId logId = LogId.of(tp.partition() + 1L);
+        StreamMetadata metadata = mock(StreamMetadata.class);
+        StreamLayout layout = mock(StreamLayout.class);
+        when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(metadata));
+        when(metadata.layout()).thenReturn(layout);
+        when(layout.logIds()).thenReturn(CompletableFuture.completedFuture(
+                LongStream.rangeClosed(1, tp.partition() + 1L)
+                        .mapToObj(LogId::of)
+                        .toList()));
+        when(catalog.openLog(identifier, logId))
+                .thenReturn(CompletableFuture.completedFuture(logInstance));
     }
 
     private static LogOffset mockOffset(long offset) {

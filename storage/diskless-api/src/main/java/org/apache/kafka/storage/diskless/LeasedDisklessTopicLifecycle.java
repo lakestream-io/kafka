@@ -19,12 +19,14 @@ package org.apache.kafka.storage.diskless;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Uuid;
 
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 final class LeasedDisklessTopicLifecycle implements DisklessTopicLifecycle {
     private final DisklessTopicLifecycle delegate;
     private final DisklessClassLoaderRegistry.Lease classLoaderLease;
+    private boolean closed;
 
     LeasedDisklessTopicLifecycle(
             DisklessTopicLifecycle delegate,
@@ -34,12 +36,19 @@ final class LeasedDisklessTopicLifecycle implements DisklessTopicLifecycle {
     }
 
     @Override
+    public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
+        return callWithClassLoader(delegate::listManagedTopics);
+    }
+
+    @Override
     public CompletableFuture<Void> registerTopic(
             String topicName,
             Uuid topicId,
             int partitions,
-            Map<String, String> properties) {
-        return callWithClassLoader(() -> delegate.registerTopic(topicName, topicId, partitions, properties));
+            Map<String, String> properties,
+            long sourceRevision) {
+        return callWithClassLoader(() -> delegate.registerTopic(
+                topicName, topicId, partitions, properties, sourceRevision));
     }
 
     @Override
@@ -48,15 +57,16 @@ final class LeasedDisklessTopicLifecycle implements DisklessTopicLifecycle {
     }
 
     @Override
-    public void close() throws Exception {
-        try {
-            DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
-                delegate.close();
-                return null;
-            });
-        } finally {
-            classLoaderLease.close();
+    public synchronized void close() throws Exception {
+        if (closed) {
+            return;
         }
+        DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
+            delegate.close();
+            return null;
+        });
+        classLoaderLease.close();
+        closed = true;
     }
 
     private <T> T callWithClassLoader(DisklessClassLoaderContext.Action<T> action) {

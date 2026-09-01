@@ -18,7 +18,9 @@ package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.Uuid;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -30,12 +32,55 @@ import java.util.concurrent.CompletableFuture;
  */
 public interface DisklessTopicLifecycle extends AutoCloseable {
 
-    /** Register a logical diskless topic without creating its physical partition logs. */
+    /**
+     * A Kafka topic incarnation durably owned by this diskless storage implementation.
+     *
+     * <p>The topic ID, rather than the topic name alone, identifies the immutable Kafka topic
+     * incarnation. Implementations must only return entries carrying explicit Kafka ownership
+     * metadata; an arbitrary storage object whose name resembles a Kafka topic is not managed.
+     */
+    record ManagedTopic(String topicName, Uuid topicId, long sourceRevision) {
+        public ManagedTopic {
+            Objects.requireNonNull(topicName, "topicName must not be null");
+            Objects.requireNonNull(topicId, "topicId must not be null");
+            if (topicName.isBlank()) {
+                throw new IllegalArgumentException("topicName must not be blank");
+            }
+            if (Uuid.ZERO_UUID.equals(topicId)) {
+                throw new IllegalArgumentException("topicId must not be zero");
+            }
+            if (sourceRevision < 0) {
+                throw new IllegalArgumentException("sourceRevision must not be negative");
+            }
+        }
+    }
+
+    /**
+     * Lists non-terminal Kafka topic incarnations managed by this storage implementation.
+     *
+     * <p>The active Kafka controller uses this semantic inventory to reconcile storage objects
+     * left behind by a controller restart. The inventory must include objects still being created
+     * or deleted so an abandoned lifecycle claim cannot remain hidden. Implementations must filter
+     * using durable ownership metadata and must not infer ownership from a storage-specific name
+     * alone. Each entry must also carry the KRaft source revision from the registration that made
+     * it visible. The controller only deletes an absent entry after its image has reached that
+     * revision, which prevents a newly elected but lagging controller from deleting newer state.
+     */
+    CompletableFuture<List<ManagedTopic>> listManagedTopics();
+
+    /**
+     * Reconcile a logical diskless topic at the supplied KRaft metadata revision.
+     *
+     * <p>The implementation creates the stream when it is absent, grows its partition layout when
+     * needed, and exactly replaces its properties. The source revision lets the storage catalog
+     * reject a delayed property update from an older metadata image.
+     */
     CompletableFuture<Void> registerTopic(
             String topicName,
             Uuid topicId,
             int partitions,
-            Map<String, String> properties);
+            Map<String, String> properties,
+            long sourceRevision);
 
     /**
      * Permanently unregister the logical topic after its Kafka metadata has been deleted.

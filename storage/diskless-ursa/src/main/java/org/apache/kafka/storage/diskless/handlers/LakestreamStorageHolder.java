@@ -19,9 +19,15 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.storage.diskless.OxiaServiceUrl;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -29,17 +35,26 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.function.Function;
-import java.util.function.Supplier;
+import java.util.function.Predicate;
 
+import io.lakestream.api.EntryIndex;
 import io.lakestream.api.Log;
-import io.lakestream.api.Stream;
+import io.lakestream.api.LogCursor;
+import io.lakestream.api.LogEntry;
+import io.lakestream.api.LogEntryHeader;
+import io.lakestream.api.LogId;
+import io.lakestream.api.LogOffset;
+import io.lakestream.api.LogStorage;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamCatalogLoader;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.exception.NoSuchStreamException;
+import io.netty.buffer.ByteBuf;
 import io.oxia.client.api.AsyncOxiaClient;
 
 /**
@@ -47,19 +62,51 @@ import io.oxia.client.api.AsyncOxiaClient;
  */
 final class LakestreamStorageHolder implements Closeable {
 
+    private static final Logger log = LoggerFactory.getLogger(LakestreamStorageHolder.class);
     private static final long OXIA_CONNECT_TIMEOUT_SECONDS = 10;
+    private static final long LIFECYCLE_RETRY_MS = 1_000;
+    private static final long CLOSE_DRAIN_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(10);
     private static final String OXIA_STORAGE_URL_PROP = "oxiaStorageUrl";
 
     private final StreamCatalog catalog;
     private final AsyncOxiaClient producerStateOxiaClient;
-    private final ConcurrentHashMap<StreamIdentifier, TopicOperations> topicOperations = new ConcurrentHashMap<>();
-    private final Set<StreamIdentifier> deletedTopicStreams = ConcurrentHashMap.newKeySet();
+    private final Object streamLifecycleLock = new Object();
+    private final Map<StreamIdentifier, StreamOpenState> streamOpenStates = new HashMap<>();
+    private final ScheduledExecutorService lifecycleRetryScheduler =
+            Executors.newSingleThreadScheduledExecutor(task -> {
+                Thread thread = new Thread(task, "diskless-log-lifecycle-retry");
+                thread.setDaemon(true);
+                return thread;
+            });
+    private final long lifecycleRetryMs;
+    private final long closeDrainTimeoutMs;
+    private boolean closing;
+    private boolean closed;
+    private boolean retrySchedulerClosed;
+    private boolean catalogClosed;
+    private boolean producerStateOxiaClientClosed;
 
     LakestreamStorageHolder(
             StreamCatalog catalog,
             AsyncOxiaClient producerStateOxiaClient) {
+        this(catalog, producerStateOxiaClient, LIFECYCLE_RETRY_MS, CLOSE_DRAIN_TIMEOUT_MS);
+    }
+
+    LakestreamStorageHolder(
+            StreamCatalog catalog,
+            AsyncOxiaClient producerStateOxiaClient,
+            long lifecycleRetryMs,
+            long closeDrainTimeoutMs) {
+        if (lifecycleRetryMs <= 0) {
+            throw new IllegalArgumentException("lifecycleRetryMs must be positive");
+        }
+        if (closeDrainTimeoutMs <= 0) {
+            throw new IllegalArgumentException("closeDrainTimeoutMs must be positive");
+        }
         this.catalog = catalog;
         this.producerStateOxiaClient = producerStateOxiaClient;
+        this.lifecycleRetryMs = lifecycleRetryMs;
+        this.closeDrainTimeoutMs = closeDrainTimeoutMs;
     }
 
     StreamCatalog catalog() {
@@ -70,162 +117,318 @@ final class LakestreamStorageHolder implements Closeable {
         return producerStateOxiaClient;
     }
 
-    CompletableFuture<Log> openPartition(TopicIdPartition tp, Map<String, String> topicConfig) {
+    CompletableFuture<Log> openPartition(TopicIdPartition tp) {
         StreamIdentifier identifier = streamIdentifier(tp);
-        if (deletedTopicStreams.contains(identifier)) {
+        StreamOpenState openState = beginOpen(identifier);
+        if (openState == null) {
             return CompletableFuture.failedFuture(
                     new IllegalStateException("Kafka topic incarnation is already deleted: " + tp));
         }
-        Map<String, String> suppliedConfig = KafkaLogNaming.streamProperties(tp.topic(), topicConfig);
-        return enqueueTopicOperation(identifier, operations -> operations.enqueueOpen(
-                suppliedConfig,
-                currentConfig -> {
-                    if (deletedTopicStreams.contains(identifier)) {
-                        return CompletableFuture.failedFuture(
-                                new IllegalStateException("Kafka topic incarnation is already deleted: " + tp));
-                    }
-                    return catalog.openExternalPartition(identifier, tp.partition(), currentConfig)
-                            // Opening an external partition only updates properties while growing the partition
-                            // count. Replace them explicitly so a config event racing this open cannot be
-                            // overwritten by the snapshot captured when openLog started.
-                            .thenCompose(log -> replaceTopicConfigAndReturnLog(identifier, currentConfig, log));
-                }))
-                .future();
-    }
-
-    CompletableFuture<Void> asyncUpdateTopicConfig(
-            TopicIdPartition topicIdPartition,
-            Map<String, String> topicConfig
-    ) {
-        StreamIdentifier identifier = streamIdentifier(topicIdPartition);
-        if (deletedTopicStreams.contains(identifier)) {
-            return CompletableFuture.completedFuture(null);
-        }
-        Map<String, String> configSnapshot = KafkaLogNaming.streamProperties(
-                topicIdPartition.topic(), topicConfig);
-        return enqueueTopicOperation(identifier, operations -> operations.enqueueConfigUpdate(
-                configSnapshot,
-                () -> deletedTopicStreams.contains(identifier)
-                        ? CompletableFuture.completedFuture(null)
-                        : replaceTopicConfig(identifier, configSnapshot)))
-                .future();
-    }
-
-    CompletableFuture<Void> asyncDeleteTopicConfig(TopicIdPartition topicIdPartition) {
-        StreamIdentifier identifier = streamIdentifier(topicIdPartition);
-        deletedTopicStreams.add(identifier);
-        TopicOperation<Void> deletion = enqueueTopicOperation(
-                identifier,
-                operations -> operations.enqueueDeletion(() -> replaceTopicConfig(identifier, Map.of())));
-        deletion.future().whenComplete((ignored, error) -> {
-            if (error == null) {
-                evictTopicOperations(identifier, deletion);
-            }
-        });
-        return deletion.future();
-    }
-
-    private <T> TopicOperation<T> enqueueTopicOperation(
-            StreamIdentifier identifier,
-            Function<TopicOperations, QueuedOperation<T>> enqueue) {
-        while (true) {
-            TopicOperations operations = topicOperations.computeIfAbsent(identifier, ignored -> new TopicOperations());
-            synchronized (operations) {
-                // A successful deletion can evict an idle operations object while another thread still
-                // holds a reference to it. Only enqueue while it is still canonical for this exact
-                // Kafka topic incarnation; otherwise retry against the replacement.
-                if (topicOperations.get(identifier) != operations) {
-                    continue;
-                }
-                QueuedOperation<T> queued = enqueue.apply(operations);
-                return new TopicOperation<>(operations, queued.sequence(), queued.future());
-            }
-        }
-    }
-
-    private void evictTopicOperations(StreamIdentifier identifier, TopicOperation<Void> deletion) {
-        TopicOperations operations = deletion.operations();
-        synchronized (operations) {
-            // Keep the state when another operation for this exact UUID-qualified stream was
-            // queued behind the deletion. Its queue must remain canonical until that work settles.
-            if (operations.isLatest(deletion.sequence())) {
-                topicOperations.remove(identifier, operations);
-            }
-        }
-    }
-
-    private CompletableFuture<Void> replaceTopicConfig(
-            StreamIdentifier identifier,
-            Map<String, String> topicConfig) {
-        return catalog.streamExists(identifier).thenCompose(exists -> {
-            // Config changes are broadcast to every broker, including brokers that have never opened
-            // a partition of this topic. The current metadata supplier will provide the full config
-            // when a partition is opened later, so there is nothing to persist locally yet.
-            if (!exists) {
-                return CompletableFuture.completedFuture(null);
-            }
-            return catalog.loadStream(identifier).thenCompose(stream -> {
-                final Map<String, String> existing;
-                try {
-                    existing = Map.copyOf(stream.properties());
-                } finally {
-                    closeStreamQuietly(stream);
-                }
-                List<String> staleKeys = existing.keySet().stream()
-                        .filter(key -> !topicConfig.containsKey(key))
-                        .toList();
-                CompletableFuture<Void> removeFuture = staleKeys.isEmpty()
-                        ? CompletableFuture.completedFuture(null)
-                        : catalog.removeStreamProperties(identifier, staleKeys);
-                return removeFuture.thenCompose(ignored -> topicConfig.isEmpty()
-                        ? CompletableFuture.completedFuture(null)
-                        : catalog.setStreamProperties(identifier, topicConfig));
-            });
-        });
-    }
-
-    private CompletableFuture<Log> replaceTopicConfigAndReturnLog(
-            StreamIdentifier identifier,
-            Map<String, String> topicConfig,
-            Log log) {
-        if (log == null) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("StreamCatalog.openExternalPartition returned null log"));
-        }
-        final CompletableFuture<Void> replaceFuture;
+        CompletableFuture<Log> openFuture;
         try {
-            replaceFuture = replaceTopicConfig(identifier, topicConfig);
+            openFuture = openPartition(catalog, tp);
         } catch (Throwable error) {
-            closeLogAfterFailure(log, error);
+            completeFailedOpen(identifier, openState);
             return CompletableFuture.failedFuture(error);
         }
-        if (replaceFuture == null) {
-            IllegalStateException error = new IllegalStateException("replaceTopicConfig returned null future");
-            closeLogAfterFailure(log, error);
-            return CompletableFuture.failedFuture(error);
-        }
-        return replaceFuture.handle((ignored, error) -> {
+        return openFuture.handle((openedLog, error) -> {
             if (error != null) {
-                Throwable failure = error instanceof CompletionException
-                        && error.getCause() != null ? error.getCause() : error;
-                closeLogAfterFailure(log, failure);
-                throw new CompletionException(failure);
+                completeFailedOpen(identifier, openState);
+                return CompletableFuture.<Log>failedFuture(error);
             }
-            return log;
-        });
+            return completeSuccessfulOpen(identifier, openState, tp, openedLog);
+        }).thenCompose(future -> future);
     }
 
-    CompletableFuture<Void> deletePartitionData(TopicIdPartition tp) {
+    void markTopicDeleted(TopicIdPartition tp) {
         StreamIdentifier identifier = streamIdentifier(tp);
-        // Fence this exact topic incarnation before queuing deletion. A lazy open that was
-        // admitted before the metadata delete either completes ahead of this operation or sees
-        // the tombstone and fails; it cannot re-register the old stream after cleanup.
-        deletedTopicStreams.add(identifier);
-        return enqueueTopicOperation(
-                identifier,
-                operations -> operations.enqueueCleanup(
-                        () -> catalog.deleteExternalPartition(identifier, tp.partition())))
-                .future();
+        StreamOpenState state;
+        synchronized (streamLifecycleLock) {
+            if (closing || closed) {
+                return;
+            }
+            state = streamOpenStates.computeIfAbsent(identifier, ignored -> new StreamOpenState());
+            state.deleted = true;
+        }
+        maybeReleaseDeletionFence(identifier, state);
+    }
+
+    static CompletableFuture<Log> openPartition(StreamCatalog catalog, TopicIdPartition tp) {
+        StreamIdentifier identifier = streamIdentifier(tp);
+        return catalog.loadStream(identifier)
+                .thenCompose(metadata -> metadata.layout().logIds())
+                .thenCompose(logIds -> openLayoutLog(catalog, identifier, tp, logIds));
+    }
+
+    private static CompletableFuture<Log> openLayoutLog(
+            StreamCatalog catalog,
+            StreamIdentifier identifier,
+            TopicIdPartition tp,
+            List<LogId> logIds) {
+        if (tp.partition() < 0 || tp.partition() >= logIds.size()) {
+            return CompletableFuture.failedFuture(new IllegalStateException(
+                "Partition " + tp.partition() + " is not present in the committed layout for "
+                    + identifier.fullName() + " (log count " + logIds.size() + ")"));
+        }
+        return catalog.openLog(identifier, logIds.get(tp.partition()));
+    }
+
+    private StreamOpenState beginOpen(StreamIdentifier identifier) {
+        synchronized (streamLifecycleLock) {
+            if (closing || closed) {
+                return null;
+            }
+            StreamOpenState state = streamOpenStates.computeIfAbsent(
+                    identifier, ignored -> new StreamOpenState());
+            if (state.deleted) {
+                return null;
+            }
+            state.inFlightOpens++;
+            return state;
+        }
+    }
+
+    private void completeFailedOpen(
+            StreamIdentifier identifier,
+            StreamOpenState state) {
+        boolean checkDeletion;
+        synchronized (streamLifecycleLock) {
+            state.inFlightOpens--;
+            checkDeletion = handleDrainedState(identifier, state);
+            streamLifecycleLock.notifyAll();
+        }
+        if (checkDeletion) {
+            maybeReleaseDeletionFence(identifier, state);
+        }
+    }
+
+    private CompletableFuture<Log> completeSuccessfulOpen(
+            StreamIdentifier identifier,
+            StreamOpenState state,
+            TopicIdPartition tp,
+            Log openedLog) {
+        if (openedLog == null) {
+            completeFailedOpen(identifier, state);
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("StreamCatalog.openLog returned null for " + tp));
+        }
+        TrackedLog trackedLog = new TrackedLog(
+                openedLog, closedLog -> completeHandleClose(identifier, state, closedLog));
+        boolean rejectOpen;
+        synchronized (streamLifecycleLock) {
+            state.inFlightOpens--;
+            state.activeHandles.add(trackedLog);
+            rejectOpen = state.deleted || closing || closed;
+            streamLifecycleLock.notifyAll();
+        }
+        if (!rejectOpen) {
+            return CompletableFuture.completedFuture(trackedLog);
+        }
+        IllegalStateException failure = new IllegalStateException(
+                "Kafka topic incarnation was deleted while opening its log: " + tp);
+        closeRejectedLog(trackedLog, failure);
+        return CompletableFuture.failedFuture(failure);
+    }
+
+    private void completeHandleClose(
+            StreamIdentifier identifier,
+            StreamOpenState state,
+            TrackedLog closedLog) {
+        boolean checkDeletion;
+        synchronized (streamLifecycleLock) {
+            state.activeHandles.remove(closedLog);
+            checkDeletion = handleDrainedState(identifier, state);
+            streamLifecycleLock.notifyAll();
+        }
+        if (checkDeletion) {
+            maybeReleaseDeletionFence(identifier, state);
+        }
+    }
+
+    private boolean handleDrainedState(StreamIdentifier identifier, StreamOpenState state) {
+        if (!state.isLogDrained()) {
+            return false;
+        }
+        if (!state.deleted) {
+            streamOpenStates.remove(identifier, state);
+            return false;
+        }
+        return !closing && !closed;
+    }
+
+    private void closeRejectedLog(TrackedLog trackedLog, Throwable failure) {
+        try {
+            trackedLog.close();
+        } catch (Throwable closeError) {
+            if (failure != closeError) {
+                failure.addSuppressed(closeError);
+            }
+            scheduleRetiredLogClose(trackedLog);
+        }
+    }
+
+    private void scheduleRetiredLogClose(TrackedLog trackedLog) {
+        if (trackedLog.isClosed()) {
+            return;
+        }
+        synchronized (streamLifecycleLock) {
+            if (closed || retrySchedulerClosed) {
+                return;
+            }
+        }
+        try {
+            lifecycleRetryScheduler.schedule(
+                    () -> retryRetiredLogClose(trackedLog),
+                    lifecycleRetryMs,
+                    TimeUnit.MILLISECONDS);
+        } catch (RuntimeException scheduleError) {
+            synchronized (streamLifecycleLock) {
+                if (!closed && !retrySchedulerClosed) {
+                    log.warn("Failed to schedule close retry for rejected Log {}",
+                            trackedLog, scheduleError);
+                }
+            }
+        }
+    }
+
+    private void retryRetiredLogClose(TrackedLog trackedLog) {
+        try {
+            trackedLog.close();
+        } catch (Throwable closeError) {
+            log.warn("Failed to close rejected Log {}, retrying", trackedLog, closeError);
+            scheduleRetiredLogClose(trackedLog);
+        }
+    }
+
+    private void maybeReleaseDeletionFence(StreamIdentifier identifier, StreamOpenState state) {
+        synchronized (streamLifecycleLock) {
+            if (!shouldStartDeletionCheck(identifier, state)) {
+                return;
+            }
+            state.deletionCheckInFlight = true;
+        }
+
+        CompletableFuture<?> loadFuture;
+        try {
+            loadFuture = catalog.loadStream(identifier);
+            if (loadFuture == null) {
+                loadFuture = CompletableFuture.failedFuture(
+                        new IllegalStateException("StreamCatalog.loadStream returned null for "
+                                + identifier.fullName()));
+            }
+        } catch (Throwable error) {
+            loadFuture = CompletableFuture.failedFuture(error);
+        }
+        boolean cancelForClose;
+        synchronized (streamLifecycleLock) {
+            if (streamOpenStates.get(identifier) != state || !state.deletionCheckInFlight) {
+                return;
+            }
+            state.deletionCheckSource = loadFuture;
+            cancelForClose = closing || closed;
+        }
+        loadFuture.whenComplete((ignored, error) -> completeDeletionCheck(identifier, state, error));
+        if (cancelForClose) {
+            loadFuture.cancel(false);
+        }
+    }
+
+    private void completeDeletionCheck(
+            StreamIdentifier identifier,
+            StreamOpenState state,
+            Throwable error) {
+        boolean retry;
+        synchronized (streamLifecycleLock) {
+            if (streamOpenStates.get(identifier) != state) {
+                return;
+            }
+            state.deletionCheckInFlight = false;
+            state.deletionCheckSource = null;
+            streamLifecycleLock.notifyAll();
+            if (closing || closed || !state.deleted || !state.isLogDrained()) {
+                return;
+            }
+            Throwable failure = unwrapCompletionException(error);
+            if (failure instanceof NoSuchStreamException) {
+                streamOpenStates.remove(identifier, state);
+                return;
+            }
+            retry = true;
+            if (failure != null) {
+                log.warn("Failed to verify deletion of {}, retrying", identifier.fullName(), failure);
+            }
+        }
+        if (retry) {
+            scheduleDeletionCheck(identifier, state);
+        }
+    }
+
+    private void scheduleDeletionCheck(StreamIdentifier identifier, StreamOpenState state) {
+        synchronized (streamLifecycleLock) {
+            if (!shouldStartDeletionCheck(identifier, state)) {
+                return;
+            }
+            state.deletionCheckScheduled = true;
+        }
+        try {
+            lifecycleRetryScheduler.schedule(
+                    () -> runScheduledDeletionCheck(identifier, state),
+                    lifecycleRetryMs,
+                    TimeUnit.MILLISECONDS);
+        } catch (RuntimeException scheduleError) {
+            synchronized (streamLifecycleLock) {
+                state.deletionCheckScheduled = false;
+                streamLifecycleLock.notifyAll();
+                if (!closing && !closed && streamOpenStates.get(identifier) == state) {
+                    log.warn("Failed to schedule deletion check for {}",
+                            identifier.fullName(), scheduleError);
+                }
+            }
+        }
+    }
+
+    private boolean shouldStartDeletionCheck(StreamIdentifier identifier, StreamOpenState state) {
+        if (closing || closed) {
+            return false;
+        }
+        if (streamOpenStates.get(identifier) != state || !state.deleted) {
+            return false;
+        }
+        return state.isLogDrained()
+                && !state.deletionCheckInFlight
+                && !state.deletionCheckScheduled;
+    }
+
+    private void runScheduledDeletionCheck(StreamIdentifier identifier, StreamOpenState state) {
+        synchronized (streamLifecycleLock) {
+            if (streamOpenStates.get(identifier) != state) {
+                return;
+            }
+            state.deletionCheckScheduled = false;
+            streamLifecycleLock.notifyAll();
+        }
+        maybeReleaseDeletionFence(identifier, state);
+    }
+
+    private static Throwable unwrapCompletionException(Throwable error) {
+        Throwable failure = error;
+        while ((failure instanceof CompletionException || failure instanceof ExecutionException)
+                && failure.getCause() != null) {
+            failure = failure.getCause();
+        }
+        return failure;
+    }
+
+    int deletionFenceCount() {
+        synchronized (streamLifecycleLock) {
+            return (int) streamOpenStates.values().stream().filter(state -> state.deleted).count();
+        }
+    }
+
+    boolean isClosing() {
+        synchronized (streamLifecycleLock) {
+            return closing && !closed;
+        }
     }
 
     static LakestreamStorageHolder create(UrsaStorageConfig config) throws Exception {
@@ -339,99 +542,329 @@ final class LakestreamStorageHolder implements Closeable {
         return StreamIdentifier.of(KafkaLogNaming.NAMESPACE, KafkaLogNaming.streamName(tp));
     }
 
-    private static void closeStreamQuietly(Stream stream) {
-        try {
-            stream.close();
-        } catch (Exception ignored) {
-        }
-    }
-
-    private static void closeLogAfterFailure(Log log, Throwable failure) {
-        try {
-            log.close();
-        } catch (Throwable closeError) {
-            if (failure != closeError) {
-                failure.addSuppressed(closeError);
-            }
-        }
-    }
-
-    private static final class TopicOperations {
-        private CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
-        private volatile Map<String, String> latestTopicConfig;
-        private long sequence;
-
-        synchronized QueuedOperation<Log> enqueueOpen(
-                Map<String, String> suppliedConfig,
-                Function<Map<String, String>, CompletableFuture<Log>> operation) {
-            if (latestTopicConfig == null) {
-                latestTopicConfig = suppliedConfig;
-            }
-            return enqueue(() -> operation.apply(
-                    latestTopicConfig != null ? latestTopicConfig : suppliedConfig));
-        }
-
-        synchronized QueuedOperation<Void> enqueueConfigUpdate(
-                Map<String, String> topicConfig,
-                Supplier<CompletableFuture<Void>> operation) {
-            latestTopicConfig = topicConfig;
-            return enqueue(operation);
-        }
-
-        synchronized QueuedOperation<Void> enqueueDeletion(Supplier<CompletableFuture<Void>> operation) {
-            latestTopicConfig = null;
-            return enqueue(operation);
-        }
-
-        synchronized QueuedOperation<Void> enqueueCleanup(Supplier<CompletableFuture<Void>> operation) {
-            return enqueue(operation);
-        }
-
-        private <T> QueuedOperation<T> enqueue(Supplier<CompletableFuture<T>> operation) {
-            long operationSequence = ++sequence;
-            CompletableFuture<T> next = tail.handle((ignored, previousError) -> null)
-                    .thenCompose(ignored -> operation.get());
-            tail = next.thenApply(ignored -> null);
-            return new QueuedOperation<>(operationSequence, next);
-        }
-
-        synchronized boolean isLatest(long operationSequence) {
-            return sequence == operationSequence;
-        }
-    }
-
-    private record QueuedOperation<T>(long sequence, CompletableFuture<T> future) {
-    }
-
-    private record TopicOperation<T>(
-            TopicOperations operations,
-            long sequence,
-            CompletableFuture<T> future) {
-    }
-
     @Override
-    public void close() throws IOException {
-        topicOperations.clear();
-        deletedTopicStreams.clear();
+    public synchronized void close() throws IOException {
+        synchronized (streamLifecycleLock) {
+            if (closed) {
+                return;
+            }
+            closing = true;
+            streamOpenStates.values().forEach(state -> state.deleted = true);
+        }
+        cancelDeletionChecks();
+        drainOpenLogs();
+        closeRetryScheduler();
+
         List<Exception> failures = new ArrayList<>();
-        try {
-            if (catalog != null) {
-                catalog.close();
+        if (!catalogClosed) {
+            try {
+                if (catalog != null) {
+                    catalog.close();
+                }
+                catalogClosed = true;
+            } catch (Exception e) {
+                failures.add(e);
             }
-        } catch (Exception e) {
-            failures.add(e);
         }
-        try {
-            if (producerStateOxiaClient != null) {
-                producerStateOxiaClient.close();
+        if (!producerStateOxiaClientClosed) {
+            try {
+                if (producerStateOxiaClient != null) {
+                    producerStateOxiaClient.close();
+                }
+                producerStateOxiaClientClosed = true;
+            } catch (Exception e) {
+                failures.add(e);
             }
-        } catch (Exception e) {
-            failures.add(e);
         }
-        if (!failures.isEmpty()) {
-            IOException failure = new IOException(failures.get(0));
-            failures.stream().skip(1).forEach(failure::addSuppressed);
-            throw failure;
+
+        if (failures.isEmpty()) {
+            synchronized (streamLifecycleLock) {
+                closed = true;
+                streamOpenStates.clear();
+                streamLifecycleLock.notifyAll();
+            }
+            return;
+        }
+        IOException failure = new IOException(failures.get(0));
+        failures.stream().skip(1).forEach(failure::addSuppressed);
+        throw failure;
+    }
+
+    private void cancelDeletionChecks() {
+        List<CompletableFuture<?>> deletionChecks = new ArrayList<>();
+        synchronized (streamLifecycleLock) {
+            streamOpenStates.values().forEach(state -> {
+                if (state.deletionCheckSource != null) {
+                    deletionChecks.add(state.deletionCheckSource);
+                }
+            });
+        }
+        deletionChecks.forEach(check -> check.cancel(false));
+    }
+
+    private void drainOpenLogs() throws IOException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(closeDrainTimeoutMs);
+        Exception lastCloseFailure = null;
+        while (true) {
+            List<TrackedLog> handlesToClose;
+            synchronized (streamLifecycleLock) {
+                if (isLifecycleDrained()) {
+                    return;
+                }
+                handlesToClose = streamOpenStates.values().stream()
+                        .flatMap(state -> state.activeHandles.stream())
+                        .toList();
+            }
+            for (TrackedLog trackedLog : handlesToClose) {
+                try {
+                    trackedLog.close();
+                } catch (Exception closeError) {
+                    lastCloseFailure = closeError;
+                }
+            }
+            synchronized (streamLifecycleLock) {
+                if (isLifecycleDrained()) {
+                    return;
+                }
+                long remainingNanos = deadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0) {
+                    throw closeDrainFailure(lastCloseFailure);
+                }
+                long waitMillis = Math.max(1, Math.min(
+                        lifecycleRetryMs,
+                        TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+                try {
+                    streamLifecycleLock.wait(waitMillis);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while draining Lakestream Log handles", error);
+                }
+            }
+        }
+    }
+
+    private boolean isLifecycleDrained() {
+        return streamOpenStates.values().stream().allMatch(state ->
+                state.inFlightOpens == 0
+                        && state.activeHandles.isEmpty()
+                        && !state.deletionCheckInFlight);
+    }
+
+    private IOException closeDrainFailure(Exception lastCloseFailure) {
+        int inFlightOpens = streamOpenStates.values().stream()
+                .mapToInt(state -> state.inFlightOpens)
+                .sum();
+        int activeHandles = streamOpenStates.values().stream()
+                .mapToInt(state -> state.activeHandles.size())
+                .sum();
+        long deletionChecks = streamOpenStates.values().stream()
+                .filter(state -> state.deletionCheckInFlight)
+                .count();
+        String message = "Timed out after " + closeDrainTimeoutMs
+                + " ms draining Lakestream lifecycle operations: "
+                + inFlightOpens + " open(s), "
+                + activeHandles + " Log handle(s), "
+                + deletionChecks + " deletion check(s) remain";
+        return lastCloseFailure == null
+                ? new IOException(message)
+                : new IOException(message, lastCloseFailure);
+    }
+
+    private void closeRetryScheduler() throws IOException {
+        if (retrySchedulerClosed) {
+            return;
+        }
+        lifecycleRetryScheduler.shutdownNow();
+        try {
+            if (!lifecycleRetryScheduler.awaitTermination(closeDrainTimeoutMs, TimeUnit.MILLISECONDS)) {
+                throw new IOException("Timed out waiting for Lakestream lifecycle retry scheduler to stop");
+            }
+            retrySchedulerClosed = true;
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while stopping Lakestream lifecycle retry scheduler", error);
+        }
+    }
+
+    private static final class StreamOpenState {
+        private final Set<TrackedLog> activeHandles =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        private int inFlightOpens;
+        private boolean deleted;
+        private boolean deletionCheckInFlight;
+        private boolean deletionCheckScheduled;
+        private CompletableFuture<?> deletionCheckSource;
+
+        private boolean isLogDrained() {
+            return inFlightOpens == 0 && activeHandles.isEmpty();
+        }
+    }
+
+    private static final class TrackedLog implements Log {
+        private final Log delegate;
+        private final Consumer<TrackedLog> onClosed;
+        private volatile boolean closed;
+
+        private TrackedLog(Log delegate, Consumer<TrackedLog> onClosed) {
+            this.delegate = delegate;
+            this.onClosed = onClosed;
+        }
+
+        private boolean isClosed() {
+            return closed;
+        }
+
+        @Override
+        public LogId id() {
+            return delegate.id();
+        }
+
+        @Override
+        public CompletableFuture<LogEntryHeader> append(int numberOfRecords, ByteBuf data) {
+            return delegate.append(numberOfRecords, data);
+        }
+
+        @Override
+        public CompletableFuture<List<LogEntry>> readEntries(
+                long startOffset,
+                int maxMessageCount,
+                long maxSizeBytes) {
+            return delegate.readEntries(startOffset, maxMessageCount, maxSizeBytes);
+        }
+
+        @Override
+        public CompletableFuture<List<LogEntry>> readEntries(
+                long startOffset,
+                int maxMessageCount,
+                long maxSizeBytes,
+                boolean includeTrimmed) {
+            return delegate.readEntries(startOffset, maxMessageCount, maxSizeBytes, includeTrimmed);
+        }
+
+        @Override
+        public CompletableFuture<LogEntry> readEntry(long offset) {
+            return delegate.readEntry(offset);
+        }
+
+        @Override
+        public CompletableFuture<LogEntryHeader> getEntryMetadata(long offset) {
+            return delegate.getEntryMetadata(offset);
+        }
+
+        @Override
+        public CompletableFuture<EntryIndex> getEntryIndex(long offset) {
+            return delegate.getEntryIndex(offset);
+        }
+
+        @Override
+        public CompletableFuture<List<EntryIndex>> readIndexRange(long startOffset, long endOffset) {
+            return delegate.readIndexRange(startOffset, endOffset);
+        }
+
+        @Override
+        public CompletableFuture<List<LogEntryHeader>> getEntryMetadataRange(long startOffset, long endOffset) {
+            return delegate.getEntryMetadataRange(startOffset, endOffset);
+        }
+
+        @Override
+        public CompletableFuture<LogOffset> getFirstOffset() {
+            return delegate.getFirstOffset();
+        }
+
+        @Override
+        public CompletableFuture<LogOffset> getFirstOffset(boolean includeTrimmed) {
+            return delegate.getFirstOffset(includeTrimmed);
+        }
+
+        @Override
+        public CompletableFuture<LogOffset> getLastOffset() {
+            return delegate.getLastOffset();
+        }
+
+        @Override
+        public CompletableFuture<Long> softTrim(long offsetIncluded) {
+            return delegate.softTrim(offsetIncluded);
+        }
+
+        @Override
+        public LogStorage logStorage() {
+            return delegate.logStorage();
+        }
+
+        @Override
+        public void cacheIndex(EntryIndex index) {
+            delegate.cacheIndex(index);
+        }
+
+        @Override
+        public void invalidateCache() {
+            delegate.invalidateCache();
+        }
+
+        @Override
+        public void invalidateCache(long offset) {
+            delegate.invalidateCache(offset);
+        }
+
+        @Override
+        public long getMessageCount(long startOffset, long endOffset) {
+            return delegate.getMessageCount(startOffset, endOffset);
+        }
+
+        @Override
+        public void fence() {
+            delegate.fence();
+        }
+
+        @Override
+        public CompletableFuture<LogCursor> openCursor(String name, long initialOffset) {
+            return delegate.openCursor(name, initialOffset);
+        }
+
+        @Override
+        public CompletableFuture<LogCursor> openEphemeralCursor(String name, long initialOffset) {
+            return delegate.openEphemeralCursor(name, initialOffset);
+        }
+
+        @Override
+        public CompletableFuture<LogCursor> loadCursor(String name) {
+            return delegate.loadCursor(name);
+        }
+
+        @Override
+        public CompletableFuture<List<LogCursor>> loadAllCursors() {
+            return delegate.loadAllCursors();
+        }
+
+        @Override
+        public CompletableFuture<Void> deleteCursor(String name) {
+            return delegate.deleteCursor(name);
+        }
+
+        @Override
+        public CompletableFuture<Long> computeRetentionTrimOffset(
+                long maxOffset,
+                long retentionMillis,
+                long retentionSizeBytes) {
+            return delegate.computeRetentionTrimOffset(maxOffset, retentionMillis, retentionSizeBytes);
+        }
+
+        @Override
+        public CompletableFuture<Long> binarySearchOffset(
+                long min,
+                long max,
+                Predicate<LogEntryHeader> predicate) {
+            return delegate.binarySearchOffset(min, max, predicate);
+        }
+
+        @Override
+        public synchronized void close() throws Exception {
+            if (closed) {
+                return;
+            }
+            delegate.close();
+            closed = true;
+            onClosed.accept(this);
         }
     }
 }

@@ -281,15 +281,9 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             }
         }
 
-        Set<TopicIdPartition> deletedPartitionsWithoutTrackedState =
-                deletedPartitionsWithoutTrackedState(partitionsToCheck, permanentlyDeletedPartitions);
-
-        // TODO: Since deleted partitions are only passed on the deletion delta,
-        //  there may be no subsequent retries—leaving catalog metadata or stream data leaked.
         cleanupTrackedPartitions(trackedPartitionsToCleanup, topicMaybeEmptied);
         cleanupRetainedProducerStates(retainedOwnedZones);
         cleanupDeletedTrackedPartitions(trackedPartitionsToDelete, topicMaybeEmptied);
-        cleanupDeletedPartitionsWithoutTrackedState(deletedPartitionsWithoutTrackedState);
     }
 
     private void cleanupTrackedPartitions(
@@ -308,30 +302,9 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             Consumer<String> topicMaybeEmptied
     ) {
         for (TopicIdPartition trackedPartition : trackedPartitionsToDelete) {
-            boolean cleanupSucceeded = cleanupPartitionInternal(trackedPartition, true);
-            cleanupSucceeded = deletePartitionDataInternal(trackedPartition) && cleanupSucceeded;
-            if (cleanupSucceeded) {
+            if (cleanupPartitionInternal(trackedPartition, true)) {
                 topicMaybeEmptied.accept(trackedPartition.topic());
             }
-        }
-    }
-
-    private Set<TopicIdPartition> deletedPartitionsWithoutTrackedState(
-            Set<TopicIdPartition> trackedPartitions,
-            Set<TopicIdPartition> permanentlyDeletedPartitions
-    ) {
-        Set<TopicIdPartition> deletedPartitionsWithoutTrackedState = new LinkedHashSet<>();
-        for (TopicIdPartition deletedPartition : permanentlyDeletedPartitions) {
-            if (!trackedPartitions.contains(deletedPartition)) {
-                deletedPartitionsWithoutTrackedState.add(deletedPartition);
-            }
-        }
-        return deletedPartitionsWithoutTrackedState;
-    }
-
-    private void cleanupDeletedPartitionsWithoutTrackedState(Set<TopicIdPartition> deletedPartitionsWithoutTrackedState) {
-        for (TopicIdPartition deletedPartition : deletedPartitionsWithoutTrackedState) {
-            deletePartitionDataInternal(deletedPartition);
         }
     }
 
@@ -526,17 +499,6 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
                 engine.cleanupPartition(tp, deletePartition);
             }
         });
-    }
-
-    private boolean deletePartitionDataInternal(TopicIdPartition tp) {
-        // Deletion targets an incarnation which is no longer current by definition. Keep the
-        // deterministic broker selection, but do not require current metadata as request routing
-        // does, or no broker would ever remove the deleted incarnation's persistent data.
-        if (!enabled || tp == null || !isSelectedBrokerForZone(tp, DisklessClientZone.NO_ZONE) || engine == null) {
-            return true;
-        }
-        // TODO: Add retry for transient failures.
-        return cleanupStep("persistent storage", tp, () -> engine.deletePartitionData(tp));
     }
 
     private <V, O, R> CompletableFuture<Map<TopicIdPartition, R>> handleWithOwnership(

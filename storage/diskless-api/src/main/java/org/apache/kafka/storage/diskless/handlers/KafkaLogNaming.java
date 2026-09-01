@@ -23,13 +23,14 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
-/**
- * Stable Lakestream catalog naming for Kafka diskless partition logs.
- */
+/** Stable Lakestream catalog naming and ownership metadata for Kafka diskless streams. */
 public final class KafkaLogNaming {
 
     public static final String NAMESPACE = "default";
+    public static final String KAFKA_MANAGED_PROPERTY = "lakestream.kafka.managed";
     public static final String KAFKA_TOPIC_NAME_PROPERTY = "lakestream.kafka.topic.name";
+    public static final String KAFKA_TOPIC_ID_PROPERTY = "lakestream.kafka.topic.id";
+    public static final String KAFKA_SOURCE_REVISION_PROPERTY = "lakestream.kafka.source.revision";
 
     private KafkaLogNaming() {
     }
@@ -50,23 +51,25 @@ public final class KafkaLogNaming {
         return tp.topic() + "-topic-id-" + tp.topicId();
     }
 
-    /** Stable physical partition name used by the Lakestream storage/catalog contract. */
-    public static String logName(TopicIdPartition tp) {
-        return NAMESPACE + "/" + partitionName(tp);
-    }
-
-    /** Physical partition-name component used by {@link #logName}. */
-    public static String partitionName(TopicIdPartition tp) {
-        return streamName(tp) + "-partition-" + tp.partition();
-    }
-
-    /** Adds Kafka's stable logical topic name to the external stream metadata. */
+    /** Adds Kafka's stable logical topic identity to the stream ownership metadata. */
     public static Map<String, String> streamProperties(
             String topicName,
-            Map<String, String> topicConfig) {
+            Uuid topicId,
+            Map<String, String> topicConfig,
+            long sourceRevision) {
         Objects.requireNonNull(topicName, "topicName must not be null");
+        Objects.requireNonNull(topicId, "topicId must not be null");
+        if (Uuid.ZERO_UUID.equals(topicId)) {
+            throw new IllegalArgumentException("topicId must not be zero");
+        }
+        if (sourceRevision < 0) {
+            throw new IllegalArgumentException("sourceRevision must not be negative");
+        }
         Map<String, String> properties = new HashMap<>(topicConfig == null ? Map.of() : topicConfig);
+        properties.put(KAFKA_MANAGED_PROPERTY, "true");
         properties.put(KAFKA_TOPIC_NAME_PROPERTY, topicName);
+        properties.put(KAFKA_TOPIC_ID_PROPERTY, topicId.toString());
+        properties.put(KAFKA_SOURCE_REVISION_PROPERTY, Long.toString(sourceRevision));
         return Map.copyOf(properties);
     }
 

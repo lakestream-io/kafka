@@ -60,6 +60,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -687,13 +688,17 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                         topicId, new TopicPartition(topicName, 0));
                 setTopicConfig(admin, topicResource, TopicConfig.RETENTION_MS_CONFIG, "60000");
                 waitForUrsaTopicConfig(topicIdPartition, Map.of(
+                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
                         KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, topicName,
+                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
                         TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                         TopicConfig.RETENTION_MS_CONFIG, "60000"));
 
                 setTopicConfig(admin, topicResource, TopicConfig.RETENTION_BYTES_CONFIG, "1048576");
                 waitForUrsaTopicConfig(topicIdPartition, Map.of(
+                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
                         KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, topicName,
+                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
                         TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                         TopicConfig.RETENTION_MS_CONFIG, "60000",
                         TopicConfig.RETENTION_BYTES_CONFIG, "1048576"));
@@ -724,7 +729,12 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                     var broker = cluster.brokers().values().iterator().next();
                     Map<String, String> actualConfig = getUrsaTopicConfig(
                             broker.replicaManager().disklessStorageSupport().getUrsaState(), topicIdPartition);
-                    return expectedConfig.equals(actualConfig);
+                    Map<String, String> userVisibleConfig = new HashMap<>(actualConfig);
+                    String sourceRevision = userVisibleConfig.remove(
+                            KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY);
+                    return sourceRevision != null
+                            && Long.parseLong(sourceRevision) >= 0
+                            && expectedConfig.equals(userVisibleConfig);
                 } catch (Exception e) {
                     lastFailure.set(e);
                     return false;
@@ -777,7 +787,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             try (Admin admin = cluster.admin()) {
                 waitForTopicReady(admin, topicName, 1);
             }
-            assertExternalStreamRegistered(topicName, 1);
+            assertCatalogStreamReady(topicName, 1);
             produceRecords(cluster.bootstrapServers(), topicName, 10);
             consumeAndVerifyRecords(cluster.bootstrapServers(), topicName, 10);
 
@@ -795,7 +805,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             try (Admin admin = cluster.admin()) {
                 waitForTopicReady(admin, topicName, numPartitions);
             }
-            assertExternalStreamRegistered(topicName, numPartitions);
+            assertCatalogStreamReady(topicName, numPartitions);
 
             for (int partition = 0; partition < numPartitions; partition++) {
                 produceRecords(cluster.bootstrapServers(), topicName, partition, 1);
@@ -818,7 +828,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                         .all().get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
 
-            assertExternalStreamUnregistered(topicName);
+            assertCatalogStreamDropped(topicName);
             assertProducerStateSnapshotsDeletedFromOxia(topicId, numPartitions);
             log.info("Partitioned stream lifecycle test passed for topic {}", topicName);
         }
@@ -846,7 +856,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private void assertExternalStreamRegistered(String topicName, int expectedPartitions)
+        private void assertCatalogStreamReady(String topicName, int expectedPartitions)
                 throws Exception {
             String streamName = catalogStreamName(topicName);
             try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
@@ -858,12 +868,12 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                     return catalog.partitionCount(
                             KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS) == expectedPartitions;
                 }, 30_000, 100,
-                        () -> "Timed out waiting for external stream registration: "
+                        () -> "Timed out waiting for catalog stream reconciliation: "
                                 + KafkaLogNaming.NAMESPACE + "/" + streamName);
             }
         }
 
-        private void assertExternalStreamUnregistered(String topicName) throws Exception {
+        private void assertCatalogStreamDropped(String topicName) throws Exception {
             String streamName = catalogStreamName(topicName);
             try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
                 TestUtils.waitForCondition(
@@ -871,7 +881,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                                 KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS),
                         30_000,
                         100,
-                        () -> "Timed out waiting for external stream unregistration: "
+                        () -> "Timed out waiting for catalog stream deletion: "
                                 + KafkaLogNaming.NAMESPACE + "/" + streamName);
             }
         }
@@ -1147,13 +1157,9 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         Object identifier = identifierMethod.invoke(null, topicIdPartition);
 
         var loadStreamMethod = catalog.getClass().getMethod("loadStream", identifier.getClass());
-        Object stream = ((CompletableFuture<?>) loadStreamMethod.invoke(catalog, identifier))
+        Object metadata = ((CompletableFuture<?>) loadStreamMethod.invoke(catalog, identifier))
                 .get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        try {
-            var propertiesMethod = stream.getClass().getMethod("properties");
-            return Map.copyOf((Map<String, String>) propertiesMethod.invoke(stream));
-        } finally {
-            ((AutoCloseable) stream).close();
-        }
+        var propertiesMethod = metadata.getClass().getMethod("properties");
+        return Map.copyOf((Map<String, String>) propertiesMethod.invoke(metadata));
     }
 }

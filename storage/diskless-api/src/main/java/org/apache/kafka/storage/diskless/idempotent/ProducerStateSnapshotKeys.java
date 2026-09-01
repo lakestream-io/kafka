@@ -44,6 +44,16 @@ public final class ProducerStateSnapshotKeys {
         return DELETED_TOPIC_PREFIX + topicId;
     }
 
+    /** Prefix shared by every durable deleted-topic marker. */
+    public static String deletedTopicMarkerPrefix() {
+        return DELETED_TOPIC_PREFIX;
+    }
+
+    /** Exclusive upper bound used to enumerate every durable deleted-topic marker. */
+    public static String deletedTopicMarkerEndExclusive() {
+        return DELETED_TOPIC_PREFIX + '\uffff';
+    }
+
     /** Oxia secondary index used to enumerate snapshots for one topic without a namespace scan. */
     public static String topicIndexName() {
         return TOPIC_INDEX_NAME;

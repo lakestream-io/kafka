@@ -178,26 +178,34 @@ class DisklessStorageEngineLoaderTest {
     }
 
     @Test
-    void testLeasedDisklessStorageEngineReleasesClassLoaderWhenDelegateCloseFails() throws Exception {
+    void testLeasedDisklessStorageEngineRetainsClassLoaderUntilDelegateCloseSucceeds() throws Exception {
         Path childDir = Files.createDirectory(tempDir.resolve("child"));
         URL[] urls = new URL[] {childDir.toUri().toURL()};
         ClassLoader parent = DisklessStorageEngineLoaderTest.class.getClassLoader();
         DisklessClassLoaderRegistry.Lease lease = DisklessClassLoaderRegistry.acquire(urls, parent);
         ClassLoader firstLoader = lease.classLoader();
         CloseTrackingDisklessStorageEngine delegate = new CloseTrackingDisklessStorageEngine(true);
+        LeasedDisklessStorageEngine engine = new LeasedDisklessStorageEngine(delegate, lease);
 
-        try {
-            new LeasedDisklessStorageEngine(delegate, lease).close();
-        } catch (IOException expected) {
-            // expected
-        }
-        assertTrue(delegate.closed.get());
+        assertThrows(IOException.class, engine::close);
+        assertTrue(delegate.closeAttempted.get());
 
         DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
         try {
-            assertNotSame(firstLoader, nextLease.classLoader());
+            assertSame(firstLoader, nextLease.classLoader());
         } finally {
             nextLease.close();
+        }
+
+        delegate.failOnClose.set(false);
+        engine.close();
+
+        DisklessClassLoaderRegistry.Lease afterSuccessfulClose =
+                DisklessClassLoaderRegistry.acquire(urls, parent);
+        try {
+            assertNotSame(firstLoader, afterSuccessfulClose.classLoader());
+        } finally {
+            afterSuccessfulClose.close();
         }
     }
 
@@ -217,7 +225,6 @@ class DisklessStorageEngineLoaderTest {
             engine.fetch(null, Map.of()).get();
             engine.listOffsets(Map.of()).get();
             engine.cleanupPartition(null, false);
-            engine.deletePartitionData(null);
             engine.snapshotTrackedPartitions();
             engine.cleanupNonOwnedProducerStates(null, Set.of(), false);
         }
@@ -327,11 +334,6 @@ class DisklessStorageEngineLoaderTest {
                     }
 
                     @Override
-                    public void deletePartitionData(TopicIdPartition tp) {
-                        requirePluginResource("deletePartitionData");
-                    }
-
-                    @Override
                     public Set<TopicIdPartition> snapshotTrackedPartitions() {
                         requirePluginResource("snapshotTrackedPartitions");
                         return Set.of();
@@ -382,10 +384,11 @@ class DisklessStorageEngineLoaderTest {
 
     private static final class CloseTrackingDisklessStorageEngine implements DisklessStorageEngine {
         private final AtomicBoolean closed = new AtomicBoolean(false);
-        private final boolean failOnClose;
+        private final AtomicBoolean closeAttempted = new AtomicBoolean(false);
+        private final AtomicBoolean failOnClose;
 
         private CloseTrackingDisklessStorageEngine(boolean failOnClose) {
-            this.failOnClose = failOnClose;
+            this.failOnClose = new AtomicBoolean(failOnClose);
         }
 
         @Override
@@ -408,10 +411,6 @@ class DisklessStorageEngineLoaderTest {
         }
 
         @Override
-        public void deletePartitionData(TopicIdPartition tp) {
-        }
-
-        @Override
         public Set<TopicIdPartition> snapshotTrackedPartitions() {
             return Set.of();
         }
@@ -426,10 +425,11 @@ class DisklessStorageEngineLoaderTest {
 
         @Override
         public void close() throws IOException {
-            closed.set(true);
-            if (failOnClose) {
+            closeAttempted.set(true);
+            if (failOnClose.get()) {
                 throw new IOException("close failed");
             }
+            closed.set(true);
         }
     }
 

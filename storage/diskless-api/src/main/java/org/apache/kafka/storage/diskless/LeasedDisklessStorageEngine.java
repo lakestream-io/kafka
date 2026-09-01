@@ -32,6 +32,7 @@ import java.util.concurrent.CompletableFuture;
 final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
     private final DisklessStorageEngine delegate;
     private final DisklessClassLoaderRegistry.Lease classLoaderLease;
+    private boolean closed;
 
     LeasedDisklessStorageEngine(
             DisklessStorageEngine delegate,
@@ -66,14 +67,6 @@ final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
     }
 
     @Override
-    public void deletePartitionData(TopicIdPartition tp) {
-        callWithClassLoader(() -> {
-            delegate.deletePartitionData(tp);
-            return null;
-        });
-    }
-
-    @Override
     public void updateTopicConfig(TopicIdPartition topicIdPartition, Map<String, String> config) {
         callWithClassLoader(() -> {
             delegate.updateTopicConfig(topicIdPartition, config);
@@ -103,7 +96,10 @@ final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
     }
 
     @Override
-    public void close() throws IOException {
+    public synchronized void close() throws IOException {
+        if (closed) {
+            return;
+        }
         try {
             DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
                 delegate.close();
@@ -113,9 +109,9 @@ final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
             throw e;
         } catch (Exception e) {
             throw new IOException(e);
-        } finally {
-            classLoaderLease.close();
         }
+        classLoaderLease.close();
+        closed = true;
     }
 
     private <T> T callWithClassLoader(DisklessClassLoaderContext.Action<T> action) {

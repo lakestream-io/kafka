@@ -27,6 +27,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -47,12 +48,18 @@ class DisklessTopicLifecycleLoaderTest {
         RecordingLifecycle.CLOSED.set(false);
         RecordingLifecycle.registration = null;
         RecordingLifecycle.classLoader = null;
+        RecordingLifecycle.inventoryClassLoader = null;
         RecordingLifecycle.invocationClassLoader = null;
         RecordingLifecycle.closeClassLoader = null;
         RecordingProducerStateStore.CLOSED.set(false);
         RecordingProducerStateStore.deletedTopicId = null;
+        RecordingProducerStateStore.reconciliation = null;
         RecordingProducerStateStore.classLoader = null;
+        RecordingProducerStateStore.inventoryClassLoader = null;
+        RecordingProducerStateStore.invocationClassLoader = null;
+        RecordingProducerStateStore.closeClassLoader = null;
         FailingCloseLifecycle.classLoader = null;
+        FailingCloseLifecycle.FAIL_ON_CLOSE.set(true);
     }
 
     @Test
@@ -63,12 +70,14 @@ class DisklessTopicLifecycleLoaderTest {
         Uuid topicId = Uuid.randomUuid();
         try (DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(
                 config, RecordingLifecycle.class.getName())) {
-            lifecycle.registerTopic("orders", topicId, 3, Map.of("owner", "kafka")).get();
+            assertTrue(lifecycle.listManagedTopics().get().isEmpty());
+            lifecycle.registerTopic("orders", topicId, 3, Map.of("owner", "kafka"), 11).get();
         }
 
         assertEquals("orders:" + topicId + ":3", RecordingLifecycle.registration);
         assertTrue(RecordingLifecycle.CLOSED.get());
         ClassLoader observedLoader = RecordingLifecycle.classLoader;
+        assertSame(observedLoader, RecordingLifecycle.inventoryClassLoader);
         assertSame(observedLoader, RecordingLifecycle.invocationClassLoader);
         assertSame(observedLoader, RecordingLifecycle.closeClassLoader);
         DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
@@ -86,11 +95,20 @@ class DisklessTopicLifecycleLoaderTest {
 
         try (DisklessProducerStateStore store = DisklessProducerStateStoreLoader.load(
                 config, RecordingProducerStateStore.class.getName())) {
+            store.reconcileTopic("orders", topicId, 17).get();
+            assertEquals(
+                    List.of(new DisklessProducerStateStore.ManagedProducerStateTopic(
+                            "orders", topicId, 17)),
+                    store.listManagedTopics().get());
             store.deleteTopicSnapshots(topicId).get();
         }
 
+        assertEquals("orders:" + topicId + ":17", RecordingProducerStateStore.reconciliation);
         assertEquals(topicId, RecordingProducerStateStore.deletedTopicId);
         assertTrue(RecordingProducerStateStore.CLOSED.get());
+        assertSame(RecordingProducerStateStore.classLoader, RecordingProducerStateStore.inventoryClassLoader);
+        assertSame(RecordingProducerStateStore.classLoader, RecordingProducerStateStore.invocationClassLoader);
+        assertSame(RecordingProducerStateStore.classLoader, RecordingProducerStateStore.closeClassLoader);
     }
 
     @Test
@@ -139,7 +157,7 @@ class DisklessTopicLifecycleLoaderTest {
     }
 
     @Test
-    void testLifecycleCloseFailureStillReleasesLease() throws Exception {
+    void testLifecycleCloseFailureRetainsLeaseUntilRetrySucceeds() throws Exception {
         UrsaStorageConfig config = ursaConfig(tempDir);
         URL[] urls = DisklessTopicLifecycleLoader.classPathUrls(tempDir.toString());
         ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
@@ -151,9 +169,20 @@ class DisklessTopicLifecycleLoaderTest {
 
         DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
         try {
-            assertNotSame(failedLoader, nextLease.classLoader());
+            assertSame(failedLoader, nextLease.classLoader());
         } finally {
             nextLease.close();
+        }
+
+        FailingCloseLifecycle.FAIL_ON_CLOSE.set(false);
+        lifecycle.close();
+
+        DisklessClassLoaderRegistry.Lease afterSuccessfulClose =
+                DisklessClassLoaderRegistry.acquire(urls, parent);
+        try {
+            assertNotSame(failedLoader, afterSuccessfulClose.classLoader());
+        } finally {
+            afterSuccessfulClose.close();
         }
     }
 
@@ -166,6 +195,7 @@ class DisklessTopicLifecycleLoaderTest {
         static final AtomicBoolean CLOSED = new AtomicBoolean(false);
         static volatile String registration;
         static volatile ClassLoader classLoader;
+        static volatile ClassLoader inventoryClassLoader;
         static volatile ClassLoader invocationClassLoader;
         static volatile ClassLoader closeClassLoader;
 
@@ -174,11 +204,18 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
+        public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
+            inventoryClassLoader = Thread.currentThread().getContextClassLoader();
+            return CompletableFuture.completedFuture(List.of());
+        }
+
+        @Override
         public CompletableFuture<Void> registerTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
-                Map<String, String> properties) {
+                Map<String, String> properties,
+                long sourceRevision) {
             registration = topicName + ":" + topicId + ":" + partitions;
             invocationClassLoader = Thread.currentThread().getContextClassLoader();
             return CompletableFuture.completedFuture(null);
@@ -199,10 +236,36 @@ class DisklessTopicLifecycleLoaderTest {
     public static final class RecordingProducerStateStore implements DisklessProducerStateStore {
         static final AtomicBoolean CLOSED = new AtomicBoolean(false);
         static volatile Uuid deletedTopicId;
+        static volatile String reconciliation;
         static volatile ClassLoader classLoader;
+        static volatile ClassLoader inventoryClassLoader;
+        static volatile ClassLoader invocationClassLoader;
+        static volatile ClassLoader closeClassLoader;
 
         public RecordingProducerStateStore(UrsaStorageConfig config) {
             classLoader = Thread.currentThread().getContextClassLoader();
+        }
+
+        @Override
+        public CompletableFuture<Void> reconcileTopic(
+                String topicName,
+                Uuid topicId,
+                long sourceRevision
+        ) {
+            reconciliation = topicName + ":" + topicId + ":" + sourceRevision;
+            invocationClassLoader = Thread.currentThread().getContextClassLoader();
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
+        public CompletableFuture<List<ManagedProducerStateTopic>> listManagedTopics() {
+            inventoryClassLoader = Thread.currentThread().getContextClassLoader();
+            if (reconciliation == null) {
+                return CompletableFuture.completedFuture(List.of());
+            }
+            String[] fields = reconciliation.split(":", 3);
+            return CompletableFuture.completedFuture(List.of(new ManagedProducerStateTopic(
+                    fields[0], Uuid.fromString(fields[1]), Long.parseLong(fields[2]))));
         }
 
         @Override
@@ -213,6 +276,7 @@ class DisklessTopicLifecycleLoaderTest {
 
         @Override
         public void close() {
+            closeClassLoader = Thread.currentThread().getContextClassLoader();
             CLOSED.set(true);
         }
     }
@@ -228,6 +292,7 @@ class DisklessTopicLifecycleLoaderTest {
     }
 
     public static final class FailingCloseLifecycle implements DisklessTopicLifecycle {
+        static final AtomicBoolean FAIL_ON_CLOSE = new AtomicBoolean(true);
         static volatile ClassLoader classLoader;
 
         public FailingCloseLifecycle(UrsaStorageConfig config) {
@@ -235,11 +300,17 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
+        public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
+            return CompletableFuture.completedFuture(List.of());
+        }
+
+        @Override
         public CompletableFuture<Void> registerTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
-                Map<String, String> properties) {
+                Map<String, String> properties,
+                long sourceRevision) {
             return CompletableFuture.completedFuture(null);
         }
 
@@ -250,7 +321,9 @@ class DisklessTopicLifecycleLoaderTest {
 
         @Override
         public void close() throws IOException {
-            throw new IOException("close failed");
+            if (FAIL_ON_CLOSE.get()) {
+                throw new IOException("close failed");
+            }
         }
     }
 }

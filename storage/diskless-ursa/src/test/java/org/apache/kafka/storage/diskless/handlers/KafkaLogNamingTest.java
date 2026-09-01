@@ -31,16 +31,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class KafkaLogNamingTest {
 
     @Test
-    void testLogName() {
-        Uuid topicId = Uuid.randomUuid();
-        TopicIdPartition tp = new TopicIdPartition(topicId, new TopicPartition("test-topic", 2));
-        assertEquals(
-                "default/test-topic-topic-id-" + topicId + "-partition-2",
-                KafkaLogNaming.logName(tp)
-        );
-    }
-
-    @Test
     void testStreamNameIncludesTopicIncarnation() {
         Uuid topicId = Uuid.randomUuid();
         TopicIdPartition tp = new TopicIdPartition(topicId, new TopicPartition("test-topic", 0));
@@ -51,28 +41,35 @@ class KafkaLogNamingTest {
     }
 
     @Test
-    void testSameNameRecreatedTopicUsesDifferentStreamAndLogNames() {
+    void testSameNameRecreatedTopicUsesDifferentStreamNames() {
         TopicPartition partition = new TopicPartition("recreated-topic", 0);
         TopicIdPartition deleted = new TopicIdPartition(Uuid.randomUuid(), partition);
         TopicIdPartition recreated = new TopicIdPartition(Uuid.randomUuid(), partition);
 
         assertNotEquals(KafkaLogNaming.streamName(deleted), KafkaLogNaming.streamName(recreated));
-        assertNotEquals(KafkaLogNaming.logName(deleted), KafkaLogNaming.logName(recreated));
     }
 
     @Test
     void testUnknownTopicIncarnationIsRejected() {
         TopicIdPartition tp = new TopicIdPartition(Uuid.ZERO_UUID, new TopicPartition("test-topic", 0));
 
-        assertThrows(IllegalArgumentException.class, () -> KafkaLogNaming.logName(tp));
+        assertThrows(IllegalArgumentException.class, () -> KafkaLogNaming.streamName(tp));
     }
 
     @Test
     void testStreamPropertiesPreserveLogicalKafkaTopicName() {
         Map<String, String> properties = KafkaLogNaming.streamProperties(
-                "orders", Map.of("retention.ms", "60000"));
+                "orders",
+                Uuid.fromString("65WMNfybQpCDVulYOxMCTw"),
+                Map.of("retention.ms", "60000"),
+                42L);
 
         assertEquals("orders", properties.get(KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY));
+        assertEquals("true", properties.get(KafkaLogNaming.KAFKA_MANAGED_PROPERTY));
+        assertEquals(
+                "65WMNfybQpCDVulYOxMCTw",
+                properties.get(KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY));
+        assertEquals("42", properties.get(KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY));
         assertEquals("60000", properties.get("retention.ms"));
     }
 }

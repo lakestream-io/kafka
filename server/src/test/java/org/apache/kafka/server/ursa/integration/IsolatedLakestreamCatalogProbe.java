@@ -38,7 +38,7 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
     private static final String STREAM_CATALOG_CLASS = "io.lakestream.api.StreamCatalog";
     private static final String STREAM_CATALOG_LOADER_CLASS = "io.lakestream.api.StreamCatalogLoader";
     private static final String STREAM_IDENTIFIER_CLASS = "io.lakestream.api.StreamIdentifier";
-    private static final String STREAM_CLASS = "io.lakestream.api.Stream";
+    private static final String STREAM_METADATA_CLASS = "io.lakestream.api.StreamMetadata";
     private static final String PARTITIONING_CLASS = "io.lakestream.api.Partitioning";
     private static final String STREAM_LAYOUT_CLASS = "io.lakestream.api.StreamLayout";
     private static final String LOG_ID_CLASS = "io.lakestream.api.LogId";
@@ -53,12 +53,11 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
     private final Method listStreamsMethod;
     private final Method streamExistsMethod;
     private final Method loadStreamMethod;
-    private final Method getLayoutMethod;
-    private final Method streamPartitioningMethod;
+    private final Method metadataPartitioningMethod;
     private final Method partitionCountMethod;
-    private final Method streamLayoutMethod;
+    private final Method metadataLayoutMethod;
     private final Method layoutLogIdsMethod;
-    private final Method streamGetLogMethod;
+    private final Method openLogMethod;
     private final Method logIdValueMethod;
     private final Method logLastOffsetMethod;
     private final Method logReadIndexRangeMethod;
@@ -92,7 +91,7 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
 
         Class<?> identifierClass = loadClass(STREAM_IDENTIFIER_CLASS);
         Class<?> catalogClass = loadClass(STREAM_CATALOG_CLASS);
-        Class<?> streamClass = loadClass(STREAM_CLASS);
+        Class<?> metadataClass = loadClass(STREAM_METADATA_CLASS);
         Class<?> partitioningClass = loadClass(PARTITIONING_CLASS);
         Class<?> layoutClass = loadClass(STREAM_LAYOUT_CLASS);
         Class<?> logIdClass = loadClass(LOG_ID_CLASS);
@@ -105,12 +104,11 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
         listStreamsMethod = catalogClass.getMethod("listStreams", String.class);
         streamExistsMethod = catalogClass.getMethod("streamExists", identifierClass);
         loadStreamMethod = catalogClass.getMethod("loadStream", identifierClass);
-        getLayoutMethod = catalogClass.getMethod("getLayout", identifierClass);
-        streamPartitioningMethod = streamClass.getMethod("partitioning");
+        metadataPartitioningMethod = metadataClass.getMethod("partitioning");
         partitionCountMethod = partitioningClass.getMethod("numPartitions");
-        streamLayoutMethod = streamClass.getMethod("layout");
+        metadataLayoutMethod = metadataClass.getMethod("layout");
         layoutLogIdsMethod = layoutClass.getMethod("logIds");
-        streamGetLogMethod = streamClass.getMethod("getLog", logIdClass);
+        openLogMethod = catalogClass.getMethod("openLog", identifierClass, logIdClass);
         logIdValueMethod = logIdClass.getMethod("id");
         logLastOffsetMethod = logClass.getMethod("getLastOffset");
         logReadIndexRangeMethod = logClass.getMethod("readIndexRange", long.class, long.class);
@@ -157,13 +155,9 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
             TimeUnit unit
     ) throws Exception {
         return withContextClassLoader(() -> {
-            Object stream = loadStream(namespace, streamName, timeout, unit);
-            try {
-                Object partitioning = invoke(streamPartitioningMethod, stream);
-                return ((Number) invoke(partitionCountMethod, partitioning)).intValue();
-            } finally {
-                closeResource(stream);
-            }
+            Object metadata = loadStream(namespace, streamName, timeout, unit);
+            Object partitioning = invoke(metadataPartitioningMethod, metadata);
+            return ((Number) invoke(partitionCountMethod, partitioning)).intValue();
         });
     }
 
@@ -174,12 +168,8 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
             TimeUnit unit
     ) throws Exception {
         return withContextClassLoader(() -> {
-            Object layout = result(
-                    getLayoutMethod,
-                    catalog,
-                    timeout,
-                    unit,
-                    identifier(namespace, streamName));
+            Object metadata = loadStream(namespace, streamName, timeout, unit);
+            Object layout = invoke(metadataLayoutMethod, metadata);
             List<?> logIds = result(layoutLogIdsMethod, layout, timeout, unit);
             List<Long> values = new ArrayList<>(logIds.size());
             for (Object logId : logIds) {
@@ -197,14 +187,15 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
             TimeUnit unit
     ) throws Exception {
         return withContextClassLoader(() -> {
-            Object stream = loadStream(namespace, streamName, timeout, unit);
+            Object identifier = identifier(namespace, streamName);
+            Object metadata = result(loadStreamMethod, catalog, timeout, unit, identifier);
             Object log = null;
             try {
-                Object layout = invoke(streamLayoutMethod, stream);
+                Object layout = invoke(metadataLayoutMethod, metadata);
                 List<?> logIds = result(layoutLogIdsMethod, layout, timeout, unit);
                 Object logId = logIds.get(partition);
                 long logIdValue = ((Number) invoke(logIdValueMethod, logId)).longValue();
-                log = invoke(streamGetLogMethod, stream, logId);
+                log = result(openLogMethod, catalog, timeout, unit, identifier, logId);
 
                 Object lastOffset = result(logLastOffsetMethod, log, timeout, unit);
                 long offset = ((Number) invoke(logOffsetValueMethod, lastOffset)).longValue();
@@ -230,12 +221,8 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
                 }
                 return new LogIndexSummary(logIdValue, offset, indexes.size(), parquetIndexCount);
             } finally {
-                try {
-                    if (log != null) {
-                        closeResource(log);
-                    }
-                } finally {
-                    closeResource(stream);
+                if (log != null) {
+                    closeResource(log);
                 }
             }
         });

@@ -85,11 +85,6 @@ public class UrsaStorageEngineImpl implements DisklessStorageEngine {
     }
 
     @Override
-    public void deletePartitionData(TopicIdPartition tp) {
-        state.deletePartitionData(tp);
-    }
-
-    @Override
     public Set<TopicIdPartition> snapshotTrackedPartitions() {
         return state.snapshotTrackedPartitions();
     }

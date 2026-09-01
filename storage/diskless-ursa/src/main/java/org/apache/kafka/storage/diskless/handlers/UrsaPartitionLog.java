@@ -75,6 +75,7 @@ final class UrsaPartitionLog {
     private final int producerStateSnapshotRecordThreshold;
     private final ScheduledExecutorService producerStateScheduler;
     private final DisklessLogMetrics logMetrics;
+    private final CompletableFuture<Log> logFuture;
     private final CompletableFuture<Log> initFuture;
     private final PartitionWriteSequencer writeSequencer;
     private final AtomicBoolean initialRetentionTriggered = new AtomicBoolean();
@@ -85,6 +86,8 @@ final class UrsaPartitionLog {
     private CompletableFuture<Long> activeTrimFuture;
     private volatile LogCursorPool fetchCursorPool;
     private volatile boolean closed;
+    private CompletableFuture<Void> logCloseAttempt;
+    private boolean logClosed;
     private final ConcurrentHashMap<String, ProducerStateManager> producerStateManagers = new ConcurrentHashMap<>();
 
     UrsaPartitionLog(TopicIdPartition topicIdPartition,
@@ -104,6 +107,7 @@ final class UrsaPartitionLog {
         this.producerStateScheduler = producerStateScheduler;
         this.writeSequencer = new PartitionWriteSequencer(topicIdPartition.toString());
         this.closed = false;
+        this.logFuture = logFuture;
         this.initFuture = createInitFuture(logFuture);
     }
 
@@ -119,6 +123,10 @@ final class UrsaPartitionLog {
                 producerStateSnapshotIntervalMs,
                 producerStateSnapshotRecordThreshold,
                 producerStateScheduler));
+    }
+
+    TopicIdPartition topicIdPartition() {
+        return topicIdPartition;
     }
 
     synchronized void installProducerStateManager(String zone, ProducerStateManager producerStateManager) {
@@ -981,6 +989,11 @@ final class UrsaPartitionLog {
             log.info("Partition log is no longer local owner for partition {}", topicIdPartition, cause);
             return new PartitionResponse(Errors.NOT_LEADER_OR_FOLLOWER);
         }
+        if (isNotFound(cause)) {
+            invalidate();
+            log.debug("Partition log is not provisioned yet for partition {}", topicIdPartition, cause);
+            return new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION);
+        }
 
         log.error("Failed to write to partition {}", topicIdPartition, error);
         return new PartitionResponse(Errors.KAFKA_STORAGE_ERROR);
@@ -1088,24 +1101,30 @@ final class UrsaPartitionLog {
         close(false);
     }
 
-    void close(boolean deletePartition) {
+    CompletableFuture<Void> close(boolean deletePartition) {
         CompletableFuture<Log> retentionFuture;
         CompletableFuture<Long> trimFuture;
+        boolean firstClose;
         synchronized (this) {
+            firstClose = !closed;
             closed = true;
             retentionFuture = inFlightRetention.getAndSet(null);
             trimFuture = activeTrimFuture;
         }
-        pendingRetention.set(null);
-        releasePendingWritePayloads();
-        if (retentionFuture != null) {
-            retentionFuture.cancel(false);
+        if (firstClose) {
+            pendingRetention.set(null);
+            releasePendingWritePayloads();
+            if (retentionFuture != null) {
+                retentionFuture.cancel(false);
+            }
+            awaitTrimCompletion(trimFuture);
+            cleanupWriteState();
+            cleanupGlobalState();
+            cleanup(deletePartition);
         }
-        awaitTrimCompletion(trimFuture);
-        cleanupWriteState();
-        cleanupGlobalState();
-        closeLog();
-        cleanup(deletePartition);
+        CompletableFuture<Void> closeAttempt = retryCloseLog();
+        state.trackRetiredPartitionLog(this, closeAttempt);
+        return closeAttempt;
     }
 
     private void awaitTrimCompletion(CompletableFuture<Long> trimFuture) {
@@ -1189,8 +1208,6 @@ final class UrsaPartitionLog {
             }
 
             if (closed) {
-                fenceLogUnlessReplaced(logInstance);
-                closeLogQuietly(logInstance);
                 initialized.completeExceptionally(
                         new NotLeaderOrFollowerException("Partition log already closed"));
                 return;
@@ -1198,18 +1215,19 @@ final class UrsaPartitionLog {
 
             UrsaPartitionLog activePartitionLog = state.partitionLog(topicIdPartition);
             if (activePartitionLog != null && activePartitionLog != this) {
-                closeLogQuietly(logInstance);
+                closed = true;
                 initialized.completeExceptionally(
                         new NotLeaderOrFollowerException("Partition log already replaced"));
+                state.trackRetiredPartitionLog(this, retryCloseLog());
                 return;
             }
 
             try {
-                activateAndInitGlobalState(logInstance, initialized);
-            } catch (Throwable activationError) {
-                fenceLogUnlessReplaced(logInstance);
-                closeLogQuietly(logInstance);
-                initialized.completeExceptionally(activationError);
+                initGlobalState(logInstance, initialized);
+            } catch (Throwable initializationError) {
+                closed = true;
+                initialized.completeExceptionally(initializationError);
+                state.trackRetiredPartitionLog(this, retryCloseLog());
             }
         });
         return initialized;
@@ -1320,7 +1338,7 @@ final class UrsaPartitionLog {
     private record RetentionRequest(long retentionMs, long retentionBytes) {
     }
 
-    private void activateAndInitGlobalState(
+    private void initGlobalState(
             Log logInstance,
             CompletableFuture<Log> initialized) {
         synchronized (this) {
@@ -1331,7 +1349,6 @@ final class UrsaPartitionLog {
             if (activePartitionLog != null && activePartitionLog != this) {
                 throw new NotLeaderOrFollowerException("Partition log already replaced");
             }
-            logInstance.activate();
             if (fetchCursorPool == null) {
                 fetchCursorPool = new LogCursorPool(
                         logInstance,
@@ -1350,33 +1367,39 @@ final class UrsaPartitionLog {
         }
     }
 
-    private void closeLog() {
-        initialized().whenComplete((logInstance, error) -> {
-            if (logInstance != null) {
-                fenceLogUnlessReplaced(logInstance);
-                closeLogQuietly(logInstance);
+    synchronized CompletableFuture<Void> retryCloseLog() {
+        if (logClosed) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (logCloseAttempt != null && !logCloseAttempt.isDone()) {
+            return logCloseAttempt;
+        }
+
+        CompletableFuture<Void> attempt = logFuture
+                .handle((logInstance, openError) -> {
+                    if (openError != null || logInstance == null) {
+                        return CompletableFuture.<Void>completedFuture(null);
+                    }
+                    try {
+                        logInstance.close();
+                        return CompletableFuture.<Void>completedFuture(null);
+                    } catch (Throwable closeError) {
+                        return CompletableFuture.<Void>failedFuture(closeError);
+                    }
+                })
+                .thenCompose(Function.identity());
+        logCloseAttempt = attempt;
+        attempt.whenComplete((ignored, error) -> {
+            synchronized (UrsaPartitionLog.this) {
+                if (logCloseAttempt == attempt) {
+                    logCloseAttempt = null;
+                    if (error == null) {
+                        logClosed = true;
+                    }
+                }
             }
         });
-    }
-
-    private void fenceLogUnlessReplaced(Log logInstance) {
-        UrsaPartitionLog activePartitionLog = state.partitionLog(topicIdPartition);
-        if (activePartitionLog != null && activePartitionLog != this) {
-            return;
-        }
-        try {
-            logInstance.fence();
-        } catch (Exception e) {
-            log.warn("Failed to fence Log for partition {}", topicIdPartition, e);
-        }
-    }
-
-    private void closeLogQuietly(Log logInstance) {
-        try {
-            logInstance.close();
-        } catch (Exception e) {
-            log.warn("Failed to close Log for partition {}", topicIdPartition, e);
-        }
+        return attempt;
     }
 
     private boolean closeFetchCursorPool() {

@@ -43,19 +43,27 @@ import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.storage.diskless.DisklessStorageReplicaManagerSupport;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 class DisklessStateReconcilerPublisherTest {
 
@@ -99,9 +107,52 @@ class DisklessStateReconcilerPublisherTest {
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 1)),
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 2))
         );
+        TopicIdPartition topicIdentity =
+                new TopicIdPartition(topicId, new TopicPartition(topicName, 0));
+        InOrder lifecycleOrder = inOrder(support);
+        lifecycleOrder.verify(support).deleteTopicConfig(topicIdentity);
+        lifecycleOrder.verify(support).reconcileTrackedPartitions(eq(deletedPartitions), same(callback));
+    }
+
+    @Test
+    void testDeletionFenceCompletesBeforePartitionHandlesCanBeReconciled() throws Exception {
+        Uuid topicId = Uuid.randomUuid();
+        String topicName = "diskless-topic";
+        MetadataImage oldImage = metadataImage(topicName, topicId, 1, true);
+
+        MetadataDelta delta = new MetadataDelta.Builder().setImage(oldImage).build();
+        delta.replay(new RemoveTopicRecord().setTopicId(topicId));
+
+        DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
+        @SuppressWarnings("unchecked")
+        Consumer<String> callback = mock(Consumer.class);
+        DisklessStateReconcilerPublisher publisher =
+                new DisklessStateReconcilerPublisher(support, callback);
+        TopicIdPartition topicIdentity =
+                new TopicIdPartition(topicId, new TopicPartition(topicName, 0));
+        Set<TopicIdPartition> deletedPartitions = Set.of(topicIdentity);
+        CountDownLatch fenceStarted = new CountDownLatch(1);
+        CountDownLatch allowFenceToComplete = new CountDownLatch(1);
+        doAnswer(ignored -> {
+            fenceStarted.countDown();
+            assertTrue(allowFenceToComplete.await(10, TimeUnit.SECONDS));
+            return null;
+        }).when(support).deleteTopicConfig(topicIdentity);
+
+        CompletableFuture<Void> update = CompletableFuture.runAsync(() -> publisher.onMetadataUpdate(
+                delta,
+                MetadataImage.EMPTY,
+                mock(LoaderManifest.class)
+        ));
+
+        assertTrue(fenceStarted.await(10, TimeUnit.SECONDS));
+        verify(support, never()).reconcileTrackedPartitions(any(), any());
+
+        allowFenceToComplete.countDown();
+        update.get(10, TimeUnit.SECONDS);
+
         verify(support).reconcileTrackedPartitions(eq(deletedPartitions), same(callback));
-        verify(support).deleteTopicConfig(
-                new TopicIdPartition(topicId, new TopicPartition(topicName, 0)));
+        verifyNoInteractions(callback);
     }
 
     @Test

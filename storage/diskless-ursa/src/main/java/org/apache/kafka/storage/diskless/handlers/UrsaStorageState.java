@@ -59,6 +59,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
 
     private static final Logger log = LoggerFactory.getLogger(UrsaStorageState.class);
     private static final long TOPIC_CONFIG_UPDATE_TIMEOUT_SECONDS = 30;
+    private static final long RETIRED_LOG_CLOSE_RETRY_MS = 1_000;
 
     private final Time time;
     private final int brokerId;
@@ -67,12 +68,15 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final DisklessLogMetrics logMetrics = new DisklessLogMetrics();
 
     private final ConcurrentHashMap<TopicIdPartition, UrsaPartitionLog> partitionLogs = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UrsaPartitionLog, CompletableFuture<Void>> retiredPartitionLogs =
+            new ConcurrentHashMap<>();
 
     private final LakestreamStorageHolder lakestreamStorageHolder;
     private final StreamCatalog catalog;
     private final Supplier<AsyncOxiaClient> oxiaClientSupplier;
     private final ScheduledExecutorService producerStateScheduler;
     private final ScheduledExecutorService retentionScheduler;
+    private final ScheduledExecutorService retiredLogCloseScheduler;
     private final ScheduledFuture<?> retentionTask;
     private final Map<String, Object> logConfigDefaults;
     private final Function<String, Map<String, String>> topicConfigSupplier;
@@ -114,6 +118,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             thread.setDaemon(true);
             return thread;
         });
+        this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close");
 
         LakestreamStorageHolder holder;
         try {
@@ -155,6 +160,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.oxiaClientSupplier = () -> null;
         this.producerStateScheduler = newDaemonScheduler("producer-state-manager-test");
         this.retentionScheduler = newDaemonScheduler("diskless-retention-test");
+        this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close-test");
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
         this.retentionTask = startRetentionChecks();
@@ -178,6 +184,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.oxiaClientSupplier = lakestreamStorageHolder::oxiaClient;
         this.producerStateScheduler = newDaemonScheduler("producer-state-manager-test");
         this.retentionScheduler = newDaemonScheduler("diskless-retention-test");
+        this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close-test");
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
         this.retentionTask = startRetentionChecks();
@@ -218,27 +225,27 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             TopicIdPartition topicIdPartition,
             Map<String, String> topicConfig
     ) {
-        if (topicIdPartition == null || topicConfig == null || lakestreamStorageHolder == null) {
+        if (topicIdPartition == null || topicConfig == null) {
             return CompletableFuture.completedFuture(null);
         }
         Map<String, String> configSnapshot = Map.copyOf(topicConfig);
-        // Kafka metadata is authoritative for retention. Trigger it immediately; catalog
-        // persistence is for Lakestream/materialization consumers and must not delay local cleanup.
+        // Kafka metadata is authoritative for broker-side retention. Catalog properties are
+        // reconciled by the active controller's DisklessTopicLifecyclePublisher.
         triggerRetentionForTopic(topicIdPartition, configSnapshot);
-        return lakestreamStorageHolder.asyncUpdateTopicConfig(topicIdPartition, configSnapshot)
-                .whenComplete((ignored, error) -> {
-                    if (error != null) {
-                        log.warn("Failed to update topic config for Lakestream topic {}", topicIdPartition, error);
-                    }
-                });
+        return CompletableFuture.completedFuture(null);
     }
 
     public void deleteTopicConfig(TopicIdPartition topicIdPartition) {
-        if (topicIdPartition == null || lakestreamStorageHolder == null) {
+        if (topicIdPartition == null) {
             return;
         }
+        if (lakestreamStorageHolder != null) {
+            lakestreamStorageHolder.markTopicDeleted(topicIdPartition);
+        }
+        // Publish the local lifecycle fence before doing any best-effort cleanup work. A request
+        // racing this committed deletion must not be able to open a new leased Log while
+        // retention callbacks are being scheduled.
         triggerRetentionForTopic(topicIdPartition, Map.of());
-        lakestreamStorageHolder.asyncDeleteTopicConfig(topicIdPartition).join();
     }
 
     UrsaPartitionLog getOrCreatePartitionLog(TopicIdPartition tp) {
@@ -286,6 +293,75 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         partitionLogs.remove(tp, partitionLog);
     }
 
+    void trackRetiredPartitionLog(
+            UrsaPartitionLog partitionLog,
+            CompletableFuture<Void> closeAttempt) {
+        Objects.requireNonNull(partitionLog, "partitionLog must not be null");
+        Objects.requireNonNull(closeAttempt, "closeAttempt must not be null");
+        while (true) {
+            CompletableFuture<Void> current = retiredPartitionLogs.get(partitionLog);
+            if (current != null && !current.isDone()) {
+                return;
+            }
+            boolean installed = current == null
+                    ? retiredPartitionLogs.putIfAbsent(partitionLog, closeAttempt) == null
+                    : retiredPartitionLogs.replace(partitionLog, current, closeAttempt);
+            if (installed) {
+                observeRetiredPartitionLogClose(partitionLog, closeAttempt);
+                return;
+            }
+        }
+    }
+
+    private void observeRetiredPartitionLogClose(
+            UrsaPartitionLog partitionLog,
+            CompletableFuture<Void> closeAttempt) {
+        closeAttempt.whenComplete((ignored, error) -> {
+            if (error == null) {
+                retiredPartitionLogs.remove(partitionLog, closeAttempt);
+                return;
+            }
+            if (closed.get() || retiredPartitionLogs.get(partitionLog) != closeAttempt) {
+                return;
+            }
+            try {
+                retiredLogCloseScheduler.schedule(
+                        () -> retryRetiredPartitionLog(partitionLog, closeAttempt),
+                        RETIRED_LOG_CLOSE_RETRY_MS,
+                        TimeUnit.MILLISECONDS);
+            } catch (RuntimeException scheduleError) {
+                if (!closed.get()) {
+                    log.warn("Failed to schedule Log close retry for {}",
+                            partitionLog.topicIdPartition(), scheduleError);
+                }
+            }
+        });
+    }
+
+    private void retryRetiredPartitionLog(
+            UrsaPartitionLog partitionLog,
+            CompletableFuture<Void> previousAttempt) {
+        if (retiredPartitionLogs.get(partitionLog) != previousAttempt) {
+            return;
+        }
+        CompletableFuture<Void> retry = partitionLog.retryCloseLog();
+        if (retiredPartitionLogs.replace(partitionLog, previousAttempt, retry)) {
+            observeRetiredPartitionLogClose(partitionLog, retry);
+        }
+    }
+
+    void retryRetiredPartitionLogs() {
+        retiredPartitionLogs.forEach((partitionLog, attempt) -> {
+            if (attempt.isDone()) {
+                retryRetiredPartitionLog(partitionLog, attempt);
+            }
+        });
+    }
+
+    int retiredPartitionLogCount() {
+        return retiredPartitionLogs.size();
+    }
+
     /**
      * Best-effort cleanup for a topic-partition that is no longer hosted by this broker.
      * <p>
@@ -310,15 +386,16 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         if (tp == null) {
             return false;
         }
+        retryRetiredPartitionLogs();
         synchronized (lifecycleLock) {
             if (closed.get()) {
                 return false;
             }
             AtomicBoolean cleaned = new AtomicBoolean();
             partitionLogs.computeIfPresent(tp, (ignored, partitionLog) -> {
-                // Fence the old log while this key is still locked in the map. Otherwise a concurrent
-                // computeIfAbsent can activate a replacement between remove() and close(), after which
-                // the old owner's delayed fence would disable the replacement.
+                // Publish the local closed state while this key is still locked in the map. A
+                // concurrent computeIfAbsent can only install a new leased handle after the retired
+                // handle has stopped accepting broker requests.
                 partitionLog.close(deletePartition);
                 cleaned.set(true);
                 return null;
@@ -340,23 +417,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         }
 
         return partitionLog.cleanupNonOwnedProducerStates(ownedZones, deletePartition);
-    }
-
-    /**
-     * Permanently delete the Lakestream log and its catalog metadata for a partition.
-     *
-     * <p>This path is idempotent: missing metadata is treated as success because the desired end state is already
-     * reached.
-     */
-    public void deletePartitionData(TopicIdPartition tp) {
-        if (tp == null) {
-            return;
-        }
-
-        if (lakestreamStorageHolder == null) {
-            return;
-        }
-        lakestreamStorageHolder.deletePartitionData(tp).join();
     }
 
     public Set<TopicIdPartition> snapshotTrackedPartitions() {
@@ -551,21 +611,26 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
                 return;
             }
             retentionTask.cancel(false);
-            partitionLogsToClose = List.copyOf(partitionLogs.values());
+            LinkedHashSet<UrsaPartitionLog> logsToClose = new LinkedHashSet<>(partitionLogs.values());
+            logsToClose.addAll(retiredPartitionLogs.keySet());
+            partitionLogsToClose = List.copyOf(logsToClose);
             partitionLogs.clear();
         }
         shutdownScheduler(retentionScheduler);
         try {
             try {
                 partitionLogsToClose.forEach(UrsaPartitionLog::close);
+                retryRetiredPartitionLogs();
             } finally {
                 sealProducerStateCleanups().join();
             }
         } finally {
+            shutdownScheduler(retiredLogCloseScheduler);
             shutdownScheduler(producerStateScheduler);
             if (lakestreamStorageHolder != null) {
                 lakestreamStorageHolder.close();
             }
+            retiredPartitionLogs.clear();
         }
     }
 
@@ -582,21 +647,10 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     }
 
     CompletableFuture<Log> openLog(TopicIdPartition tp) {
-        Map<String, String> suppliedTopicConfig = topicConfigSupplier != null
-                ? topicConfigSupplier.apply(tp.topic())
-                : null;
-        Map<String, String> topicConfig = suppliedTopicConfig != null ? Map.copyOf(suppliedTopicConfig) : Map.of();
-
         if (lakestreamStorageHolder != null) {
-            // The holder serializes opening with config events and exact-replaces properties using
-            // the latest published snapshot. Re-applying topicConfig here would let this open's stale
-            // snapshot overwrite a racing newer event.
-            return lakestreamStorageHolder.openPartition(tp, topicConfig);
+            return lakestreamStorageHolder.openPartition(tp);
         }
-        return catalog.openExternalPartition(
-                LakestreamStorageHolder.streamIdentifier(tp),
-                tp.partition(),
-                topicConfig);
+        return LakestreamStorageHolder.openPartition(catalog, tp);
     }
 
 }

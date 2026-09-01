@@ -148,7 +148,7 @@ public class UrsaStorageOxiaFailureE2ETest extends UrsaStorageE2ETestBase {
                     .unpauseContainerCmd(oxiaContainer.getContainerId()).exec();
         }
 
-        assertExternalStreamRegistered(topicName, topicId, partitions);
+        assertCatalogStreamReady(topicName, topicId, partitions);
     }
 
     @Test
@@ -187,10 +187,10 @@ public class UrsaStorageOxiaFailureE2ETest extends UrsaStorageE2ETestBase {
                     .get(warmupTopic)
                     .topicId();
         }
-        assertExternalStreamRegistered(warmupTopic, topicId, 1);
+        assertCatalogStreamReady(warmupTopic, topicId, 1);
     }
 
-    private static void assertExternalStreamRegistered(
+    private static void assertCatalogStreamReady(
             String topicName,
             Uuid topicId,
             int expectedPartitions
@@ -209,7 +209,7 @@ public class UrsaStorageOxiaFailureE2ETest extends UrsaStorageE2ETestBase {
                 return catalog.partitionCount(
                         KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS) == expectedPartitions;
             }, 30_000, 100,
-                    () -> "Timed out waiting for external stream reconciliation: "
+                    () -> "Timed out waiting for catalog stream reconciliation: "
                             + KafkaLogNaming.NAMESPACE + "/" + streamName);
         }
     }

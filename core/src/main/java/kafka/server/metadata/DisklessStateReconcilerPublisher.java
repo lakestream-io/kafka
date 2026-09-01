@@ -64,8 +64,6 @@ public class DisklessStateReconcilerPublisher implements MetadataPublisher {
             LoaderManifest manifest
     ) {
         Set<TopicIdPartition> deletedPartitions = deletedDisklessPartitions(delta);
-        disklessStorageSupport.reconcileTrackedPartitions(deletedPartitions, onTopicMaybeEmptied);
-
         Set<TopicIdPartition> deletedTopics = new LinkedHashSet<>();
         for (TopicIdPartition deletedPartition : deletedPartitions) {
             deletedTopics.add(new TopicIdPartition(
@@ -73,6 +71,12 @@ public class DisklessStateReconcilerPublisher implements MetadataPublisher {
                     new TopicPartition(deletedPartition.topic(), 0)));
         }
         deletedTopics.forEach(disklessStorageSupport::deleteTopicConfig);
+
+        // Fence the deleted topic in the broker-local storage state before closing any cached
+        // partition handles. Otherwise a concurrent request can reopen a handle in the window
+        // between reconcileTrackedPartitions closing the old handle and deleteTopicConfig
+        // publishing the deletion fence.
+        disklessStorageSupport.reconcileTrackedPartitions(deletedPartitions, onTopicMaybeEmptied);
     }
 
     private Set<TopicIdPartition> deletedDisklessPartitions(MetadataDelta delta) {

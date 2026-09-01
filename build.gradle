@@ -645,7 +645,16 @@ subprojects {
       }
     }
 
-    maxParallelForks = maxTestForks
+    if (isolatedCiTestsMode == 'only' && project.path == ':server') {
+      // The Ursa E2E classes each host multiple brokers, a controller, Oxia, and sometimes
+      // object-storage containers in one test worker. Run one class per worker so the documented
+      // isolated-test command has the same resource isolation as CI and releases native state
+      // between suites.
+      maxParallelForks = 1
+      forkEvery = 1
+    } else {
+      maxParallelForks = maxTestForks
+    }
     ignoreFailures = userIgnoreFailures
 
     maxHeapSize = "3g"
