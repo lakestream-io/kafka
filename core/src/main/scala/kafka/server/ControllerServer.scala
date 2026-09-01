@@ -20,7 +20,7 @@ package kafka.server
 import kafka.network.SocketServer
 import kafka.raft.KafkaRaftManager
 import kafka.server.QuotaFactory.QuotaManagers
-import kafka.server.metadata.{ClientQuotaMetadataManager, DisklessTopicLifecyclePublisher, DynamicConfigPublisher, KRaftMetadataCachePublisher}
+import kafka.server.metadata.{ClientQuotaMetadataManager, DisklessTopicLifecycleReconciler, DynamicConfigPublisher, KRaftMetadataCachePublisher}
 
 import scala.collection.immutable
 import kafka.utils.Logging
@@ -52,7 +52,7 @@ import org.apache.kafka.server.policy.{AlterConfigPolicy, CreateTopicPolicy}
 import org.apache.kafka.server.util.{Deadline, FutureUtils}
 import org.apache.kafka.server.NodeToControllerChannelManagerImpl
 import org.apache.kafka.server.RaftControllerNodeProvider
-import org.apache.kafka.storage.diskless.{DisklessProducerStateStore, DisklessProducerStateStoreLoader, DisklessTopicLifecycle, DisklessTopicLifecycleLoader}
+import org.apache.kafka.storage.diskless.{DisklessProducerStateLifecycle, DisklessProducerStateLifecycleLoader, DisklessTopicLifecycle, DisklessTopicLifecycleLoader}
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig
 
 import java.util
@@ -104,7 +104,7 @@ class ControllerServer(
   var controllerApis: ControllerApis = _
   var controllerApisHandlerPool: KafkaRequestHandlerPool = _
   var disklessTopicLifecycle: DisklessTopicLifecycle = _
-  var disklessProducerStateStore: DisklessProducerStateStore = _
+  var disklessProducerStateLifecycle: DisklessProducerStateLifecycle = _
   def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
   val metadataPublishers: util.List[MetadataPublisher] = new util.ArrayList[MetadataPublisher]()
   @volatile var metadataCache : KRaftMetadataCache = _
@@ -268,15 +268,11 @@ class ControllerServer(
       }
       if (config.ursaStorageEnable) {
         val ursaConfig = UrsaStorageConfig.fromConfigs(config.originals().asInstanceOf[util.Map[String, _]])
-        disklessTopicLifecycle = DisklessTopicLifecycleLoader.load(ursaConfig)
-        try {
-          disklessProducerStateStore = DisklessProducerStateStoreLoader.load(ursaConfig)
-        } catch {
-          case error: Throwable =>
-            Utils.closeQuietly(disklessTopicLifecycle, "diskless topic lifecycle")
-            disklessTopicLifecycle = null
-            throw error
-        }
+        // Construct only non-blocking facades during controller startup. The active controller's
+        // lifecycle reconciler supervises provider initialization, timeouts, and retries so a
+        // temporary Ursa or Oxia outage cannot prevent this controller from joining the quorum.
+        disklessTopicLifecycle = DisklessTopicLifecycleLoader.loadLazily(ursaConfig)
+        disklessProducerStateLifecycle = DisklessProducerStateLifecycleLoader.loadLazily(ursaConfig)
       }
       controller = controllerBuilder.build()
 
@@ -347,12 +343,12 @@ class ControllerServer(
         ),
         "controller"))
 
-      // Reconcile committed diskless topic registrations and clean up deleted topic state.
+      // Reconcile committed diskless topic state and clean up deleted topic state.
       if (config.ursaStorageEnable) {
-        metadataPublishers.add(new DisklessTopicLifecyclePublisher(
+        metadataPublishers.add(new DisklessTopicLifecycleReconciler(
           config.nodeId,
           disklessTopicLifecycle,
-          disklessProducerStateStore,
+          disklessProducerStateLifecycle,
           (msg: String, cause: Throwable) => sharedServer.metadataPublishingFaultHandler.handleFault(msg, cause),
         ))
       }
@@ -504,8 +500,8 @@ class ControllerServer(
         Utils.swallow(this.logger.underlying, () => quotaManagers.shutdown())
       Utils.closeQuietly(controller, "controller")
       Utils.closeQuietly(quorumControllerMetrics, "quorum controller metrics")
-      Utils.closeQuietly(disklessProducerStateStore, "diskless producer-state store")
-      disklessProducerStateStore = null
+      Utils.closeQuietly(disklessProducerStateLifecycle, "diskless producer-state lifecycle")
+      disklessProducerStateLifecycle = null
       Utils.closeQuietly(disklessTopicLifecycle, "diskless topic lifecycle")
       disklessTopicLifecycle = null
       authorizerPlugin.foreach(Utils.closeQuietly(_, "authorizer plugin"))

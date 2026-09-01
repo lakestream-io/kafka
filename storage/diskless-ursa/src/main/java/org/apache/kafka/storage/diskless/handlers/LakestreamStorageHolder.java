@@ -539,7 +539,9 @@ final class LakestreamStorageHolder implements Closeable {
     }
 
     static StreamIdentifier streamIdentifier(TopicIdPartition tp) {
-        return StreamIdentifier.of(KafkaLogNaming.NAMESPACE, KafkaLogNaming.streamName(tp));
+        return StreamIdentifier.of(
+                KafkaStreamIdentity.NAMESPACE,
+                KafkaStreamIdentity.streamName(tp.topic(), tp.topicId()));
     }
 
     @Override

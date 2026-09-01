@@ -52,7 +52,7 @@ Ursa is a distributed storage engine designed for streaming workloads:
 
 Oxia is a distributed key-value store used for metadata and state management:
 - **Producer State Persistence**: Replaces local `.snapshot` files for idempotent producer tracking
-- **Stream Metadata**: Manages partition-to-stream mappings and offsets
+- **Catalog Persistence**: The Ursa StreamCatalog provider may persist layouts and lifecycle state in Oxia; Kafka never reads or writes those private keys
 - **Fast Recovery**: Enables rapid broker failover without local state re-hydration
 
 ### KIP-405 Tiered Storage (Context)
@@ -158,7 +158,7 @@ In this LIP, diskless topics are handled by the Lakestream-backed implementation
                             ▼
           ┌─────────────────────────────────────┐
           │              Oxia                   │
-          │  (Producer State / Stream Metadata) │
+          │      Producer State / Catalog       │
           └─────────────────────────────────────┘
 ```
 
@@ -183,8 +183,9 @@ In this LIP, diskless topics are handled by the Lakestream-backed implementation
 | `DisklessStorageReplicaManagerSupport` | Entry point; partitions requests between diskless and classic paths |
 | `UrsaLakestreamWriter` | Write path for diskless topics; appends records to a Lakestream log |
 | `UrsaLakestreamReader` | Read path for diskless topics; handles Fetch and ListOffsets via a Lakestream log |
-| `UrsaStorageState` | Manages stream IDs, offset tracking, and shared state |
-| `UrsaProducerStateStore` | Persists producer state to Oxia for idempotent semantics |
+| `UrsaStorageState` | Manages partition LogId handles, offset tracking, and shared state |
+| `ProducerStateManager` | Validates idempotent producer sequences and persists snapshots to Oxia |
+| `DisklessTopicLifecycleReconciler` | Reconciles Kafka topic metadata with StreamCatalog lifecycle state on the active controller |
 | `UrsaStorageConfig` | Configuration holder for Ursa settings |
 | `MetadataCacheDisklessStorageView` | Determines if a topic is diskless based on topic config |
 | `ListOffsetsPartitionRequest` | Request DTO for diskless ListOffsets operations |
@@ -205,14 +206,14 @@ ReplicaManager.appendRecords()
        │         │         ▼
        │         │    UrsaLakestreamWriter.write()
        │         │         │
-       │         │         ├──▶ ProducerStateStore.validate()     ◄── Oxia
+       │         │         ├──▶ ProducerStateManager.validate()   ◄── Oxia
        │         │         │         (sequence validation)
        │         │         │
        │         │         ├──▶ UrsaStorageState.getOrCreatePartitionLog()
        │         │         │
        │         │         ├──▶ Log.append(numberOfMessages, data)
        │         │         │
-       │         │         └──▶ ProducerStateStore.updateAfterWrite()
+       │         │         └──▶ ProducerStateManager.updateAfterWrite()
        │         │
        │         └──▶ classicEntries (traditional topics)
        │                   │
@@ -308,7 +309,7 @@ ReplicaManager.fetchMessages()
        │         │         ├──▶ LogCursor.readEntries()
        │         │         │
        │         │         └──▶ Convert entries to MemoryRecords
-       │         │               (patch baseOffset = entryId)
+       │         │               (rebase batches from LogEntry offset metadata)
        │         │
        │         └──▶ classicFetches (traditional topics)
        │                   │
@@ -348,15 +349,15 @@ ReplicaManager.fetchOffset()
        │         │                   ▼
        │         │              UrsaLakestreamReader.listOffsets()
        │         │                   │
-       │         │                   ├──▶ EARLIEST (-2): getFirstPosition()
+       │         │                   ├──▶ EARLIEST (-2): Log.getFirstOffset()
        │         │                   │
-       │         │                   ├──▶ LATEST (-1): getLastConfirmedEntry() → HWM
+       │         │                   ├──▶ LATEST (-1): Log.getLastOffset() → HWM
        │         │                   │
-       │         │                   ├──▶ MAX_TIMESTAMP (-3): lastEntry publishTime → last offset
+       │         │                   ├──▶ MAX_TIMESTAMP (-3): scan Kafka record timestamps
        │         │                   │
        │         │                   ├──▶ LATEST_TIERED (-5): return -1 (N/A)
        │         │                   │
-       │         │                   └──▶ timestamp >= 0: publishTime binary search + record scan
+       │         │                   └──▶ timestamp >= 0: scan Kafka records from the first offset
        │         │
        │         └──▶ NO: fetchOffsetClassic() (local log)
        │
@@ -369,11 +370,11 @@ ReplicaManager.fetchOffset()
 | Timestamp Value | Meaning | Diskless Behavior |
 |-----------------|---------|-------------------|
 | `-2` (EARLIEST) | First available offset | Returns the first available Lakestream log offset |
-| `-1` (LATEST) | High watermark | Returns high watermark derived from the last confirmed entry |
-| `-3` (MAX_TIMESTAMP) | Offset with highest timestamp | Returns last message offset and publishTime (if available) |
+| `-1` (LATEST) | High watermark | Returns the end offset derived from the last Lakestream log offset and record count |
+| `-3` (MAX_TIMESTAMP) | Offset with highest timestamp | Scans record timestamps and returns the maximum timestamp and its Kafka offset |
 | `-4` (EARLIEST_LOCAL) | First local offset | Same as EARLIEST for diskless (no local/remote distinction) |
 | `-5` (LATEST_TIERED) | End of tiered storage | Returns -1 (not applicable for diskless) |
-| `>= 0` | First offset with timestamp >= value | PublishTime binary search to narrow the start entry, then scan records |
+| `>= 0` | First offset with timestamp >= value | Scans Kafka records from the first available log offset |
 
 **Key Implementation Details**:
 
@@ -383,7 +384,7 @@ ReplicaManager.fetchOffset()
 
 2. **EARLIEST/LATEST Optimization**: EARLIEST/LATEST are served from the first and last Lakestream log offsets.
 
-3. **Timestamp Search**: Uses publishTime to narrow the candidate start entry (binary search), then scans Kafka records to compare actual record timestamps.
+3. **Timestamp Search**: Opens an ephemeral Lakestream cursor at the first available offset and scans Kafka record timestamps. The broker does not depend on a provider-specific publish-time index.
 
 4. **Async Execution**: All ListOffsets operations return `CompletableFuture` to avoid blocking request handler threads.
 
@@ -398,7 +399,7 @@ For diskless topics:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   UrsaProducerStateStore                    │
+│                    ProducerStateManager                     │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  In-Memory Cache                                            │
@@ -451,7 +452,6 @@ No protocol changes required.
 | `ursa.storage.path` | string | `/tmp/ursa-data` | Local storage path for `LOCAL`, or the remote object prefix for `S3`/`GCS`/Azure Blob |
 | `ursa.storage.compaction.prefix` | string | `/tmp/compaction-data` | Compaction output prefix for remote object storage backends |
 | `ursa.storage.namespace` | string | `default` | Namespace for Ursa streams |
-| `ursa.storage.wal.directory` | string | `/tmp/ursa-wal` | Write-ahead log directory |
 | `ursa.storage.write.buffer.flush.interval.ms` | long | `250` | Write buffer flush interval |
 | `ursa.storage.write.buffer.size` | int | `4194304` (4MB) | Size of each WAL write buffer segment |
 | `ursa.storage.write.buffer.flush.size` | long | `268435456` (256MB) | Write buffer flush size threshold |
@@ -657,7 +657,7 @@ Diskless topics support **external compaction** via the Ursa compactor. In this 
 
 This external compaction is **not** Kafka key/value log compaction and does **not** change consumer semantics for diskless topics. Kafka-side K/V log compaction remains unsupported for diskless topics (see **Limitations** → **No K/V Compaction**).
 
-Compaction-task ownership follows the storage boundary. For diskless topics, the standalone Ursa compactor discovers Lakestream partition logs and publishes its own tasks; Kafka brokers do not run a compaction-task publisher. The compactor reads the WAL through the Storage API and decodes the Kafka `MemoryRecords` carried by each entry. Classic-topic lakehouse ingestion is outside this integration and will use a separate StreamCatalog-based source-reader design.
+Compaction-task ownership follows the storage boundary. For diskless topics, the standalone Ursa compactor discovers LogIds from committed Lakestream layouts and publishes its own tasks; Kafka brokers do not run a compaction-task publisher. The compactor reads the WAL through the Storage API and decodes the Kafka `MemoryRecords` carried by each entry. Classic-topic lakehouse ingestion is outside this integration and will use a separate StreamCatalog-based source-reader design.
 
 The Ursa storage runtime reads the V2 `KAFKA_BATCHED_RAW_PARQUET` format behind the Lakestream API. Kafka broker code neither selects nor instantiates the compacted-object reader implementation. The runtime fails fast for legacy V1 lakehouse indexes.
 
@@ -704,21 +704,21 @@ bash ./run-localstack-compaction-demo.sh
 
 ### Lakestream identity compatibility
 
-Every Lakestream stream and partition log is scoped to the Kafka topic incarnation, not only the
-reusable topic name. For topic ID `<uuid>`, the canonical identities are:
+Every Lakestream stream is scoped to the Kafka topic incarnation, not only the reusable topic name.
+For topic ID `<uuid>`, Kafka derives the topic-level `StreamIdentifier`
+`default/<topic>-topic-id-<uuid>`. The stream's committed `StreamLayout` contains one opaque `LogId`
+per Kafka partition, in partition-index order. Kafka opens data-plane logs only through
+`StreamCatalog.openLog(StreamIdentifier, LogId)`; it does not derive partition-log names.
 
-- partition log: `default/<topic>-topic-id-<uuid>-partition-N`
-- Lakestream aggregate stream: `default/<topic>-topic-id-<uuid>`
-
-Kafka also stores the stable logical topic name in the aggregate stream property
+Kafka also stores the stable logical topic name in the topic-level stream property
 `lakestream.kafka.topic.name`. Ursa materialization uses that value for Schema Registry subjects;
-it must not infer the logical topic from the UUID-qualified physical stream name.
+it must not infer the logical topic from the UUID-qualified StreamIdentifier name.
 
-The Ursa compactor publishes diskless tasks from these incarnation-qualified Lakestream identities;
-there is no Kafka-side diskless publisher cache. The catalog's Oxia keys, stream-ID mappings,
+The Ursa compactor uses these incarnation-qualified StreamIdentifiers and their committed layout
+LogIds; there is no Kafka-side compaction-task publisher or cache. The catalog's Oxia keys, stream-ID mappings,
 tombstones, task records, and object paths are private Ursa implementation details and are not part
 of Kafka's integration contract. If deletion cleanup fails, old storage state can remain orphaned,
-but a recreated topic receives a distinct Lakestream identity and cannot attach to the orphan.
+but a recreated topic receives a distinct StreamIdentifier and cannot attach to the orphan.
 
 In-place rolling upgrades from earlier experimental name-only diskless-storage metadata layouts are
 not supported. Deploy this version with an empty Oxia namespace, or perform an offline metadata and

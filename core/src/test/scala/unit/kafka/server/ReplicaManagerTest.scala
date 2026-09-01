@@ -3019,8 +3019,7 @@ class ReplicaManagerTest {
     buildRemoteLogAuxState: Boolean = false,
     remoteFetchQuotaExceeded: Option[Boolean] = None,
     remoteFetchReaperEnabled: Boolean = false,
-    mockDisklessStorageSupport: Option[DisklessStorageReplicaManagerSupport] = None,
-    schedulerOverride: Option[Scheduler] = None
+    mockDisklessStorageSupport: Option[DisklessStorageReplicaManagerSupport] = None
   ): ReplicaManager = {
     val props = TestUtils.createBrokerConfig(brokerId)
     val path1 = TestUtils.tempRelativeDir("data").getAbsolutePath
@@ -3089,7 +3088,7 @@ class ReplicaManagerTest {
       metrics = metrics,
       config = config,
       time = time,
-      scheduler = schedulerOverride.getOrElse(new MockScheduler(time)),
+      scheduler = new MockScheduler(time),
       logManager = mockLogMgr,
       quotaManagers = quotaManager,
       metadataCache = metadataCache,

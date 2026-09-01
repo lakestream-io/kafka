@@ -136,6 +136,7 @@ import static org.apache.kafka.common.protocol.Errors.INELIGIBLE_REPLICA;
 import static org.apache.kafka.common.protocol.Errors.INVALID_PARTITIONS;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICATION_FACTOR;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REPLICA_ASSIGNMENT;
+import static org.apache.kafka.common.protocol.Errors.INVALID_REQUEST;
 import static org.apache.kafka.common.protocol.Errors.INVALID_TOPIC_EXCEPTION;
 import static org.apache.kafka.common.protocol.Errors.NEW_LEADER_ELECTED;
 import static org.apache.kafka.common.protocol.Errors.NONE;
@@ -3697,6 +3698,32 @@ public class ReplicationControlManagerTest {
         assertNotNull(topicResult);
         assertEquals(Errors.INVALID_REQUEST.code(), topicResult.errorCode());
         assertTrue(topicResult.errorMessage().contains("diskless storage system is disabled"));
+    }
+
+    @Test
+    public void testInternalTopicCannotExplicitlyEnableDisklessStorage() {
+        ReplicationControlTestContext ctx = new ReplicationControlTestContext.Builder().
+            setDisklessStorageSystemEnabled(true).
+            build();
+        ctx.registerBrokers(0);
+        ctx.unfenceBrokers(0);
+
+        String internalTopic = "__consumer_offsets";
+        CreatableTopic topic = new CreatableTopic().setName(internalTopic).
+            setNumPartitions(1).setReplicationFactor((short) 1);
+        topic.configs().add(new CreateTopicsRequestData.CreatableTopicConfig().
+            setName(URSA_STORAGE_ENABLE_CONFIG).setValue("true"));
+        CreateTopicsRequestData request = new CreateTopicsRequestData().
+            setTopics(new CreatableTopicCollection(List.of(topic).iterator()));
+
+        ControllerResult<CreateTopicsResponseData> result = ctx.replicationControl.createTopics(
+            anonymousContextFor(ApiKeys.CREATE_TOPICS), request, Set.of(internalTopic), false);
+
+        CreatableTopicResult topicResult = result.response().topics().find(internalTopic);
+        assertNotNull(topicResult);
+        assertEquals(INVALID_REQUEST.code(), topicResult.errorCode());
+        assertTrue(topicResult.errorMessage().contains("internal topic"));
+        assertTrue(result.records().isEmpty());
     }
 
 }

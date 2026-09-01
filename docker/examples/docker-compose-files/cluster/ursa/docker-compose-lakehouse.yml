@@ -160,7 +160,7 @@ services:
     entrypoint: ["/bin/sh", "/opt/ursa-demo/polaris-setup.sh"]
 
   compactor:
-    image: ${COMPACTOR_IMAGE:-ursa-compact:lakehouse-e2e}
+    image: ${COMPACTOR_IMAGE:-ursa-compactor:lakehouse-e2e}
     hostname: compactor
     restart: unless-stopped
     depends_on:

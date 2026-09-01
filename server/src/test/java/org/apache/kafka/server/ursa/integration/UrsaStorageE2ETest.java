@@ -37,8 +37,6 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.BrokerState;
 import org.apache.kafka.server.config.ServerLogConfigs;
-import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
-import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterAll;
@@ -597,7 +595,8 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
             var broker = cluster.brokers().values().iterator().next();
             forceTrimForTopicPartition(
-                    broker.replicaManager().disklessStorageSupport().getUrsaState(),
+                    IsolatedUrsaCatalogInspector.disklessStorageEngine(
+                            broker.replicaManager().disklessStorageSupport()),
                     new TopicIdPartition(topicId, topicPartition));
 
             try (Admin admin = cluster.admin()) {
@@ -688,17 +687,17 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                         topicId, new TopicPartition(topicName, 0));
                 setTopicConfig(admin, topicResource, TopicConfig.RETENTION_MS_CONFIG, "60000");
                 waitForUrsaTopicConfig(topicIdPartition, Map.of(
-                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, topicName,
-                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
+                        IsolatedUrsaCatalogInspector.kafkaManagedProperty(cluster), "true",
+                        IsolatedUrsaCatalogInspector.kafkaTopicNameProperty(cluster), topicName,
+                        IsolatedUrsaCatalogInspector.kafkaTopicIdProperty(cluster), topicId.toString(),
                         TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                         TopicConfig.RETENTION_MS_CONFIG, "60000"));
 
                 setTopicConfig(admin, topicResource, TopicConfig.RETENTION_BYTES_CONFIG, "1048576");
                 waitForUrsaTopicConfig(topicIdPartition, Map.of(
-                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, topicName,
-                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
+                        IsolatedUrsaCatalogInspector.kafkaManagedProperty(cluster), "true",
+                        IsolatedUrsaCatalogInspector.kafkaTopicNameProperty(cluster), topicName,
+                        IsolatedUrsaCatalogInspector.kafkaTopicIdProperty(cluster), topicId.toString(),
                         TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                         TopicConfig.RETENTION_MS_CONFIG, "60000",
                         TopicConfig.RETENTION_BYTES_CONFIG, "1048576"));
@@ -722,16 +721,19 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         private void waitForUrsaTopicConfig(
                 TopicIdPartition topicIdPartition,
                 Map<String, String> expectedConfig)
-                throws InterruptedException {
+                throws Exception {
+            String sourceRevisionProperty =
+                    IsolatedUrsaCatalogInspector.kafkaSourceRevisionProperty(cluster);
             AtomicReference<Exception> lastFailure = new AtomicReference<>();
             TestUtils.waitForCondition(() -> {
                 try {
                     var broker = cluster.brokers().values().iterator().next();
                     Map<String, String> actualConfig = getUrsaTopicConfig(
-                            broker.replicaManager().disklessStorageSupport().getUrsaState(), topicIdPartition);
+                            IsolatedUrsaCatalogInspector.disklessStorageEngine(
+                                    broker.replicaManager().disklessStorageSupport()),
+                            topicIdPartition);
                     Map<String, String> userVisibleConfig = new HashMap<>(actualConfig);
-                    String sourceRevision = userVisibleConfig.remove(
-                            KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY);
+                    String sourceRevision = userVisibleConfig.remove(sourceRevisionProperty);
                     return sourceRevision != null
                             && Long.parseLong(sourceRevision) >= 0
                             && expectedConfig.equals(userVisibleConfig);
@@ -779,8 +781,8 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         private final Map<String, Uuid> topicIds = new ConcurrentHashMap<>();
 
         @Test
-        @DisplayName("Partition logs are accessible through the Lakestream catalog after I/O")
-        void testPartitionLogsAccessibleThroughLakestreamCatalog() throws Exception {
+        @DisplayName("Committed partition layout is visible through the Lakestream catalog after I/O")
+        void testCommittedPartitionLayoutVisibleThroughLakestreamCatalog() throws Exception {
             String topicName = uniqueTopicName("log-metadata-topic");
 
             createDisklessTopic(cluster, topicName);
@@ -791,8 +793,8 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             produceRecords(cluster.bootstrapServers(), topicName, 10);
             consumeAndVerifyRecords(cluster.bootstrapServers(), topicName, 10);
 
-            assertPartitionLogsAccessible(topicName, 1);
-            log.info("Lakestream partition log test passed for topic {}", topicName);
+            assertCommittedPartitionLayoutVisible(topicName, 1);
+            log.info("Lakestream committed partition layout test passed for topic {}", topicName);
         }
 
         @Test
@@ -810,7 +812,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             for (int partition = 0; partition < numPartitions; partition++) {
                 produceRecords(cluster.bootstrapServers(), topicName, partition, 1);
             }
-            assertPartitionLogsAccessible(topicName, numPartitions);
+            assertCommittedPartitionLayoutVisible(topicName, numPartitions);
 
             Uuid topicId;
             try (Admin admin = cluster.admin()) {
@@ -835,7 +837,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
         @Test
         @Timeout(value = 600, unit = TimeUnit.SECONDS)
-        @DisplayName("Bulk diskless topic deletion unregisters every Lakestream stream")
+        @DisplayName("Bulk diskless topic deletion permanently deletes every Lakestream stream")
         void testBulkTopicDeletionUnregistersStreams() throws Exception {
             int topicCount = 100;
             int partitionsPerTopic = 10;
@@ -851,7 +853,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                 admin.deleteTopics(topicNames).all().get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
 
-            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
+            try (IsolatedUrsaCatalogInspector catalog = createCatalogInspector()) {
                 assertBulkStreamsUnregistered(catalog, streamNames, topicCount);
             }
         }
@@ -859,48 +861,54 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         private void assertCatalogStreamReady(String topicName, int expectedPartitions)
                 throws Exception {
             String streamName = catalogStreamName(topicName);
-            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
+            String namespace = IsolatedUrsaCatalogInspector.namespace(cluster);
+            try (IsolatedUrsaCatalogInspector catalog = createCatalogInspector()) {
                 TestUtils.waitForCondition(() -> {
                     if (!catalog.isStreamListed(
-                            KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS)) {
+                            namespace, streamName, 10, TimeUnit.SECONDS)) {
                         return false;
                     }
                     return catalog.partitionCount(
-                            KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS) == expectedPartitions;
+                            namespace, streamName, 10, TimeUnit.SECONDS) == expectedPartitions;
                 }, 30_000, 100,
                         () -> "Timed out waiting for catalog stream reconciliation: "
-                                + KafkaLogNaming.NAMESPACE + "/" + streamName);
+                                + namespace + "/" + streamName);
             }
         }
 
         private void assertCatalogStreamDropped(String topicName) throws Exception {
             String streamName = catalogStreamName(topicName);
-            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
+            String namespace = IsolatedUrsaCatalogInspector.namespace(cluster);
+            try (IsolatedUrsaCatalogInspector catalog = createCatalogInspector()) {
                 TestUtils.waitForCondition(
                         () -> !catalog.streamExists(
-                                KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS),
+                                namespace, streamName, 10, TimeUnit.SECONDS),
                         30_000,
                         100,
                         () -> "Timed out waiting for catalog stream deletion: "
-                                + KafkaLogNaming.NAMESPACE + "/" + streamName);
+                                + namespace + "/" + streamName);
             }
         }
 
-        private void assertPartitionLogsAccessible(String topicName, int expectedPartitions) throws Exception {
-            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
+        private void assertCommittedPartitionLayoutVisible(String topicName, int expectedPartitions) throws Exception {
+            String namespace = IsolatedUrsaCatalogInspector.namespace(cluster);
+            try (IsolatedUrsaCatalogInspector catalog = createCatalogInspector()) {
                 List<Long> logIds = catalog.partitionLogIds(
-                        KafkaLogNaming.NAMESPACE,
+                        namespace,
                         catalogStreamName(topicName),
                         10,
                         TimeUnit.SECONDS);
                 assertEquals(expectedPartitions, logIds.size(),
-                        "Unexpected Lakestream partition log count for " + topicName);
+                        "Unexpected committed Lakestream partition count for " + topicName);
             }
         }
 
         private void putProducerStateSnapshotsInOxia(Uuid topicId, int partitions) throws Exception {
             String oxiaServiceAddress = oxiaContainer.getServiceAddress();
             String namespace = ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
+            String topicIndexName = IsolatedUrsaCatalogInspector.producerStateTopicIndexName(cluster);
+            String topicIndexKey = IsolatedUrsaCatalogInspector.producerStateTopicIndexKey(
+                    cluster, topicId.toString());
 
             try (AsyncOxiaClient client = OxiaClientBuilder.create(oxiaServiceAddress)
                     .namespace(namespace)
@@ -918,8 +926,8 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                                     key,
                                     value,
                                     Set.of(PutOption.SecondaryIndex(
-                                            ProducerStateSnapshotKeys.topicIndexName(),
-                                            ProducerStateSnapshotKeys.topicIndexKey(topicId.toString()))))
+                                            topicIndexName,
+                                            topicIndexKey)))
                                     .get(10, TimeUnit.SECONDS);
                         }
                     }
@@ -945,12 +953,17 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private List<String> producerStateSnapshotKeys(Uuid topicId, int partition) {
+        private List<String> producerStateSnapshotKeys(Uuid topicId, int partition) throws Exception {
             return List.of(
-                    ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), partition),
-                    ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), partition, TEST_PRODUCER_ZONE),
-                    ProducerStateSnapshotKeys.snapshotKey(
-                            topicId.toString(), partition, TEST_PRODUCER_ZONE_WITH_PATH_SEPARATOR));
+                    IsolatedUrsaCatalogInspector.producerStateSnapshotKey(
+                            cluster, topicId.toString(), partition),
+                    IsolatedUrsaCatalogInspector.producerStateSnapshotKey(
+                            cluster, topicId.toString(), partition, TEST_PRODUCER_ZONE),
+                    IsolatedUrsaCatalogInspector.producerStateSnapshotKey(
+                            cluster,
+                            topicId.toString(),
+                            partition,
+                            TEST_PRODUCER_ZONE_WITH_PATH_SEPARATOR));
         }
 
         private void assertOxiaKeyExists(String key, String description) throws Exception {
@@ -1003,7 +1016,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         }
 
         private void assertBulkStreamsUnregistered(
-                IsolatedLakestreamCatalogProbe catalog,
+                IsolatedUrsaCatalogInspector catalog,
                 List<String> streamNames,
                 int topicCount
         ) throws Exception {
@@ -1014,16 +1027,17 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                     return false;
                 }
             }, 120_000, 500,
-                    () -> "Timed out waiting for bulk stream unregistration for " + topicCount + " topics");
+                    () -> "Timed out waiting for bulk stream deletion for " + topicCount + " topics");
         }
 
         private boolean areBulkStreamsUnregistered(
-                IsolatedLakestreamCatalogProbe catalog,
+                IsolatedUrsaCatalogInspector catalog,
                 List<String> streamNames
         ) throws Exception {
+            String namespace = IsolatedUrsaCatalogInspector.namespace(cluster);
             for (String streamName : streamNames) {
                 if (catalog.streamExists(
-                        KafkaLogNaming.NAMESPACE,
+                        namespace,
                         streamName,
                         10,
                         TimeUnit.SECONDS)) {
@@ -1060,20 +1074,17 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         }
 
         private String catalogStreamName(String topicName) throws Exception {
-            TopicIdPartition topicIdPartition = new TopicIdPartition(
-                    topicId(topicName),
-                    new TopicPartition(topicName, 0));
-            return KafkaLogNaming.streamName(topicIdPartition);
+            return IsolatedUrsaCatalogInspector.streamName(cluster, topicName, topicId(topicName));
         }
 
-        private IsolatedLakestreamCatalogProbe createCatalogProbe() throws Exception {
+        private IsolatedUrsaCatalogInspector createCatalogInspector() throws Exception {
             String catalogUri = "oxia://" + oxiaContainer.getServiceAddress()
                     + "/" + ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
             Properties properties = new Properties();
             properties.setProperty("backendStorageType", "LOCAL");
             properties.setProperty("storagePath", baseDir.toString());
             properties.setProperty("oxiaStorageUrl", catalogUri);
-            return IsolatedLakestreamCatalogProbe.open(cluster, catalogUri, properties);
+            return IsolatedUrsaCatalogInspector.open(cluster, catalogUri, properties);
         }
 
         private Uuid topicId(String topicName) throws Exception {

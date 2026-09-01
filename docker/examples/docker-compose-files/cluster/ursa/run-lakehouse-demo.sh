@@ -21,7 +21,7 @@ base="$here/docker-compose-lakehouse.yml"
 demo="$here/docker-compose-lakehouse.demo.yml"
 project="${COMPOSE_PROJECT_NAME:-kafka-ursa-lakehouse}"
 kafka_image="${IMAGE:-kafka-diskless:latest}"
-compactor_image="${COMPACTOR_IMAGE:-ursa-compact:lakehouse-e2e}"
+compactor_image="${COMPACTOR_IMAGE:-ursa-compactor:lakehouse-e2e}"
 num_records="${NUM_RECORDS:-100}"
 passed=false
 

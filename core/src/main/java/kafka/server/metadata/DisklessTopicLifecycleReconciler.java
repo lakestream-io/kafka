@@ -19,6 +19,7 @@ package kafka.server.metadata;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.image.ConfigurationsDelta;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
@@ -27,8 +28,8 @@ import org.apache.kafka.image.TopicsDelta;
 import org.apache.kafka.image.loader.LoaderManifest;
 import org.apache.kafka.image.publisher.MetadataPublisher;
 import org.apache.kafka.raft.LeaderAndEpoch;
-import org.apache.kafka.storage.diskless.DisklessProducerStateStore;
-import org.apache.kafka.storage.diskless.DisklessProducerStateStore.ManagedProducerStateTopic;
+import org.apache.kafka.storage.diskless.DisklessProducerStateLifecycle;
+import org.apache.kafka.storage.diskless.DisklessProducerStateLifecycle.ManagedProducerStateTopic;
 import org.apache.kafka.storage.diskless.DisklessTopicLifecycle;
 import org.apache.kafka.storage.diskless.DisklessTopicLifecycle.ManagedTopic;
 
@@ -52,23 +53,24 @@ import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
 /**
- * Active-controller publisher for post-commit diskless topic lifecycle reconciliation.
+ * Active-controller reconciler for post-commit diskless topic lifecycle operations.
  *
- * <p>After a diskless topic creation is committed, this publisher idempotently reconciles its
- * storage catalog registration. Once deletion is committed, it unregisters the catalog entry and
+ * <p>After a diskless topic creation is committed, this component idempotently reconciles its
+ * storage catalog state. Once deletion is committed, it deletes the catalog entry and
  * removes Kafka-owned producer-state snapshots. Operations for one topic ID are serialized, while
  * unrelated topics can make progress independently. Failed operations retry while their desired
  * state and the controller leadership generation remain current. A passive controller retains a
  * bounded window of deletion states for fast failover; after activation, a full KRaft image plus
  * the storage-owned lifecycle inventory also reconciles older or non-terminal catalog orphans.
  */
-public final class DisklessTopicLifecyclePublisher implements MetadataPublisher {
+public final class DisklessTopicLifecycleReconciler implements MetadataPublisher {
 
     private static final long DEFAULT_INITIAL_RETRY_DELAY_MS = 1_000;
     private static final long DEFAULT_MAX_RETRY_DELAY_MS = 30_000;
     private static final int DEFAULT_MAX_PASSIVE_DELETION_STATES = 10_000;
     private static final long DEFAULT_MANAGED_TOPIC_INVENTORY_INTERVAL_MS = 30_000;
     private static final long DEFAULT_MANAGED_TOPIC_INVENTORY_TIMEOUT_MS = 10_000;
+    private static final long DEFAULT_LIFECYCLE_OPERATION_TIMEOUT_MS = 60_000;
 
     private enum DesiredStatus {
         PRESENT,
@@ -154,18 +156,20 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
     private record PendingTimedOperation(
             CompletableFuture<?> source,
             CompletableFuture<?> timed,
-            ScheduledFuture<?> timeout) {
+            ScheduledFuture<?> timeout,
+            boolean inventoryOperation) {
     }
 
     private final int nodeId;
     private final DisklessTopicLifecycle topicLifecycle;
-    private final DisklessProducerStateStore producerStateStore;
+    private final DisklessProducerStateLifecycle producerStateLifecycle;
     private final BiConsumer<String, Throwable> faultHandler;
     private final long initialRetryDelayMs;
     private final long maxRetryDelayMs;
     private final int maxPassiveDeletionStates;
     private final long managedTopicInventoryIntervalMs;
     private final long managedTopicInventoryTimeoutMs;
+    private final long lifecycleOperationTimeoutMs;
     private final ScheduledExecutorService retryExecutor;
     private final Map<Uuid, DesiredTopicState> desiredStates = new HashMap<>();
     private final Set<Uuid> passiveDeletionStates = new LinkedHashSet<>();
@@ -183,42 +187,42 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
     private long managedTopicInventoryCycle = 0;
     private MetadataImage latestImage = null;
 
-    public DisklessTopicLifecyclePublisher(
+    public DisklessTopicLifecycleReconciler(
             int nodeId,
             DisklessTopicLifecycle topicLifecycle,
-            DisklessProducerStateStore producerStateStore,
+            DisklessProducerStateLifecycle producerStateLifecycle,
             BiConsumer<String, Throwable> faultHandler) {
         this(
                 nodeId,
                 topicLifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 faultHandler,
                 DEFAULT_INITIAL_RETRY_DELAY_MS,
                 DEFAULT_MAX_RETRY_DELAY_MS,
                 DEFAULT_MAX_PASSIVE_DELETION_STATES);
     }
 
-    DisklessTopicLifecyclePublisher(
+    DisklessTopicLifecycleReconciler(
             int nodeId,
             DisklessTopicLifecycle topicLifecycle,
-            DisklessProducerStateStore producerStateStore,
+            DisklessProducerStateLifecycle producerStateLifecycle,
             BiConsumer<String, Throwable> faultHandler,
             long initialRetryDelayMs,
             long maxRetryDelayMs) {
         this(
                 nodeId,
                 topicLifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 faultHandler,
                 initialRetryDelayMs,
                 maxRetryDelayMs,
                 DEFAULT_MAX_PASSIVE_DELETION_STATES);
     }
 
-    DisklessTopicLifecyclePublisher(
+    DisklessTopicLifecycleReconciler(
             int nodeId,
             DisklessTopicLifecycle topicLifecycle,
-            DisklessProducerStateStore producerStateStore,
+            DisklessProducerStateLifecycle producerStateLifecycle,
             BiConsumer<String, Throwable> faultHandler,
             long initialRetryDelayMs,
             long maxRetryDelayMs,
@@ -226,28 +230,53 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
         this(
                 nodeId,
                 topicLifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 faultHandler,
                 initialRetryDelayMs,
                 maxRetryDelayMs,
                 maxPassiveDeletionStates,
                 DEFAULT_MANAGED_TOPIC_INVENTORY_INTERVAL_MS,
-                DEFAULT_MANAGED_TOPIC_INVENTORY_TIMEOUT_MS);
+                DEFAULT_MANAGED_TOPIC_INVENTORY_TIMEOUT_MS,
+                DEFAULT_LIFECYCLE_OPERATION_TIMEOUT_MS);
     }
 
-    DisklessTopicLifecyclePublisher(
+    DisklessTopicLifecycleReconciler(
             int nodeId,
             DisklessTopicLifecycle topicLifecycle,
-            DisklessProducerStateStore producerStateStore,
+            DisklessProducerStateLifecycle producerStateLifecycle,
             BiConsumer<String, Throwable> faultHandler,
             long initialRetryDelayMs,
             long maxRetryDelayMs,
             int maxPassiveDeletionStates,
             long managedTopicInventoryIntervalMs,
             long managedTopicInventoryTimeoutMs) {
+        this(
+                nodeId,
+                topicLifecycle,
+                producerStateLifecycle,
+                faultHandler,
+                initialRetryDelayMs,
+                maxRetryDelayMs,
+                maxPassiveDeletionStates,
+                managedTopicInventoryIntervalMs,
+                managedTopicInventoryTimeoutMs,
+                DEFAULT_LIFECYCLE_OPERATION_TIMEOUT_MS);
+    }
+
+    DisklessTopicLifecycleReconciler(
+            int nodeId,
+            DisklessTopicLifecycle topicLifecycle,
+            DisklessProducerStateLifecycle producerStateLifecycle,
+            BiConsumer<String, Throwable> faultHandler,
+            long initialRetryDelayMs,
+            long maxRetryDelayMs,
+            int maxPassiveDeletionStates,
+            long managedTopicInventoryIntervalMs,
+            long managedTopicInventoryTimeoutMs,
+            long lifecycleOperationTimeoutMs) {
         this.nodeId = nodeId;
         this.topicLifecycle = Objects.requireNonNull(topicLifecycle, "topicLifecycle must not be null");
-        this.producerStateStore = Objects.requireNonNull(producerStateStore, "producerStateStore must not be null");
+        this.producerStateLifecycle = Objects.requireNonNull(producerStateLifecycle, "producerStateLifecycle must not be null");
         this.faultHandler = Objects.requireNonNull(faultHandler, "faultHandler must not be null");
         if (initialRetryDelayMs < 1) {
             throw new IllegalArgumentException("initialRetryDelayMs must be at least 1");
@@ -264,13 +293,17 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
         if (managedTopicInventoryTimeoutMs < 1) {
             throw new IllegalArgumentException("managedTopicInventoryTimeoutMs must be at least 1");
         }
+        if (lifecycleOperationTimeoutMs < 1) {
+            throw new IllegalArgumentException("lifecycleOperationTimeoutMs must be at least 1");
+        }
         this.initialRetryDelayMs = initialRetryDelayMs;
         this.maxRetryDelayMs = maxRetryDelayMs;
         this.maxPassiveDeletionStates = maxPassiveDeletionStates;
         this.managedTopicInventoryIntervalMs = managedTopicInventoryIntervalMs;
         this.managedTopicInventoryTimeoutMs = managedTopicInventoryTimeoutMs;
+        this.lifecycleOperationTimeoutMs = lifecycleOperationTimeoutMs;
         this.retryExecutor = Executors.newSingleThreadScheduledExecutor(task -> {
-            Thread thread = new Thread(task, "diskless-topic-lifecycle-publisher-" + nodeId + "-retry");
+            Thread thread = new Thread(task, "diskless-topic-lifecycle-reconciler-" + nodeId + "-retry");
             thread.setDaemon(true);
             return thread;
         });
@@ -278,7 +311,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
 
     @Override
     public String name() {
-        return "DisklessTopicLifecyclePublisher id=" + nodeId;
+        return "DisklessTopicLifecycleReconciler id=" + nodeId;
     }
 
     @Override
@@ -378,12 +411,15 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
             if (topicImage == null) {
                 continue;
             }
+            if (Topic.isInternal(topicImage.name())) {
+                continue;
+            }
             Map<String, String> configs = topicConfigs(newImage, topicImage.name());
             if (!isDisklessTopic(configs)) {
                 continue;
             }
             DesiredTopicState desired = rememberPresentTopic(topicImage, configs, sourceRevision);
-            scheduleRegistrationIfActive(desired, context, generation);
+            scheduleReconciliationIfActive(desired, context, generation);
         }
     }
 
@@ -403,6 +439,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
             TopicImage topicImage = newImage.topics().getTopic(topicId);
             if (oldTopicImage == null
                     || topicImage == null
+                    || Topic.isInternal(topicImage.name())
                     || oldTopicImage.partitions().size() == topicImage.partitions().size()) {
                 continue;
             }
@@ -411,7 +448,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
                 continue;
             }
             DesiredTopicState desired = rememberPresentTopic(topicImage, configs, sourceRevision);
-            scheduleRegistrationIfActive(desired, context, generation);
+            scheduleReconciliationIfActive(desired, context, generation);
         }
     }
 
@@ -432,12 +469,15 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
             if (topicImage == null) {
                 continue;
             }
+            if (Topic.isInternal(topicImage.name())) {
+                continue;
+            }
             Map<String, String> configs = topicConfigs(newImage, topicImage.name());
             if (!isDisklessTopic(configs)) {
                 continue;
             }
             DesiredTopicState desired = rememberPresentTopic(topicImage, configs, sourceRevision);
-            scheduleRegistrationIfActive(desired, context, generation);
+            scheduleReconciliationIfActive(desired, context, generation);
         }
     }
 
@@ -472,46 +512,28 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
     private void reconcileFullImage(MetadataImage image, long generation) {
         String context = "full MetadataImage at " + image.highestOffsetAndEpoch().offset();
         long sourceRevision = image.highestOffsetAndEpoch().offset();
-        Map<Uuid, TopicImage> currentDisklessTopics = new HashMap<>();
-        for (TopicImage topicImage : image.topics().topicsById().values()) {
-            Map<String, String> configs = topicConfigs(image, topicImage.name());
-            if (!isDisklessTopic(configs)) {
-                continue;
-            }
-            currentDisklessTopics.put(topicImage.id(), topicImage);
-        }
+        Map<Uuid, TopicImage> currentDisklessTopics = currentDisklessTopics(image);
 
-        List<DesiredTopicState> registrations = new ArrayList<>();
+        List<DesiredTopicState> reconciliations = new ArrayList<>();
         List<DesiredTopicState> deletions = new ArrayList<>();
         boolean imageIsCurrent;
         synchronized (this) {
             imageIsCurrent = isReconciliationImageCurrent(image, generation);
             if (imageIsCurrent) {
-                for (TopicImage topicImage : currentDisklessTopics.values()) {
-                    registrations.add(rememberPresentTopicFromFullImage(
-                            topicImage,
-                            topicConfigs(image, topicImage.name()),
-                            sourceRevision));
-                }
-                List<DesiredTopicState> rememberedStates = new ArrayList<>(desiredStates.values());
-                for (DesiredTopicState desired : rememberedStates) {
-                    if (desired.status() == DesiredStatus.PRESENT
-                            && desired.sourceRevision() <= sourceRevision
-                            && !currentDisklessTopics.containsKey(desired.topicId())) {
-                        desired = rememberDeletedTopic(desired.topicId(), desired.topicName());
-                    }
-                    if (desired.status() == DesiredStatus.DELETED) {
-                        deletions.add(desired);
-                    }
-                }
+                rememberFullImageStates(
+                        image,
+                        sourceRevision,
+                        currentDisklessTopics,
+                        reconciliations,
+                        deletions);
             }
         }
         if (!imageIsCurrent) {
             reconcileNewerImage(image, generation);
             return;
         }
-        for (DesiredTopicState desired : registrations) {
-            scheduleRegistrationIfActive(desired, context, generation);
+        for (DesiredTopicState desired : reconciliations) {
+            scheduleReconciliationIfActive(desired, context, generation);
         }
         for (DesiredTopicState desired : deletions) {
             scheduleDeletionIfActive(desired, context, generation);
@@ -521,6 +543,46 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
                 generation,
                 Set.copyOf(currentDisklessTopics.keySet()),
                 context);
+    }
+
+    private Map<Uuid, TopicImage> currentDisklessTopics(MetadataImage image) {
+        Map<Uuid, TopicImage> currentDisklessTopics = new HashMap<>();
+        for (TopicImage topicImage : image.topics().topicsById().values()) {
+            if (Topic.isInternal(topicImage.name())) {
+                continue;
+            }
+            Map<String, String> configs = topicConfigs(image, topicImage.name());
+            if (!isDisklessTopic(configs)) {
+                continue;
+            }
+            currentDisklessTopics.put(topicImage.id(), topicImage);
+        }
+        return currentDisklessTopics;
+    }
+
+    private void rememberFullImageStates(
+            MetadataImage image,
+            long sourceRevision,
+            Map<Uuid, TopicImage> currentDisklessTopics,
+            List<DesiredTopicState> reconciliations,
+            List<DesiredTopicState> deletions) {
+        for (TopicImage topicImage : currentDisklessTopics.values()) {
+            reconciliations.add(rememberPresentTopicFromFullImage(
+                    topicImage,
+                    topicConfigs(image, topicImage.name()),
+                    sourceRevision));
+        }
+        List<DesiredTopicState> rememberedStates = new ArrayList<>(desiredStates.values());
+        for (DesiredTopicState desired : rememberedStates) {
+            if (desired.status() == DesiredStatus.PRESENT
+                    && desired.sourceRevision() <= sourceRevision
+                    && !currentDisklessTopics.containsKey(desired.topicId())) {
+                desired = rememberDeletedTopic(desired.topicId(), desired.topicName());
+            }
+            if (desired.status() == DesiredStatus.DELETED) {
+                deletions.add(desired);
+            }
+        }
     }
 
     private void startManagedTopicOrphanReconciliation(
@@ -536,7 +598,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
                 timedOperationsToCancel = List.of();
             } else {
                 cycle = ++managedTopicInventoryCycle;
-                timedOperationsToCancel = removePendingTimedOperations();
+                timedOperationsToCancel = removePendingInventoryTimedOperations();
             }
         }
         cancelTimedOperations(timedOperationsToCancel);
@@ -570,7 +632,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
         CompletableFuture<List<ManagedProducerStateTopic>> producerStateInventoryFuture;
         try {
             producerStateInventoryFuture = Objects.requireNonNull(
-                    producerStateStore.listManagedTopics(),
+                    producerStateLifecycle.listManagedTopics(),
                     "Diskless producer-state inventory returned null future");
         } catch (Throwable error) {
             producerStateInventoryFuture = CompletableFuture.failedFuture(error);
@@ -803,12 +865,21 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
             CompletableFuture<T> source,
             long timeoutMs,
             String description) {
+        return withTimeout(source, timeoutMs, description, true);
+    }
+
+    private <T> CompletableFuture<T> withTimeout(
+            CompletableFuture<T> source,
+            long timeoutMs,
+            String description,
+            boolean inventoryOperation) {
         CompletableFuture<T> timed = new CompletableFuture<>();
         ScheduledFuture<?> timeout;
         synchronized (this) {
             if (closed) {
+                source.cancel(true);
                 return CompletableFuture.failedFuture(
-                        new CancellationException("Diskless topic lifecycle publisher is closed"));
+                        new CancellationException("Diskless topic lifecycle reconciler is closed"));
             }
             try {
                 timeout = retryExecutor.schedule(
@@ -816,14 +887,32 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
                         timeoutMs,
                         TimeUnit.MILLISECONDS);
             } catch (RuntimeException scheduleError) {
+                source.cancel(true);
                 return CompletableFuture.failedFuture(scheduleError);
             }
             pendingTimedOperations.put(
                     timed,
-                    new PendingTimedOperation(source, timed, timeout));
+                    new PendingTimedOperation(source, timed, timeout, inventoryOperation));
         }
         source.whenComplete((value, error) -> completeTimedOperation(timed, value, error));
+        timed.whenComplete((value, error) -> {
+            if (timed.isCancelled()) {
+                cancelTimedOperation(timed);
+            }
+        });
         return timed;
+    }
+
+    private void cancelTimedOperation(CompletableFuture<?> timed) {
+        PendingTimedOperation operation;
+        synchronized (this) {
+            operation = pendingTimedOperations.remove(timed);
+        }
+        if (operation == null) {
+            return;
+        }
+        operation.timeout().cancel(false);
+        operation.source().cancel(true);
     }
 
     private <T> void completeTimedOperation(
@@ -1002,7 +1091,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
         return state != null && state.status() == DesiredStatus.DELETED;
     }
 
-    private void scheduleRegistrationIfActive(
+    private void scheduleReconciliationIfActive(
             DesiredTopicState desired,
             String context,
             long generation) {
@@ -1082,7 +1171,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
             workflowGeneration = ++runner.workflowGeneration;
             if (desired.status() == DesiredStatus.PRESENT) {
                 operations = List.of(new RetryingOperation(
-                        "register diskless topic " + desired.topicName()
+                        "reconcile diskless topic " + desired.topicName()
                                 + " (" + desired.topicId() + ")",
                         () -> reconcilePresentTopic(desired),
                         initialRetryDelayMs));
@@ -1090,9 +1179,9 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
                 List<RetryingOperation> deletionOperations = new ArrayList<>();
                 if (desired.deleteCatalog()) {
                     deletionOperations.add(new RetryingOperation(
-                            "unregister diskless topic " + desired.topicName()
+                            "delete diskless topic " + desired.topicName()
                                     + " (" + desired.topicId() + ")",
-                            () -> topicLifecycle.unregisterTopic(
+                            () -> topicLifecycle.deleteTopic(
                                     desired.topicName(), desired.topicId()),
                             initialRetryDelayMs));
                 }
@@ -1100,7 +1189,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
                     deletionOperations.add(new RetryingOperation(
                             "delete producer-state snapshots for topic " + desired.topicName()
                                     + " (" + desired.topicId() + ")",
-                            () -> producerStateStore.deleteTopicSnapshots(desired.topicId()),
+                            () -> producerStateLifecycle.deleteTopicSnapshots(desired.topicId()),
                             initialRetryDelayMs));
                 }
                 operations = List.copyOf(deletionOperations);
@@ -1149,7 +1238,7 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
             CompletableFuture<Void> result) {
         try {
             return Objects.requireNonNull(
-                    producerStateStore.reconcileTopic(
+                    producerStateLifecycle.reconcileTopic(
                             desired.topicName(),
                             desired.topicId(),
                             desired.sourceRevision()),
@@ -1179,13 +1268,13 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
         CompletableFuture<Void> catalog;
         try {
             catalog = Objects.requireNonNull(
-                    topicLifecycle.registerTopic(
+                    topicLifecycle.reconcileTopic(
                             desired.topicName(),
                             desired.topicId(),
                             desired.partitions(),
                             desired.configs(),
                             desired.sourceRevision()),
-                    "Diskless topic lifecycle registration returned null future");
+                    "Diskless topic lifecycle reconciliation returned null future");
         } catch (Throwable error) {
             result.completeExceptionally(error);
             return;
@@ -1221,8 +1310,13 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
 
         CompletableFuture<Void> source;
         try {
-            source = Objects.requireNonNull(
+            CompletableFuture<Void> rawSource = Objects.requireNonNull(
                     operation.supplier.get(), "Diskless lifecycle operation returned null future");
+            source = withTimeout(
+                    rawSource,
+                    lifecycleOperationTimeoutMs,
+                    "Timed out while attempting to " + operation.name,
+                    false);
         } catch (Throwable error) {
             source = CompletableFuture.failedFuture(error);
         }
@@ -1269,6 +1363,9 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
                     runnerToStart = completeCurrentWorkflow(runner);
                 }
             } else if (runner.pendingDesired != null) {
+                failureToReport = unwrap(error);
+                failedAttempt = operation.attempt++;
+                context = runner.currentContext;
                 cancellation = abandonCurrentWorkflow(runner);
                 runnerToStart = runner;
             } else {
@@ -1355,6 +1452,17 @@ public final class DisklessTopicLifecyclePublisher implements MetadataPublisher 
         List<PendingTimedOperation> operations = new ArrayList<>(pendingTimedOperations.values());
         pendingTimedOperations.clear();
         operations.forEach(operation -> operation.timeout().cancel(false));
+        return operations;
+    }
+
+    private synchronized List<PendingTimedOperation> removePendingInventoryTimedOperations() {
+        List<PendingTimedOperation> operations = pendingTimedOperations.values().stream()
+                .filter(PendingTimedOperation::inventoryOperation)
+                .toList();
+        for (PendingTimedOperation operation : operations) {
+            pendingTimedOperations.remove(operation.timed());
+            operation.timeout().cancel(false);
+        }
         return operations;
     }
 

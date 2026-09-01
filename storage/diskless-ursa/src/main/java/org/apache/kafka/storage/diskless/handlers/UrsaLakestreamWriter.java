@@ -16,17 +16,68 @@
  */
 package org.apache.kafka.storage.diskless.handlers;
 
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
+import org.apache.kafka.storage.diskless.Writer;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.util.AbstractMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+
 /**
  * Writer implementation using Lakestream for storage.
  */
-public class UrsaLakestreamWriter extends AbstractUrsaStorageWriter {
+public final class UrsaLakestreamWriter implements Writer {
+
+    private static final Logger log = LoggerFactory.getLogger(UrsaLakestreamWriter.class);
+    private static final String WRITER_NAME = "Lakestream";
+
+    private final UrsaStorageState state;
 
     public UrsaLakestreamWriter(UrsaStorageState state) {
-        super(state);
+        this.state = state;
     }
 
     @Override
-    protected String writerName() {
-        return "Lakestream";
+    public CompletableFuture<Map<TopicIdPartition, PartitionResponse>> write(
+            Map<TopicIdPartition, MemoryRecords> entriesPerPartition,
+            String zone) {
+        log.debug("Writing to {} partitions via {}", entriesPerPartition.size(), WRITER_NAME);
+
+        if (entriesPerPartition.isEmpty()) {
+            return CompletableFuture.completedFuture(Map.of());
+        }
+
+        List<CompletableFuture<AbstractMap.SimpleEntry<TopicIdPartition, PartitionResponse>>> futures =
+                entriesPerPartition.entrySet().stream()
+                        .map(entry -> state.getOrCreatePartitionLog(entry.getKey())
+                                .write(entry.getValue(), zone, WRITER_NAME)
+                                .thenApply(response -> new AbstractMap.SimpleEntry<>(entry.getKey(), response)))
+                        .toList();
+
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]))
+                .thenApply(ignored -> {
+                    Map<TopicIdPartition, PartitionResponse> result = futures.stream()
+                            .map(CompletableFuture::join)
+                            .collect(Collectors.toMap(
+                                    Map.Entry::getKey,
+                                    Map.Entry::getValue,
+                                    (oldValue, newValue) -> oldValue,
+                                    LinkedHashMap::new));
+                    log.debug("Completed writing to {} partitions via {}", result.size(), WRITER_NAME);
+                    return result;
+                });
+    }
+
+    @Override
+    public void close() throws IOException {
     }
 }

@@ -19,7 +19,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ursa_storage_dir="${URSA_STORAGE_DIR:-${1:-}}"
 kafka_image="${IMAGE:-kafka-diskless:latest}"
-compactor_image="${COMPACTOR_IMAGE:-ursa-compact:lakehouse-e2e}"
+compactor_image="${COMPACTOR_IMAGE:-ursa-compactor:lakehouse-e2e}"
 
 if [[ -z "$ursa_storage_dir" || ! -f "$ursa_storage_dir/pom.xml" ]]; then
   cat >&2 <<'EOF'
@@ -47,7 +47,7 @@ fi
 
 docker build \
   -t "$compactor_image" \
-  -f "$here/ursa-compact-ue.Dockerfile" \
+  -f "$here/ursa-compactor.Dockerfile" \
   "$ursa_storage_dir"
 
 echo "Built $kafka_image and $compactor_image."

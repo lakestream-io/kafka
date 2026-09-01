@@ -21,6 +21,7 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.image.TopicImage;
@@ -37,12 +38,21 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.Consumer;
 
-public class DisklessStateReconcilerPublisher implements MetadataPublisher {
+/**
+ * Applies committed topic deletions to broker-local diskless state.
+ *
+ * <p>The controller owns catalog reconciliation. This broker reconciler only fences deleted topic
+ * incarnations and closes cached partition handles after the fence is visible.
+ */
+public final class DisklessBrokerTopicDeletionReconciler implements MetadataPublisher {
+
+    private record DeletedTopic(String name, Uuid id) {
+    }
 
     private final DisklessStorageReplicaManagerSupport disklessStorageSupport;
     private final Consumer<String> onTopicMaybeEmptied;
 
-    public DisklessStateReconcilerPublisher(
+    public DisklessBrokerTopicDeletionReconciler(
             DisklessStorageReplicaManagerSupport disklessStorageSupport,
             Consumer<String> onTopicMaybeEmptied
     ) {
@@ -54,7 +64,7 @@ public class DisklessStateReconcilerPublisher implements MetadataPublisher {
 
     @Override
     public String name() {
-        return "DisklessStateReconcilerPublisher";
+        return "DisklessBrokerTopicDeletionReconciler";
     }
 
     @Override
@@ -64,17 +74,16 @@ public class DisklessStateReconcilerPublisher implements MetadataPublisher {
             LoaderManifest manifest
     ) {
         Set<TopicIdPartition> deletedPartitions = deletedDisklessPartitions(delta);
-        Set<TopicIdPartition> deletedTopics = new LinkedHashSet<>();
+        Set<DeletedTopic> deletedTopics = new LinkedHashSet<>();
         for (TopicIdPartition deletedPartition : deletedPartitions) {
-            deletedTopics.add(new TopicIdPartition(
-                    deletedPartition.topicId(),
-                    new TopicPartition(deletedPartition.topic(), 0)));
+            deletedTopics.add(new DeletedTopic(deletedPartition.topic(), deletedPartition.topicId()));
         }
-        deletedTopics.forEach(disklessStorageSupport::deleteTopicConfig);
+        deletedTopics.forEach(topic ->
+                disklessStorageSupport.fenceDeletedTopic(topic.name(), topic.id()));
 
         // Fence the deleted topic in the broker-local storage state before closing any cached
         // partition handles. Otherwise a concurrent request can reopen a handle in the window
-        // between reconcileTrackedPartitions closing the old handle and deleteTopicConfig
+        // between reconcileTrackedPartitions closing the old handle and fenceDeletedTopic
         // publishing the deletion fence.
         disklessStorageSupport.reconcileTrackedPartitions(deletedPartitions, onTopicMaybeEmptied);
     }
@@ -104,6 +113,9 @@ public class DisklessStateReconcilerPublisher implements MetadataPublisher {
     }
 
     private boolean isDisklessTopic(MetadataImage image, String topicName) {
+        if (Topic.isInternal(topicName)) {
+            return false;
+        }
         ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, topicName);
         Map<String, String> configs = image.configs().configMapForResource(resource);
         String enabledValue = configs.get(TopicConfig.URSA_STORAGE_ENABLE_CONFIG);

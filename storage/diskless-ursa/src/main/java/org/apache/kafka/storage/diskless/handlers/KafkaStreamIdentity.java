@@ -16,15 +16,14 @@
  */
 package org.apache.kafka.storage.diskless.handlers;
 
-import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.Uuid;
 
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
-/** Stable Lakestream catalog naming and ownership metadata for Kafka diskless streams. */
-public final class KafkaLogNaming {
+/** Ursa catalog identity and ownership metadata for Kafka diskless streams. */
+public final class KafkaStreamIdentity {
 
     public static final String NAMESPACE = "default";
     public static final String KAFKA_MANAGED_PROPERTY = "lakestream.kafka.managed";
@@ -32,7 +31,7 @@ public final class KafkaLogNaming {
     public static final String KAFKA_TOPIC_ID_PROPERTY = "lakestream.kafka.topic.id";
     public static final String KAFKA_SOURCE_REVISION_PROPERTY = "lakestream.kafka.source.revision";
 
-    private KafkaLogNaming() {
+    private KafkaStreamIdentity() {
     }
 
     /**
@@ -43,12 +42,13 @@ public final class KafkaLogNaming {
      * key would let the recreated topic attach to the deleted incarnation's log when that cleanup
      * failed.
      */
-    public static String streamName(TopicIdPartition tp) {
-        Objects.requireNonNull(tp, "topicIdPartition must not be null");
-        if (Uuid.ZERO_UUID.equals(tp.topicId())) {
-            throw new IllegalArgumentException("topicIdPartition must contain a non-zero topic ID");
+    public static String streamName(String topicName, Uuid topicId) {
+        Objects.requireNonNull(topicName, "topicName must not be null");
+        Objects.requireNonNull(topicId, "topicId must not be null");
+        if (Uuid.ZERO_UUID.equals(topicId)) {
+            throw new IllegalArgumentException("topicId must not be zero");
         }
-        return tp.topic() + "-topic-id-" + tp.topicId();
+        return topicName + "-topic-id-" + topicId;
     }
 
     /** Adds Kafka's stable logical topic identity to the stream ownership metadata. */
@@ -72,5 +72,4 @@ public final class KafkaLogNaming {
         properties.put(KAFKA_SOURCE_REVISION_PROPERTY, Long.toString(sourceRevision));
         return Map.copyOf(properties);
     }
-
 }

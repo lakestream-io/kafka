@@ -17,6 +17,7 @@
 package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
@@ -98,13 +99,13 @@ public class UrsaStorageEngineImpl implements DisklessStorageEngine {
     }
 
     @Override
-    public void updateTopicConfig(TopicIdPartition topicIdPartition, Map<String, String> config) {
-        state.updateTopicConfig(topicIdPartition, config);
+    public void applyTopicConfig(String topicName, Uuid topicId, Map<String, String> config) {
+        state.applyTopicConfig(topicName, topicId, config);
     }
 
     @Override
-    public void deleteTopicConfig(TopicIdPartition topicIdPartition) {
-        state.deleteTopicConfig(topicIdPartition);
+    public void fenceDeletedTopic(String topicName, Uuid topicId) {
+        state.fenceDeletedTopic(topicName, topicId);
     }
 
     @Override

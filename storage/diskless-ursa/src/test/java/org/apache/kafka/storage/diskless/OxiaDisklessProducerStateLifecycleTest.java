@@ -17,7 +17,7 @@
 package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.Uuid;
-import org.apache.kafka.storage.diskless.DisklessProducerStateStore.ManagedProducerStateTopic;
+import org.apache.kafka.storage.diskless.DisklessProducerStateLifecycle.ManagedProducerStateTopic;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 
 import org.junit.jupiter.api.Test;
@@ -30,6 +30,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -47,7 +48,6 @@ import io.oxia.client.api.options.defs.OptionVersionId;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -57,14 +57,14 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-class OxiaDisklessProducerStateStoreTest {
+class OxiaDisklessProducerStateLifecycleTest {
 
     @Test
     void testReconcilePersistsInventoryAndRejectsRevisionRegression() throws Exception {
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         InMemoryOxia oxia = new InMemoryOxia();
 
-        try (OxiaDisklessProducerStateStore store = new OxiaDisklessProducerStateStore(oxia.client())) {
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(oxia.client())) {
             store.reconcileTopic("orders", topicId, 17).get();
             store.reconcileTopic("orders", topicId, 9).get();
 
@@ -80,11 +80,12 @@ class OxiaDisklessProducerStateStoreTest {
     }
 
     @Test
-    void testDeleteFencesFirstCleansSnapshotsThenConditionallyDeletesManifest() throws Exception {
+    void testDeleteJournalsThenFencesBeforeCleaningSnapshotsAndManifest() throws Exception {
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         Uuid otherTopicId = Uuid.fromString("VkZ5AkuESPGkMc2OxpKUjw");
         String topicPrefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId.toString());
         String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
+        String cleanupJournalKey = ProducerStateSnapshotKeys.cleanupJournalKey(topicId.toString());
         String unzonedKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 0);
         String zonedKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 1, "rack/region/zone");
         String otherTopicKey = ProducerStateSnapshotKeys.snapshotKey(
@@ -97,7 +98,7 @@ class OxiaDisklessProducerStateStoreTest {
         oxia.storeValue(malformedTopicScopedKey, new byte[]{4});
         oxia.indexKeys(List.of(unzonedKey, otherTopicKey, malformedTopicScopedKey, zonedKey));
 
-        try (OxiaDisklessProducerStateStore store = new OxiaDisklessProducerStateStore(oxia.client())) {
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(oxia.client())) {
             store.reconcileTopic("orders", topicId, 17).get();
             oxia.clearEvents();
 
@@ -107,24 +108,24 @@ class OxiaDisklessProducerStateStoreTest {
             assertFalse(oxia.contains(unzonedKey));
             assertFalse(oxia.contains(zonedKey));
             assertTrue(oxia.contains(otherTopicKey));
-            assertEquals(
-                    List.of(new ManagedProducerStateTopic("orders", topicId, 17)),
-                    store.listManagedTopics().get());
+            assertEquals(List.of(), store.listManagedTopics().get(),
+                    "the permanent fence must not remain in the active cleanup inventory");
             int markerPut = firstEventWithPrefix(
                     oxia.events(), "conditional-put:" + deletedTopicMarkerKey);
+            int journalPut = firstEventWithPrefix(
+                    oxia.events(), "conditional-put:" + cleanupJournalKey);
             int snapshotRangeDelete = oxia.events().indexOf(
                     "delete-range:" + topicPrefix + ":" + topicPrefix + '\uffff');
             int manifestDelete = firstEventWithPrefix(oxia.events(), "conditional-delete:");
-            assertTrue(markerPut >= 0 && markerPut < snapshotRangeDelete);
+            assertTrue(journalPut >= 0 && journalPut < markerPut);
+            assertTrue(markerPut < snapshotRangeDelete);
             assertTrue(snapshotRangeDelete < manifestDelete);
 
             ExecutionException deletedFailure = assertThrows(
                     ExecutionException.class,
                     () -> store.reconcileTopic("orders", topicId, 99).get());
             assertInstanceOf(IllegalStateException.class, deletedFailure.getCause());
-            assertEquals(
-                    List.of(new ManagedProducerStateTopic("orders", topicId, 17)),
-                    store.listManagedTopics().get());
+            assertEquals(List.of(), store.listManagedTopics().get());
         }
     }
 
@@ -136,7 +137,7 @@ class OxiaDisklessProducerStateStoreTest {
         CompletableFuture<GetResult> delayedManifestRead = oxia.deferNextGet(
                 key -> !key.equals(deletedTopicMarkerKey));
 
-        try (OxiaDisklessProducerStateStore store = new OxiaDisklessProducerStateStore(oxia.client())) {
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(oxia.client())) {
             CompletableFuture<Void> reconcile = store.reconcileTopic("orders", topicId, 17);
             assertFalse(reconcile.isDone());
 
@@ -146,37 +147,149 @@ class OxiaDisklessProducerStateStoreTest {
             ExecutionException deletedFailure = assertThrows(ExecutionException.class, reconcile::get);
             assertInstanceOf(IllegalStateException.class, deletedFailure.getCause());
             assertTrue(oxia.contains(deletedTopicMarkerKey));
-            assertEquals(
-                    List.of(deletedTopicJournal(topicId)),
-                    store.listManagedTopics().get());
+            assertEquals(List.of(), store.listManagedTopics().get());
         }
     }
 
     @Test
-    void testLateSnapshotAfterWriterPassedFenceRemainsDiscoverableAndIsCleaned() throws Exception {
+    void testDeletionWaitsForActiveWriterClaimBeforeCleaningSnapshots() throws Exception {
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         String markerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
         String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 0);
+        String writerClaimKey = ProducerStateSnapshotKeys.writerClaimKey(topicId.toString(), "manager-1");
         InMemoryOxia oxia = new InMemoryOxia();
+        ManualExecutor claimRetryExecutor = new ManualExecutor();
+        oxia.storeValue(snapshotKey, new byte[]{9});
+        oxia.storeValue(writerClaimKey, new byte[0]);
+        oxia.indexKeys(List.of(snapshotKey));
 
-        try (OxiaDisklessProducerStateStore store = new OxiaDisklessProducerStateStore(oxia.client())) {
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(
+                oxia.client(), TimeUnit.SECONDS.toMillis(10), claimRetryExecutor)) {
             store.reconcileTopic("orders", topicId, 17).get();
 
-            // The writer passes its first fence read, then pauses before the snapshot PUT.
-            assertNull(oxia.client().get(markerKey).get());
-            store.deleteTopicSnapshots(topicId).get();
-
-            // Resume only the PUT and simulate a crash before the writer's post-write fence read.
-            oxia.client().put(snapshotKey, new byte[]{9}).get();
-            oxia.indexKeys(List.of(snapshotKey));
+            CompletableFuture<Void> deletion = store.deleteTopicSnapshots(topicId);
+            assertFalse(deletion.isDone());
+            assertTrue(oxia.contains(markerKey), "the durable fence must be installed before waiting");
             assertTrue(oxia.contains(snapshotKey));
+            assertEquals(1, claimRetryExecutor.pendingTaskCount());
 
+            oxia.removeValue(writerClaimKey);
+            claimRetryExecutor.runNext();
+            deletion.get();
+
+            assertFalse(oxia.contains(snapshotKey));
+            assertTrue(oxia.contains(markerKey));
+            assertEquals(List.of(), store.listManagedTopics().get());
+        }
+    }
+
+    @Test
+    void testInterruptedCleanupRemainsDiscoverableAndRetryRemovesOnlyActiveJournal() throws Exception {
+        Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
+        String markerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
+        String cleanupJournalKey = ProducerStateSnapshotKeys.cleanupJournalKey(topicId.toString());
+        InMemoryOxia oxia = new InMemoryOxia();
+        CompletableFuture<List<String>> failedClaimList = oxia.deferNextList();
+
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(oxia.client())) {
+            store.reconcileTopic("orders", topicId, 17).get();
+
+            CompletableFuture<Void> firstAttempt = store.deleteTopicSnapshots(topicId);
+            RuntimeException listFailure = new RuntimeException("claim inventory unavailable");
+            failedClaimList.completeExceptionally(listFailure);
+            ExecutionException failure = assertThrows(ExecutionException.class, firstAttempt::get);
+            assertEquals(listFailure, failure.getCause());
+            assertTrue(oxia.contains(markerKey));
+            assertTrue(oxia.contains(cleanupJournalKey));
             assertEquals(
                     List.of(new ManagedProducerStateTopic("orders", topicId, 17)),
-                    store.listManagedTopics().get(),
-                    "the durable deletion journal must keep late snapshots discoverable");
+                    store.listManagedTopics().get());
+
             store.deleteTopicSnapshots(topicId).get();
-            assertFalse(oxia.contains(snapshotKey));
+            assertTrue(oxia.contains(markerKey), "the permanent deletion fence must remain");
+            assertFalse(oxia.contains(cleanupJournalKey), "successful cleanup must retire its active journal");
+            assertEquals(List.of(), store.listManagedTopics().get());
+        }
+    }
+
+    @Test
+    void testJournalFirstCrashWithoutManifestRemainsDiscoverable() throws Exception {
+        Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
+        String markerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
+        String cleanupJournalKey = ProducerStateSnapshotKeys.cleanupJournalKey(topicId.toString());
+        InMemoryOxia oxia = new InMemoryOxia();
+        CompletableFuture<PutResult> pendingFence = oxia.deferNextConditionalPut(markerKey);
+
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(oxia.client())) {
+            CompletableFuture<Void> deletion = store.deleteTopicSnapshots(topicId);
+
+            assertFalse(deletion.isDone());
+            assertTrue(oxia.contains(cleanupJournalKey));
+            assertFalse(oxia.contains(markerKey));
+            assertEquals(List.of(deletedTopicJournal(topicId)), store.listManagedTopics().get());
+
+            RuntimeException crash = new RuntimeException("controller stopped before fencing");
+            pendingFence.completeExceptionally(crash);
+            ExecutionException failure = assertThrows(ExecutionException.class, deletion::get);
+            assertEquals(crash, failure.getCause());
+
+            store.deleteTopicSnapshots(topicId).get();
+            assertTrue(oxia.contains(markerKey));
+            assertFalse(oxia.contains(cleanupJournalKey));
+            assertEquals(List.of(), store.listManagedTopics().get());
+        }
+    }
+
+    @Test
+    void testActiveWriterWaitIsBoundedAndRetryable() throws Exception {
+        Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
+        String markerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
+        String cleanupJournalKey = ProducerStateSnapshotKeys.cleanupJournalKey(topicId.toString());
+        String writerClaimKey = ProducerStateSnapshotKeys.writerClaimKey(topicId.toString(), "manager-1");
+        InMemoryOxia oxia = new InMemoryOxia();
+        ManualExecutor claimRetryExecutor = new ManualExecutor();
+        oxia.storeValue(writerClaimKey, new byte[0]);
+
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(
+                oxia.client(), TimeUnit.SECONDS.toMillis(10), claimRetryExecutor, 2)) {
+            store.reconcileTopic("orders", topicId, 17).get();
+
+            CompletableFuture<Void> deletion = store.deleteTopicSnapshots(topicId);
+            assertEquals(1, claimRetryExecutor.pendingTaskCount());
+            claimRetryExecutor.runNext();
+
+            ExecutionException failure = assertThrows(ExecutionException.class, deletion::get);
+            assertInstanceOf(TimeoutException.class, failure.getCause());
+            assertTrue(oxia.contains(markerKey));
+            assertTrue(oxia.contains(cleanupJournalKey));
+            assertEquals(
+                    List.of(new ManagedProducerStateTopic("orders", topicId, 17)),
+                    store.listManagedTopics().get());
+
+            oxia.removeValue(writerClaimKey);
+            store.deleteTopicSnapshots(topicId).get();
+            assertEquals(List.of(), store.listManagedTopics().get());
+        }
+    }
+
+    @Test
+    void testCancelledWriterWaitDoesNotStartAnotherPoll() throws Exception {
+        Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
+        String writerClaimKey = ProducerStateSnapshotKeys.writerClaimKey(topicId.toString(), "manager-1");
+        String writerClaimPrefix = ProducerStateSnapshotKeys.writerClaimPrefix(topicId.toString());
+        InMemoryOxia oxia = new InMemoryOxia();
+        ManualExecutor claimRetryExecutor = new ManualExecutor();
+        oxia.storeValue(writerClaimKey, new byte[0]);
+
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(
+                oxia.client(), TimeUnit.SECONDS.toMillis(10), claimRetryExecutor)) {
+            CompletableFuture<Void> deletion = store.deleteTopicSnapshots(topicId);
+            assertEquals(1, countEventsWithPrefix(oxia.events(), "list:" + writerClaimPrefix));
+            assertTrue(deletion.cancel(true));
+
+            claimRetryExecutor.runNext();
+            assertEquals(1, countEventsWithPrefix(oxia.events(), "list:" + writerClaimPrefix),
+                    "cancellation must stop the delayed writer-claim polling chain");
         }
     }
 
@@ -188,7 +301,7 @@ class OxiaDisklessProducerStateStoreTest {
         InMemoryOxia oxia = new InMemoryOxia();
         oxia.storeValue(corruptManifestKey, new byte[]{1, 2, 3});
 
-        try (OxiaDisklessProducerStateStore store = new OxiaDisklessProducerStateStore(oxia.client())) {
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(oxia.client())) {
             store.reconcileTopic("orders", validTopicId, 17).get();
 
             assertEquals(
@@ -198,9 +311,7 @@ class OxiaDisklessProducerStateStoreTest {
             store.deleteTopicSnapshots(corruptTopicId).get();
             assertFalse(oxia.contains(corruptManifestKey));
             assertEquals(
-                    Set.of(
-                            new ManagedProducerStateTopic("orders", validTopicId, 17),
-                            deletedTopicJournal(corruptTopicId)),
+                    Set.of(new ManagedProducerStateTopic("orders", validTopicId, 17)),
                     Set.copyOf(store.listManagedTopics().get()));
         }
     }
@@ -214,7 +325,7 @@ class OxiaDisklessProducerStateStoreTest {
         }
         oxia.holdGets(key -> key.startsWith("producer-state-managed-topic/"));
 
-        try (OxiaDisklessProducerStateStore store = new OxiaDisklessProducerStateStore(oxia.client())) {
+        try (OxiaDisklessProducerStateLifecycle store = new OxiaDisklessProducerStateLifecycle(oxia.client())) {
             CompletableFuture<List<ManagedProducerStateTopic>> inventory = store.listManagedTopics();
             assertEquals(32, oxia.heldGetCount());
             assertTrue(inventory.cancel(true));
@@ -228,8 +339,8 @@ class OxiaDisklessProducerStateStoreTest {
         InMemoryOxia oxia = new InMemoryOxia();
         CompletableFuture<List<String>> pendingList = oxia.deferNextList();
 
-        try (OxiaDisklessProducerStateStore store =
-                     new OxiaDisklessProducerStateStore(oxia.client(), 25)) {
+        try (OxiaDisklessProducerStateLifecycle store =
+                     new OxiaDisklessProducerStateLifecycle(oxia.client(), 25)) {
             ExecutionException timeout = assertThrows(
                     ExecutionException.class,
                     () -> store.listManagedTopics().get(5, TimeUnit.SECONDS));
@@ -242,6 +353,27 @@ class OxiaDisklessProducerStateStoreTest {
         return new ManagedProducerStateTopic("deleted-producer-state-" + topicId, topicId, 0);
     }
 
+    private static final class ManualExecutor implements Executor {
+        private final List<Runnable> tasks = new ArrayList<>();
+
+        @Override
+        public synchronized void execute(Runnable command) {
+            tasks.add(command);
+        }
+
+        synchronized int pendingTaskCount() {
+            return tasks.size();
+        }
+
+        void runNext() {
+            Runnable task;
+            synchronized (this) {
+                task = tasks.remove(0);
+            }
+            task.run();
+        }
+    }
+
     private static int firstEventWithPrefix(List<String> events, String prefix) {
         for (int index = 0; index < events.size(); index++) {
             if (events.get(index).startsWith(prefix)) {
@@ -249,6 +381,10 @@ class OxiaDisklessProducerStateStoreTest {
             }
         }
         return -1;
+    }
+
+    private static long countEventsWithPrefix(List<String> events, String prefix) {
+        return events.stream().filter(event -> event.startsWith(prefix)).count();
     }
 
     private static final class InMemoryOxia {
@@ -260,6 +396,8 @@ class OxiaDisklessProducerStateStoreTest {
         private final AsyncOxiaClient client = mock(AsyncOxiaClient.class);
         private Predicate<String> deferredGetPredicate;
         private CompletableFuture<GetResult> deferredGet;
+        private String deferredConditionalPutKey;
+        private CompletableFuture<PutResult> deferredConditionalPut;
         private CompletableFuture<List<String>> deferredList;
         private Predicate<String> heldGetPredicate;
         private final List<CompletableFuture<GetResult>> heldGets = new ArrayList<>();
@@ -296,6 +434,12 @@ class OxiaDisklessProducerStateStoreTest {
                 byte[] value = invocation.getArgument(1);
                 Set<PutOption> options = invocation.getArgument(2);
                 synchronized (this) {
+                    if (deferredConditionalPut != null && deferredConditionalPutKey.equals(key)) {
+                        CompletableFuture<PutResult> result = deferredConditionalPut;
+                        deferredConditionalPut = null;
+                        deferredConditionalPutKey = null;
+                        return result;
+                    }
                     Long expectedVersionId = expectedVersionId(options);
                     long currentVersionId = currentVersionId(key);
                     if (expectedVersionId != null && expectedVersionId != currentVersionId) {
@@ -392,6 +536,15 @@ class OxiaDisklessProducerStateStoreTest {
             return deferredList;
         }
 
+        synchronized CompletableFuture<PutResult> deferNextConditionalPut(String key) {
+            if (deferredConditionalPut != null) {
+                throw new IllegalStateException("A conditional put is already deferred");
+            }
+            deferredConditionalPutKey = key;
+            deferredConditionalPut = new CompletableFuture<>();
+            return deferredConditionalPut;
+        }
+
         synchronized void holdGets(Predicate<String> predicate) {
             heldGetPredicate = predicate;
         }
@@ -406,6 +559,10 @@ class OxiaDisklessProducerStateStoreTest {
 
         synchronized boolean contains(String key) {
             return data.containsKey(key);
+        }
+
+        synchronized void removeValue(String key) {
+            remove(key);
         }
 
         synchronized void clearEvents() {

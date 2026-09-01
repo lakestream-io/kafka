@@ -24,19 +24,19 @@ import java.lang.reflect.Constructor;
 import java.net.URL;
 import java.util.Objects;
 
-/** Loads the diskless topic lifecycle implementation from the isolated storage runtime. */
-public final class DisklessTopicLifecycleLoader {
+/** Loads producer-state lifecycle operations from the isolated diskless storage runtime. */
+public final class DisklessProducerStateLifecycleLoader {
 
     private static final String DEFAULT_DISKLESS_STORAGE_DIR = "ursa-storage";
-    private DisklessTopicLifecycleLoader() {
+    private DisklessProducerStateLifecycleLoader() {
     }
 
-    public static DisklessTopicLifecycle load(UrsaStorageConfig config) {
+    public static DisklessProducerStateLifecycle load(UrsaStorageConfig config) {
         return DisklessStorageProviderLoader.load(
                 config,
-                "topic lifecycle",
-                provider -> provider.createTopicLifecycle(config),
-                LeasedDisklessTopicLifecycle::new);
+                "producer-state lifecycle",
+                provider -> provider.createProducerStateLifecycle(config),
+                LeasedDisklessProducerStateLifecycle::new);
     }
 
     /**
@@ -44,32 +44,32 @@ public final class DisklessTopicLifecycleLoader {
      * Initialization failures are surfaced through that operation's future and retried by a later
      * operation, allowing the active controller reconciler to supervise provider availability.
      */
-    public static DisklessTopicLifecycle loadLazily(UrsaStorageConfig config) {
+    public static DisklessProducerStateLifecycle loadLazily(UrsaStorageConfig config) {
         Objects.requireNonNull(config, "config must not be null");
-        return new LazyDisklessTopicLifecycle(() -> load(config));
+        return new LazyDisklessProducerStateLifecycle(() -> load(config));
     }
 
-    static DisklessTopicLifecycle load(UrsaStorageConfig config, String lifecycleClassName) {
+    static DisklessProducerStateLifecycle load(UrsaStorageConfig config, String lifecycleClassName) {
         try {
-            ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
+            ClassLoader parent = DisklessProducerStateLifecycleLoader.class.getClassLoader();
             URL[] urls = classPathUrls(config.getClassPath());
             DisklessClassLoaderRegistry.Lease classLoaderLease = DisklessClassLoaderRegistry.acquire(urls, parent);
             try {
-                DisklessTopicLifecycle lifecycle = DisklessClassLoaderContext.call(
+                DisklessProducerStateLifecycle lifecycle = DisklessClassLoaderContext.call(
                         classLoaderLease.classLoader(),
                         () -> {
                             Class<?> lifecycleClass = Class.forName(
                                     lifecycleClassName, true, classLoaderLease.classLoader());
                             Constructor<?> constructor = lifecycleClass.getConstructor(UrsaStorageConfig.class);
-                            return (DisklessTopicLifecycle) constructor.newInstance(config);
+                            return (DisklessProducerStateLifecycle) constructor.newInstance(config);
                         });
-                return new LeasedDisklessTopicLifecycle(lifecycle, classLoaderLease);
+                return new LeasedDisklessProducerStateLifecycle(lifecycle, classLoaderLease);
             } catch (Throwable t) {
                 DisklessClassLoaderRegistry.closeLeaseOnFailure(classLoaderLease, t);
                 throw rethrow(t);
             }
         } catch (Exception e) {
-            throw new KafkaException("Failed to load diskless topic lifecycle", e);
+            throw new KafkaException("Failed to load diskless producer-state lifecycle", e);
         }
     }
 
@@ -77,7 +77,7 @@ public final class DisklessTopicLifecycleLoader {
         String classPath = KafkaPluginClassPaths.configuredOrDefault(
                 configuredClassPath,
                 DEFAULT_DISKLESS_STORAGE_DIR,
-                DisklessTopicLifecycleLoader.class);
+                DisklessProducerStateLifecycleLoader.class);
         return KafkaPluginClassPaths.toUrls(classPath);
     }
 
@@ -88,6 +88,6 @@ public final class DisklessTopicLifecycleLoader {
         if (t instanceof Error error) {
             throw error;
         }
-        return new KafkaException("Failed to load diskless topic lifecycle", t);
+        return new KafkaException("Failed to load diskless producer-state lifecycle", t);
     }
 }

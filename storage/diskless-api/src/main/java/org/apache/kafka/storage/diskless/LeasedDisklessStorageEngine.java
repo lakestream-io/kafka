@@ -18,6 +18,7 @@ package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.ProduceResponse;
@@ -67,17 +68,17 @@ final class LeasedDisklessStorageEngine implements DisklessStorageEngine {
     }
 
     @Override
-    public void updateTopicConfig(TopicIdPartition topicIdPartition, Map<String, String> config) {
+    public void applyTopicConfig(String topicName, Uuid topicId, Map<String, String> config) {
         callWithClassLoader(() -> {
-            delegate.updateTopicConfig(topicIdPartition, config);
+            delegate.applyTopicConfig(topicName, topicId, config);
             return null;
         });
     }
 
     @Override
-    public void deleteTopicConfig(TopicIdPartition topicIdPartition) {
+    public void fenceDeletedTopic(String topicName, Uuid topicId) {
         callWithClassLoader(() -> {
-            delegate.deleteTopicConfig(topicIdPartition);
+            delegate.fenceDeletedTopic(topicName, topicId);
             return null;
         });
     }

@@ -16,8 +16,6 @@
  */
 package org.apache.kafka.storage.diskless.handlers;
 
-import org.apache.kafka.common.TopicIdPartition;
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 
 import org.junit.jupiter.api.Test;
@@ -28,48 +26,48 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-class KafkaLogNamingTest {
+class KafkaStreamIdentityTest {
 
     @Test
     void testStreamNameIncludesTopicIncarnation() {
         Uuid topicId = Uuid.randomUuid();
-        TopicIdPartition tp = new TopicIdPartition(topicId, new TopicPartition("test-topic", 0));
         assertEquals(
                 "test-topic-topic-id-" + topicId,
-                KafkaLogNaming.streamName(tp)
+                KafkaStreamIdentity.streamName("test-topic", topicId)
         );
     }
 
     @Test
     void testSameNameRecreatedTopicUsesDifferentStreamNames() {
-        TopicPartition partition = new TopicPartition("recreated-topic", 0);
-        TopicIdPartition deleted = new TopicIdPartition(Uuid.randomUuid(), partition);
-        TopicIdPartition recreated = new TopicIdPartition(Uuid.randomUuid(), partition);
+        Uuid deletedTopicId = Uuid.randomUuid();
+        Uuid recreatedTopicId = Uuid.randomUuid();
 
-        assertNotEquals(KafkaLogNaming.streamName(deleted), KafkaLogNaming.streamName(recreated));
+        assertNotEquals(
+                KafkaStreamIdentity.streamName("recreated-topic", deletedTopicId),
+                KafkaStreamIdentity.streamName("recreated-topic", recreatedTopicId));
     }
 
     @Test
     void testUnknownTopicIncarnationIsRejected() {
-        TopicIdPartition tp = new TopicIdPartition(Uuid.ZERO_UUID, new TopicPartition("test-topic", 0));
-
-        assertThrows(IllegalArgumentException.class, () -> KafkaLogNaming.streamName(tp));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> KafkaStreamIdentity.streamName("test-topic", Uuid.ZERO_UUID));
     }
 
     @Test
     void testStreamPropertiesPreserveLogicalKafkaTopicName() {
-        Map<String, String> properties = KafkaLogNaming.streamProperties(
+        Map<String, String> properties = KafkaStreamIdentity.streamProperties(
                 "orders",
                 Uuid.fromString("65WMNfybQpCDVulYOxMCTw"),
                 Map.of("retention.ms", "60000"),
                 42L);
 
-        assertEquals("orders", properties.get(KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY));
-        assertEquals("true", properties.get(KafkaLogNaming.KAFKA_MANAGED_PROPERTY));
+        assertEquals("orders", properties.get(KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY));
+        assertEquals("true", properties.get(KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY));
         assertEquals(
                 "65WMNfybQpCDVulYOxMCTw",
-                properties.get(KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY));
-        assertEquals("42", properties.get(KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY));
+                properties.get(KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY));
+        assertEquals("42", properties.get(KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY));
         assertEquals("60000", properties.get("retention.ms"));
     }
 }

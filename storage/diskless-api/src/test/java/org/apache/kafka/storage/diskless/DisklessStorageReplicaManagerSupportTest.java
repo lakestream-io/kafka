@@ -80,9 +80,9 @@ class DisklessStorageReplicaManagerSupportTest {
 
         try (DisklessStorageReplicaManagerSupport support =
                      new DisklessStorageReplicaManagerSupport(metadataView, 1, selector, engine)) {
-            support.updateTopicConfig(topicIdentity.topic(), config);
+            support.applyTopicConfig(topicIdentity.topic(), config);
 
-            verify(engine).updateTopicConfig(topicIdentity, Map.of(
+            verify(engine).applyTopicConfig(topicIdentity.topic(), topicIdentity.topicId(), Map.of(
                     "retention.ms", "1000",
                     "retention.bytes", "2048"));
         }
@@ -97,9 +97,9 @@ class DisklessStorageReplicaManagerSupportTest {
 
         try (DisklessStorageReplicaManagerSupport support =
                      new DisklessStorageReplicaManagerSupport(metadataView, 1, selector, engine)) {
-            support.deleteTopicConfig(topicIdentity);
+            support.fenceDeletedTopic(topicIdentity.topic(), topicIdentity.topicId());
 
-            verify(engine).deleteTopicConfig(topicIdentity);
+            verify(engine).fenceDeletedTopic(topicIdentity.topic(), topicIdentity.topicId());
         }
     }
 

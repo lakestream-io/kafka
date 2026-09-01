@@ -16,28 +16,25 @@
  */
 package org.apache.kafka.storage.diskless;
 
-import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Uuid;
 
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
-final class LeasedDisklessTopicLifecycle implements DisklessTopicLifecycle {
-    private final DisklessTopicLifecycle delegate;
-    private final DisklessClassLoaderRegistry.Lease classLoaderLease;
-    private boolean closed;
+/** Lazy controller-side facade for the isolated topic lifecycle provider. */
+final class LazyDisklessTopicLifecycle implements DisklessTopicLifecycle {
 
-    LeasedDisklessTopicLifecycle(
-            DisklessTopicLifecycle delegate,
-            DisklessClassLoaderRegistry.Lease classLoaderLease) {
-        this.delegate = delegate;
-        this.classLoaderLease = classLoaderLease;
+    private final LazyDisklessResource<DisklessTopicLifecycle> resource;
+
+    LazyDisklessTopicLifecycle(Supplier<DisklessTopicLifecycle> loader) {
+        this.resource = new LazyDisklessResource<>("diskless topic lifecycle", loader);
     }
 
     @Override
     public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
-        return callWithClassLoader(delegate::listManagedTopics);
+        return resource.call(DisklessTopicLifecycle::listManagedTopics);
     }
 
     @Override
@@ -47,35 +44,17 @@ final class LeasedDisklessTopicLifecycle implements DisklessTopicLifecycle {
             int partitions,
             Map<String, String> properties,
             long sourceRevision) {
-        return callWithClassLoader(() -> delegate.reconcileTopic(
+        return resource.call(lifecycle -> lifecycle.reconcileTopic(
                 topicName, topicId, partitions, properties, sourceRevision));
     }
 
     @Override
     public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
-        return callWithClassLoader(() -> delegate.deleteTopic(topicName, topicId));
+        return resource.call(lifecycle -> lifecycle.deleteTopic(topicName, topicId));
     }
 
     @Override
-    public synchronized void close() throws Exception {
-        if (closed) {
-            return;
-        }
-        DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
-            delegate.close();
-            return null;
-        });
-        classLoaderLease.close();
-        closed = true;
-    }
-
-    private <T> T callWithClassLoader(DisklessClassLoaderContext.Action<T> action) {
-        try {
-            return DisklessClassLoaderContext.call(classLoaderLease.classLoader(), action);
-        } catch (RuntimeException | Error e) {
-            throw e;
-        } catch (Exception e) {
-            throw new KafkaException("Failed to invoke diskless topic lifecycle", e);
-        }
+    public void close() throws Exception {
+        resource.close();
     }
 }

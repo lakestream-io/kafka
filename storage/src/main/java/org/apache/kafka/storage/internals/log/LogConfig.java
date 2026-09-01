@@ -197,8 +197,6 @@ public class LogConfig extends AbstractConfig {
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_DOC)
             .define(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG, STRING, ServerLogConfigs.URSA_OXIA_SERVICE_URL_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_OXIA_SERVICE_URL_DOC)
-            .define(ServerLogConfigs.URSA_STORAGE_WAL_DIRECTORY_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_WAL_DIRECTORY_DEFAULT,
-                    new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_STORAGE_WAL_DIRECTORY_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_NAMESPACE_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_STORAGE_NAMESPACE_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_DEFAULT,

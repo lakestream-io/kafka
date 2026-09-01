@@ -22,13 +22,13 @@ import org.apache.kafka.common.Uuid;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
-final class LeasedDisklessProducerStateStore implements DisklessProducerStateStore {
-    private final DisklessProducerStateStore delegate;
+final class LeasedDisklessProducerStateLifecycle implements DisklessProducerStateLifecycle {
+    private final DisklessProducerStateLifecycle delegate;
     private final DisklessClassLoaderRegistry.Lease classLoaderLease;
     private boolean closed;
 
-    LeasedDisklessProducerStateStore(
-            DisklessProducerStateStore delegate,
+    LeasedDisklessProducerStateLifecycle(
+            DisklessProducerStateLifecycle delegate,
             DisklessClassLoaderRegistry.Lease classLoaderLease) {
         this.delegate = delegate;
         this.classLoaderLease = classLoaderLease;
@@ -68,7 +68,7 @@ final class LeasedDisklessProducerStateStore implements DisklessProducerStateSto
         } catch (RuntimeException | Error e) {
             throw e;
         } catch (Exception e) {
-            throw new KafkaException("Failed to invoke diskless producer-state store", e);
+            throw new KafkaException("Failed to invoke diskless producer-state lifecycle", e);
         }
     }
 }

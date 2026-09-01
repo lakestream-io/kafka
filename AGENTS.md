@@ -89,7 +89,8 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 - `DisklessStorageReplicaManagerSupport.java` — Entry point; partitions requests between diskless and classic paths
 - `DisklessStorageEngine.java` — Generic engine SPI implemented by Ursa
 - `DisklessStorageEngineLoader.java` — Loads the implementation through the isolated Ursa classpath
-- `DisklessMetadataStore.java` / `DisklessMetadataStoreLoader.java` — Generic metadata-store SPI and loader
+- `DisklessTopicLifecycle.java` / `DisklessTopicLifecycleLoader.java` — Controller-side topic lifecycle SPI and isolated loader
+- `DisklessProducerStateLifecycle.java` / `DisklessProducerStateLifecycleLoader.java` — Controller-side producer-state lifecycle SPI and isolated loader
 - `DisklessClassLoaderRegistry.java` — Shares plugin classloader instances by classpath and parent until all leases close
 - `handlers/UrsaStorageConfig.java` — Configuration holder shared by broker-side code and the Ursa implementation
 
@@ -97,8 +98,9 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 - `handlers/UrsaStorageEngineImpl.java` — Diskless storage engine implementation backed by Ursa
 - `handlers/UrsaLakestreamWriter.java` — Write path (async append via Lakestream)
 - `handlers/UrsaLakestreamReader.java` — Read path (Fetch + ListOffsets)
-- `handlers/UrsaStorageState.java` — Stream IDs, offset tracking, shared state
-- `OxiaDisklessMetadataStore.java` — Producer/topic metadata persistence through Oxia
+- `handlers/UrsaStorageState.java` — Partition LogId handles, offset tracking, and shared state
+- `handlers/UrsaDisklessTopicLifecycle.java` — StreamCatalog-backed topic lifecycle implementation
+- `OxiaDisklessProducerStateLifecycle.java` — Kafka-owned producer-state lifecycle metadata in Oxia
 - `idempotent/ProducerStateManager.java` — Producer state tracking backed by Oxia snapshots
 
 **Plugin classloading**:
@@ -134,11 +136,11 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 ### Ursa Dependencies
 Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` runtime, not in `storage` or `core`.
 
-The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.lakestream.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state metadata and the controller's existing diskless metadata-store adapter.
+The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.lakestream.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state metadata and its controller-side lifecycle adapter.
 
 Release tarballs package those isolated runtime jars under `./ursa-storage/`. Kafka, Scala, SLF4J, Log4j, and other platform jars are provided by `./libs/` and should not be duplicated into `./ursa-storage/` unless the dependency is intentionally private to the Ursa runtime. The `KafkaPluginClassLoader` loads plugin-private classes child-first while keeping Kafka/logging/Scala API packages parent-first.
 
-`ursa.storage.class.path` is the shared config used by diskless storage and Ursa SDT tests to point at this runtime classpath. In production, the default is `$KAFKA_HOME/ursa-storage/*`.
+`ursa.storage.class.path` is the shared config used by broker and controller diskless-storage loaders and their isolated integration tests. In production, the default is `$KAFKA_HOME/ursa-storage/*`.
 
 ### Isolated CI Tests
 Ursa integration tests (`org/apache/kafka/server/ursa/integration/**`, `org/apache/kafka/storage/diskless/**`) are isolated from the main test suite. Use `-Pkafka.ci.isolated.tests=only` to run them, or `=exclude` to skip them.

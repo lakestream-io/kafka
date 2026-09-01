@@ -77,8 +77,6 @@
   <allow pkg="io.oxia.client.api" />
   <allow pkg="org.awaitility" />
   <allow pkg="io.opentelemetry.api" />
-  <allow class="org.apache.kafka.storage.diskless.handlers.KafkaLogNaming" />
-  <allow class="org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys" />
 
   <!-- persistent collection factories/non-library-specific wrappers -->
   <allow pkg="org.apache.kafka.server.immutable" exact-match="true" />

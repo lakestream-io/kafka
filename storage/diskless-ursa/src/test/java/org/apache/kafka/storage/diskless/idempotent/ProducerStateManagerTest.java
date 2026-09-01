@@ -29,6 +29,7 @@ import org.apache.kafka.storage.diskless.handlers.KafkaRecordsPayload;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -74,7 +75,9 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -584,15 +587,47 @@ class ProducerStateManagerTest {
                     eq(ProducerStateManager.DEFAULT_SNAPSHOT_INTERVAL_MS),
                     eq(TimeUnit.MILLISECONDS));
 
+            clearInvocations(snapshotStore.client());
             snapshotStore.queueGet(
                     deletedTopicMarkerKey, CompletableFuture.completedFuture(mock(GetResult.class)));
             periodicTaskCaptor.getValue().run();
 
             verify(periodicTask).cancel(false);
-            verify(snapshotStore.client(), times(3)).get(deletedTopicMarkerKey);
+            verify(snapshotStore.client()).get(deletedTopicMarkerKey);
 
             periodicTaskCaptor.getValue().run();
-            verify(snapshotStore.client(), times(3)).get(deletedTopicMarkerKey);
+            verify(snapshotStore.client()).get(deletedTopicMarkerKey);
+        } finally {
+            manager.cleanup(true).get();
+        }
+    }
+
+    @Test
+    void testDeletionFenceRacingWriterClaimPreventsSnapshotClaimAndReleasesWriter() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        String writerClaimPrefix = ProducerStateSnapshotKeys.writerClaimPrefix(topicId);
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+        CompletableFuture<GetResult> postClaimFenceRead = new CompletableFuture<>();
+        snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.completedFuture(null));
+        snapshotStore.queueGet(deletedTopicMarkerKey, postClaimFenceRead);
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+
+        try {
+            CompletableFuture<ProducerStateManager.PrepareResult> prepare = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)));
+
+            assertFalse(prepare.isDone());
+            assertEquals(1, snapshotStore.keysWithPrefix(writerClaimPrefix).size());
+            assertFalse(snapshotStore.data().containsKey(snapshotKey));
+
+            postClaimFenceRead.complete(mock(GetResult.class));
+            ExecutionException failure = assertThrows(ExecutionException.class, prepare::get);
+            assertInstanceOf(IllegalStateException.class, failure.getCause());
+            assertTrue(snapshotStore.keysWithPrefix(writerClaimPrefix).isEmpty());
+            assertFalse(snapshotStore.data().containsKey(snapshotKey));
         } finally {
             manager.cleanup(true).get();
         }
@@ -1019,6 +1054,44 @@ class ProducerStateManagerTest {
     }
 
     @Test
+    void testTransientReplayCursorCloseFailureRetainsHandleAndRetries() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        RuntimeException readFailure = new RuntimeException("synchronous replay read failure");
+        LogOffset lastOffset = mockLogOffset(0L, 1);
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(lastOffset));
+        when(logInstance.openEphemeralCursor(anyString(), anyLong())).thenReturn(
+                CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), any(), anyLong())).thenThrow(readFailure);
+        doThrow(new IOException("transient cursor close failure"))
+                .doNothing()
+                .when(cursor)
+                .close();
+
+        ProducerStateManager manager = newManager(
+                tp, () -> null, () -> CompletableFuture.completedFuture(logInstance));
+        try {
+            CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 3000L)
+            ));
+
+            ExecutionException prepareError = assertThrows(
+                    ExecutionException.class,
+                    () -> prepareFuture.get(5, TimeUnit.SECONDS));
+            Throwable rootCause = prepareError;
+            while (rootCause.getCause() != null) {
+                rootCause = rootCause.getCause();
+            }
+            assertSame(readFailure, rootCause);
+            verify(cursor, timeout(5_000).times(2)).close();
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
     void testReplaySkippedWhenNoSnapshotAndMessagesExceedThreshold() throws Exception {
         TopicIdPartition tp = testTopicPartition();
         Log logInstance = mock(Log.class);
@@ -1394,6 +1467,10 @@ class ProducerStateManagerTest {
 
         Map<String, byte[]> data() {
             return data;
+        }
+
+        synchronized List<String> keysWithPrefix(String prefix) {
+            return data.keySet().stream().filter(key -> key.startsWith(prefix)).sorted().toList();
         }
 
         AsyncOxiaClient client() {

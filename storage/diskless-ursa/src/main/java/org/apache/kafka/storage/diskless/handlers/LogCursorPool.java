@@ -23,6 +23,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.lakestream.api.Log;
@@ -42,16 +46,49 @@ final class LogCursorPool implements AutoCloseable {
 
     private static final IllegalStateException POOL_CLOSED_EXCEPTION =
             new IllegalStateException("Log cursor pool is closed");
+    private static final long CLOSE_RETRY_DELAY_MS = 100L;
 
     private final Log logInstance;
     private final String cursorNamePrefix;
-    private final int maxSize;
+    private final Executor closeExecutor;
+    private final RetryScheduler retryScheduler;
+    private final List<Slot> slots;
     private final ArrayDeque<Slot> idle = new ArrayDeque<>();
     private final ArrayDeque<Waiter> waiters = new ArrayDeque<>();
 
     private boolean closed = false;
 
     LogCursorPool(Log logInstance, String cursorNamePrefix, int maxSize) {
+        this(
+                logInstance,
+                cursorNamePrefix,
+                maxSize,
+                ForkJoinPool.commonPool(),
+                task -> CompletableFuture.delayedExecutor(
+                        CLOSE_RETRY_DELAY_MS,
+                        TimeUnit.MILLISECONDS,
+                        ForkJoinPool.commonPool()).execute(task));
+    }
+
+    LogCursorPool(
+            Log logInstance,
+            String cursorNamePrefix,
+            int maxSize,
+            ScheduledExecutorService closeExecutor) {
+        this(
+                logInstance,
+                cursorNamePrefix,
+                maxSize,
+                closeExecutor,
+                task -> closeExecutor.schedule(task, CLOSE_RETRY_DELAY_MS, TimeUnit.MILLISECONDS));
+    }
+
+    private LogCursorPool(
+            Log logInstance,
+            String cursorNamePrefix,
+            int maxSize,
+            Executor closeExecutor,
+            RetryScheduler retryScheduler) {
         if (logInstance == null) {
             throw new IllegalArgumentException("log must not be null");
         }
@@ -63,9 +100,13 @@ final class LogCursorPool implements AutoCloseable {
         }
         this.logInstance = logInstance;
         this.cursorNamePrefix = cursorNamePrefix;
-        this.maxSize = maxSize;
+        this.closeExecutor = closeExecutor;
+        this.retryScheduler = retryScheduler;
+        this.slots = new ArrayList<>(maxSize);
         for (int i = 0; i < maxSize; i++) {
-            idle.add(new Slot(i));
+            Slot slot = new Slot(i);
+            slots.add(slot);
+            idle.add(slot);
         }
     }
 
@@ -82,6 +123,7 @@ final class LogCursorPool implements AutoCloseable {
                 waiters.add(waiter);
                 return waiter.future;
             }
+            slot.inUse = true;
         }
 
         CompletableFuture<Lease> result = new CompletableFuture<>();
@@ -99,32 +141,46 @@ final class LogCursorPool implements AutoCloseable {
 
     @Override
     public void close() {
+        closeAsync();
+    }
+
+    /**
+     * Starts closing every cursor owned by this pool without blocking the caller.
+     *
+     * <p>A cursor handle is retained until {@link LogCursor#close()} succeeds. Failed closes are
+     * retried on the supplied close executor, and cursors checked out by callers are closed when
+     * their leases are returned.
+     */
+    CompletableFuture<Void> closeAsync() {
         List<Waiter> toFail;
-        List<LogCursor> toClose;
+        List<Slot> toClose;
         synchronized (this) {
-            if (closed) {
-                return;
+            if (!closed) {
+                closed = true;
+                toFail = new ArrayList<>(waiters);
+                waiters.clear();
+                idle.clear();
+            } else {
+                toFail = List.of();
             }
-            closed = true;
-            toFail = new ArrayList<>(waiters);
-            waiters.clear();
-            toClose = new ArrayList<>(idle.size());
-            for (Slot slot : idle) {
-                if (slot.cursor != null) {
-                    toClose.add(slot.cursor);
+            toClose = new ArrayList<>(slots.size());
+            for (Slot slot : slots) {
+                if (!slot.inUse && !slot.closedFuture.isDone()) {
+                    toClose.add(slot);
                 }
-                slot.cursor = null;
             }
-            idle.clear();
         }
 
         for (Waiter waiter : toFail) {
             waiter.future.completeExceptionally(POOL_CLOSED_EXCEPTION);
         }
 
-        for (LogCursor cursor : toClose) {
-            closeCursorQuietly(cursor);
+        for (Slot slot : toClose) {
+            scheduleSlotClose(slot, false);
         }
+        return CompletableFuture.allOf(slots.stream()
+                .map(slot -> slot.closedFuture)
+                .toArray(CompletableFuture<?>[]::new));
     }
 
     private CompletableFuture<Lease> prepareLease(Slot slot, long startOffset) {
@@ -144,7 +200,9 @@ final class LogCursorPool implements AutoCloseable {
                         if (newCursor == null) {
                             throw new IllegalStateException("Log.openEphemeralCursor returned null cursor");
                         }
-                        slot.cursor = newCursor;
+                        synchronized (this) {
+                            slot.cursor = newCursor;
+                        }
                         return finishPreparedLease(slot);
                     });
         }
@@ -175,9 +233,10 @@ final class LogCursorPool implements AutoCloseable {
             if (!closed) {
                 return new Lease(this, slot);
             }
+            slot.inUse = false;
         }
 
-        closeSlotCursor(slot);
+        scheduleSlotClose(slot, false);
         throw POOL_CLOSED_EXCEPTION;
     }
 
@@ -194,22 +253,23 @@ final class LogCursorPool implements AutoCloseable {
         }
 
         Waiter waiter = null;
-        LogCursor cursorToClose = null;
+        boolean closeSlot = false;
         synchronized (this) {
             if (closed) {
-                cursorToClose = slot.cursor;
-                slot.cursor = null;
+                slot.inUse = false;
+                closeSlot = true;
             } else {
                 waiter = pollNextWaiterLocked();
                 if (waiter == null) {
+                    slot.inUse = false;
                     idle.add(slot);
                     return;
                 }
             }
         }
 
-        if (cursorToClose != null) {
-            closeCursorQuietly(cursorToClose);
+        if (closeSlot) {
+            scheduleSlotClose(slot, false);
             return;
         }
         if (waiter == null) {
@@ -228,23 +288,64 @@ final class LogCursorPool implements AutoCloseable {
                 });
     }
 
+    private void scheduleSlotClose(Slot slot, boolean delayed) {
+        synchronized (this) {
+            if (slot.inUse || slot.closedFuture.isDone() || slot.closeScheduled) {
+                return;
+            }
+            slot.closeScheduled = true;
+        }
+        Runnable closeTask = () -> closeSlotCursor(slot);
+        try {
+            if (delayed) {
+                retryScheduler.schedule(closeTask);
+            } else {
+                closeExecutor.execute(closeTask);
+            }
+        } catch (RuntimeException scheduleError) {
+            synchronized (this) {
+                slot.closeScheduled = false;
+            }
+            log.warn("Failed to schedule pooled cursor close for log {}", logInstance.id(), scheduleError);
+            CompletableFuture.delayedExecutor(
+                    CLOSE_RETRY_DELAY_MS,
+                    TimeUnit.MILLISECONDS,
+                    ForkJoinPool.commonPool()).execute(() -> scheduleSlotClose(slot, false));
+        }
+    }
+
     private void closeSlotCursor(Slot slot) {
         LogCursor cursor;
         synchronized (this) {
             cursor = slot.cursor;
-            slot.cursor = null;
         }
-        if (cursor != null) {
-            closeCursorQuietly(cursor);
+        if (cursor == null) {
+            completeSlotClose(slot);
+            return;
         }
-    }
-
-    private void closeCursorQuietly(LogCursor cursor) {
         try {
             cursor.close();
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log.warn("Failed to close pooled cursor for log {}", logInstance.id(), e);
+            synchronized (this) {
+                slot.closeScheduled = false;
+            }
+            scheduleSlotClose(slot, true);
+            return;
         }
+        synchronized (this) {
+            if (slot.cursor == cursor) {
+                slot.cursor = null;
+            }
+        }
+        completeSlotClose(slot);
+    }
+
+    private void completeSlotClose(Slot slot) {
+        synchronized (this) {
+            slot.closeScheduled = false;
+        }
+        slot.closedFuture.complete(null);
     }
 
     private Waiter pollNextWaiterLocked() {
@@ -265,11 +366,19 @@ final class LogCursorPool implements AutoCloseable {
 
     private static final class Slot {
         private final int index;
+        private final CompletableFuture<Void> closedFuture = new CompletableFuture<>();
         private LogCursor cursor;
+        private boolean inUse;
+        private boolean closeScheduled;
 
         private Slot(int index) {
             this.index = index;
         }
+    }
+
+    @FunctionalInterface
+    private interface RetryScheduler {
+        void schedule(Runnable task);
     }
 
     private static final class Waiter {

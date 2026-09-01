@@ -228,6 +228,39 @@ class UrsaStorageStateTest {
     }
 
     @Test
+    void testStateCloseTimeoutKeepsResourcesForRetry() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("close-timeout-topic", 0));
+        CompletableFuture<Void> cleanupGate = new CompletableFuture<>();
+        ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
+        when(producerStateManager.cleanup(false)).thenReturn(cleanupGate);
+        StreamCatalog catalog = mockCatalogWithLog(mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
+        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, oxiaClient);
+        UrsaStorageState state = new UrsaStorageState(
+                Time.SYSTEM,
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                holder,
+                Map.of(),
+                null);
+
+        UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
+        partitionLog.installProducerStateManager(DisklessClientZone.NO_ZONE, producerStateManager);
+
+        IOException timeout = assertThrows(IOException.class, () -> state.close(100L));
+        assertTrue(timeout.getMessage().contains("Timed out"));
+        verify(catalog, never()).close();
+        verify(oxiaClient, never()).close();
+
+        cleanupGate.complete(null);
+        state.close(5_000L);
+
+        verify(catalog).close();
+        verify(oxiaClient).close();
+    }
+
+    @Test
     void testStateCloseReleasesResourcesAfterProducerStateCleanupFailure() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("close-failure-topic", 0));
         ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
@@ -588,7 +621,7 @@ class UrsaStorageStateTest {
                 holder,
                 Map.of(),
                 ignored -> Map.of())) {
-            state.updateTopicConfigAsync(tp, latestConfig).get();
+            state.applyTopicConfigAsync(tp.topic(), tp.topicId(), latestConfig).get();
 
             verifyNoInteractions(catalog);
         }

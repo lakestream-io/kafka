@@ -62,7 +62,7 @@ public interface DisklessTopicLifecycle extends AutoCloseable {
      * left behind by a controller restart. The inventory must include objects still being created
      * or deleted so an abandoned lifecycle claim cannot remain hidden. Implementations must filter
      * using durable ownership metadata and must not infer ownership from a storage-specific name
-     * alone. Each entry must also carry the KRaft source revision from the registration that made
+     * alone. Each entry must also carry the KRaft source revision from the reconciliation that made
      * it visible. The controller only deletes an absent entry after its image has reached that
      * revision, which prevents a newly elected but lagging controller from deleting newer state.
      */
@@ -75,7 +75,7 @@ public interface DisklessTopicLifecycle extends AutoCloseable {
      * needed, and exactly replaces its properties. The source revision lets the storage catalog
      * reject a delayed property update from an older metadata image.
      */
-    CompletableFuture<Void> registerTopic(
+    CompletableFuture<Void> reconcileTopic(
             String topicName,
             Uuid topicId,
             int partitions,
@@ -83,11 +83,11 @@ public interface DisklessTopicLifecycle extends AutoCloseable {
             long sourceRevision);
 
     /**
-     * Permanently unregister the logical topic after its Kafka metadata has been deleted.
+     * Permanently deletes the logical topic after its Kafka metadata has been deleted.
      *
      * <p>Kafka topic IDs identify immutable topic incarnations. Implementations must durably fence
-     * this ID so that an already in-flight registration cannot recreate it after this future
+     * this ID so that an already in-flight create attempt cannot recreate it after this future
      * completes. A topic recreated with the same name receives a different ID.
      */
-    CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId);
+    CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId);
 }

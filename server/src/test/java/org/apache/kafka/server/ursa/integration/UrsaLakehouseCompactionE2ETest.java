@@ -28,7 +28,6 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.server.config.ServerLogConfigs;
-import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
@@ -43,7 +42,6 @@ import org.testcontainers.containers.Network;
 import org.testcontainers.containers.localstack.LocalStackContainer;
 import org.testcontainers.containers.wait.strategy.LogMessageWaitStrategy;
 import org.testcontainers.utility.DockerImageName;
-import org.testcontainers.utility.MountableFile;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -63,7 +61,7 @@ import io.oxia.testcontainers.OxiaContainer;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * E2E test for Kafka compaction with compacted index verification.
+ * E2E test for external Ursa lakehouse compaction with compacted-index verification.
  *
  * <p>This test:
  * <ol>
@@ -75,12 +73,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Timeout(value = 600, unit = TimeUnit.SECONDS)
 @Tag("integration")
-public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
+public class UrsaLakehouseCompactionE2ETest extends UrsaStorageE2ETestBase {
 
     private static final int NUM_RECORDS = 100;
     private static final String S3_BUCKET = "kafka-ursa-storage";
     private static final String COMPACTOR_IMAGE_ENV = "URSA_COMPACTOR_IMAGE";
-    private static final String SN_LICENSE_FILE_ENV = "SN_LICENSE_FILE";
 
     private static Network network;
     private static OxiaContainer oxiaContainer;
@@ -97,7 +94,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 "Set " + COMPACTOR_IMAGE_ENV + " to an image containing the standalone Ursa compactor package");
 
         // Used as S3 key prefix (not a local path) for WAL and compacted data.
-        s3Prefix = "kafka-compaction-e2e/" + UUID.randomUUID();
+        s3Prefix = "ursa-lakehouse-compaction-e2e/" + UUID.randomUUID();
 
         // Make sure S3A (used by parquet readers/writers) has credentials available.
         System.setProperty("aws.accessKeyId", "test");
@@ -151,7 +148,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     @DisplayName("Write, compact, and verify Parquet files")
     @SuppressWarnings("NPathComplexity")
     public void testWriteCompactAndVerifyParquetFiles() throws Exception {
-        String topicName = uniqueTopicName("kafka-compaction-e2e-topic");
+        String topicName = uniqueTopicName("ursa-lakehouse-compaction-e2e-topic");
 
         createTopicWithUrsaStorage(topicName);
         Uuid topicId = topicId(topicName);
@@ -202,13 +199,14 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
 
     private void verifyReadsUseParquetIndexes(String topicName, Uuid topicId) throws Exception {
         TopicIdPartition topicIdPartition = topicIdPartition(topicName, topicId);
-        String streamName = KafkaLogNaming.streamName(topicIdPartition);
+        String streamName = IsolatedUrsaCatalogInspector.streamName(cluster, topicName, topicId);
+        String namespace = IsolatedUrsaCatalogInspector.namespace(cluster);
         String catalogUri = compactionStorageConfig.getProperty("metadataStoreUrl");
 
-        try (IsolatedLakestreamCatalogProbe catalog =
-                     IsolatedLakestreamCatalogProbe.open(cluster, catalogUri, compactionStorageConfig)) {
-            IsolatedLakestreamCatalogProbe.LogIndexSummary summary = catalog.readLogIndexSummary(
-                    KafkaLogNaming.NAMESPACE,
+        try (IsolatedUrsaCatalogInspector catalog =
+                     IsolatedUrsaCatalogInspector.open(cluster, catalogUri, compactionStorageConfig)) {
+            IsolatedUrsaCatalogInspector.LogIndexSummary summary = catalog.readLogIndexSummary(
+                    namespace,
                     streamName,
                     topicIdPartition.partition(),
                     30,
@@ -334,13 +332,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                         .withRegEx(".*was elected leader.*\\n")
                         .withStartupTimeout(Duration.ofMinutes(5)));
 
-        String licenseFile = System.getenv(SN_LICENSE_FILE_ENV);
-        if (licenseFile != null && !licenseFile.isBlank()) {
-            compactor.withCopyFileToContainer(
-                    MountableFile.forHostPath(licenseFile),
-                    "/mnt/sn-license/license");
-        }
-
         compactor.start();
         log.info("Compactor container started: image={}", compactorImage);
         return compactor;
@@ -349,7 +340,6 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
     private static String compactorCommand() {
         return """
                 set -eu
-                mkdir -p /mnt/sn-license
                 conf=/tmp/ursa-storage.properties
                 : > "$conf"
                 property() { printf '%s=%s\\n' "$1" "$2" >> "$conf"; }
@@ -446,7 +436,8 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 org.apache.kafka.common.serialization.ByteArrayDeserializer.class.getName());
         props.put(org.apache.kafka.clients.consumer.ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
                 org.apache.kafka.common.serialization.ByteArrayDeserializer.class.getName());
-        props.put(org.apache.kafka.clients.consumer.ConsumerConfig.GROUP_ID_CONFIG, "kafka-compaction-e2e-" + UUID.randomUUID());
+        props.put(org.apache.kafka.clients.consumer.ConsumerConfig.GROUP_ID_CONFIG,
+                "ursa-lakehouse-compaction-e2e-" + UUID.randomUUID());
         props.put(org.apache.kafka.clients.consumer.ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         props.put(org.apache.kafka.clients.consumer.ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         props.put(org.apache.kafka.clients.consumer.ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "500");

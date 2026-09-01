@@ -66,68 +66,68 @@ class UrsaDisklessTopicLifecycleTest {
         Uuid negativeRevisionTopicId = Uuid.randomUuid();
         StreamIdentifier negativeRevision = UrsaDisklessTopicLifecycle.streamIdentifier(
                 "negative-revision", negativeRevisionTopicId);
-        when(catalog.listStreamEntries(KafkaLogNaming.NAMESPACE)).thenReturn(
+        when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE)).thenReturn(
                 CompletableFuture.completedFuture(List.of(
                         entry(
                                 owned,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "orders",
-                                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
-                                        KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
+                                        KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "orders",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
+                                        KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
                                 LifecycleState.CREATING),
                         entry(
                                 missingManagedMarker,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "orders",
-                                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
-                                        KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "orders",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
+                                        KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
                                 LifecycleState.ACTIVE),
                         entry(
                                 missingTopicId,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "orders",
-                                        KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
+                                        KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "orders",
+                                        KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
                                 LifecycleState.DELETING),
                         entry(
                                 malformedTopicId,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "orders",
-                                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, "not-a-topic-id",
-                                        KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
+                                        KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "orders",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, "not-a-topic-id",
+                                        KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
                                 LifecycleState.ACTIVE),
                         entry(
                                 mismatchedIdentifier,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "orders",
-                                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
-                                        KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
+                                        KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "orders",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
+                                        KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "42"),
                                 LifecycleState.ACTIVE),
                         entry(
                                 missingRevision,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "missing-revision",
-                                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, missingRevisionTopicId.toString()),
+                                        KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "missing-revision",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, missingRevisionTopicId.toString()),
                                 LifecycleState.ACTIVE),
                         entry(
                                 malformedRevision,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "malformed-revision",
-                                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, malformedRevisionTopicId.toString(),
-                                        KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "not-a-revision"),
+                                        KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "malformed-revision",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, malformedRevisionTopicId.toString(),
+                                        KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "not-a-revision"),
                                 LifecycleState.ACTIVE),
                         entry(
                                 negativeRevision,
                                 Map.of(
-                                        KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "negative-revision",
-                                        KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, negativeRevisionTopicId.toString(),
-                                        KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "-1"),
+                                        KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "negative-revision",
+                                        KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, negativeRevisionTopicId.toString(),
+                                        KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "-1"),
                                 LifecycleState.ACTIVE))));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
@@ -143,14 +143,14 @@ class UrsaDisklessTopicLifecycleTest {
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier(
                 "deleting-topic", topicId);
-        when(catalog.listStreamEntries(KafkaLogNaming.NAMESPACE))
+        when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE))
                 .thenReturn(CompletableFuture.completedFuture(List.of(entry(
                         identifier,
                         Map.of(
-                                KafkaLogNaming.KAFKA_MANAGED_PROPERTY, "true",
-                                KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, "deleting-topic",
-                                KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
-                                KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY, "43"),
+                                KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY, "true",
+                                KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY, "deleting-topic",
+                                KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY, topicId.toString(),
+                                KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "43"),
                         LifecycleState.DELETING))));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
@@ -166,7 +166,7 @@ class UrsaDisklessTopicLifecycleTest {
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
         Map<String, String> properties = Map.of("retention.ms", "60000");
-        Map<String, String> streamProperties = KafkaLogNaming.streamProperties(
+        Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, properties, 17L);
         StreamMetadata created = metadataWithPartitions(3);
         when(catalog.loadStream(identifier))
@@ -182,7 +182,7 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(created));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
-            lifecycle.registerTopic("orders", topicId, 3, properties, 17).get();
+            lifecycle.reconcileTopic("orders", topicId, 3, properties, 17).get();
         }
 
         verify(catalog).createStream(
@@ -201,7 +201,7 @@ class UrsaDisklessTopicLifecycleTest {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
-        Map<String, String> streamProperties = KafkaLogNaming.streamProperties(
+        Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, Map.of(), 18L);
         StreamMetadata existing = metadataWithPartitions(1);
         StreamMetadata expanded = metadataWithPartitions(3);
@@ -212,7 +212,7 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(expanded));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
-            lifecycle.registerTopic("orders", topicId, 3, Map.of(), 18).get();
+            lifecycle.reconcileTopic("orders", topicId, 3, Map.of(), 18).get();
         }
 
         verify(catalog).increasePartitions(identifier, 3);
@@ -226,7 +226,7 @@ class UrsaDisklessTopicLifecycleTest {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
-        Map<String, String> streamProperties = KafkaLogNaming.streamProperties(
+        Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, Map.of(), 19L);
         StreamMetadata winner = metadataWithPartitions(3);
         when(catalog.loadStream(identifier))
@@ -239,14 +239,14 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(winner));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
-            lifecycle.registerTopic("orders", topicId, 3, Map.of(), 19).get();
+            lifecycle.reconcileTopic("orders", topicId, 3, Map.of(), 19).get();
         }
 
         verify(catalog).replaceStreamProperties(identifier, streamProperties, 19);
     }
 
     @Test
-    void testUnregisterPermanentlyDropsStream() throws Exception {
+    void testDeletePermanentlyDropsStream() throws Exception {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
@@ -254,7 +254,7 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(true));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
-            lifecycle.unregisterTopic("orders", topicId).get();
+            lifecycle.deleteTopic("orders", topicId).get();
         }
 
         verify(catalog).dropStream(identifier, true);

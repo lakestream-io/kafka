@@ -33,6 +33,7 @@ import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -52,10 +53,13 @@ import io.lakestream.api.Log;
 import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
 import io.lakestream.api.LogOffset;
+import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.exception.NoSuchStreamException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -66,6 +70,7 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -318,7 +323,8 @@ class UrsaLakestreamReaderTest {
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(0L, 1)));
         when(logInstance.getLastOffset()).thenReturn(
-                CompletableFuture.failedFuture(new NoSuchStreamException("missing")));
+                CompletableFuture.failedFuture(new NoSuchStreamException(
+                        StreamIdentifier.of("default", "missing"))));
         UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -328,6 +334,24 @@ class UrsaLakestreamReaderTest {
         assertNotNull(response);
         assertEquals(Errors.UNKNOWN_TOPIC_OR_PARTITION, response.error);
         verify(state, atLeastOnce()).removePartitionLog(eq(tp), same(partitionLog));
+    }
+
+    @Test
+    void testUnrelatedNotFoundFailureDoesNotInvalidatePartitionLog() throws Exception {
+        TopicIdPartition tp = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        Log logInstance = mock(Log.class);
+        when(logInstance.getFirstOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(0L, 1)));
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.failedFuture(new ObjectNotFoundException("object missing")));
+        UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
+
+        FetchPartitionData response = new UrsaLakestreamReader(state).fetch(
+                createFetchParams(), Map.of(tp, fetchPartitionData(0L))).get().get(tp);
+
+        assertEquals(Errors.KAFKA_STORAGE_ERROR, response.error);
+        verify(state, never()).removePartitionLog(eq(tp), same(partitionLog));
     }
 
     @Test
@@ -521,6 +545,37 @@ class UrsaLakestreamReaderTest {
     }
 
     @Test
+    void testPartitionCloseDrainsTimestampCursorOpenAlreadyInFlight() throws Exception {
+        TopicIdPartition tp = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        Log logInstance = mock(Log.class);
+        LogCursor scanCursor = mock(LogCursor.class);
+        CompletableFuture<LogCursor> cursorOpen = new CompletableFuture<>();
+        when(logInstance.getFirstOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(10L, 1)));
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(10L, 1)));
+        when(logInstance.openEphemeralCursor(anyString(), eq(10L))).thenReturn(cursorOpen);
+        when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(11L)))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+        UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
+
+        CompletableFuture<ListOffsetsPartitionResponse> responseFuture = partitionLog.listOffsets(
+                new ListOffsetsPartitionRequest(tp, 1000L, Optional.empty()));
+        CompletableFuture<Void> closeFuture = partitionLog.close(false);
+
+        assertFalse(closeFuture.isDone());
+        verify(logInstance, never()).close();
+
+        cursorOpen.complete(scanCursor);
+        responseFuture.get(5, TimeUnit.SECONDS);
+        closeFuture.get(5, TimeUnit.SECONDS);
+
+        verify(scanCursor).close();
+        verify(logInstance).close();
+    }
+
+    @Test
     void testTimestampScanClosesCursorWhenReadThrowsSynchronously() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
@@ -534,6 +589,10 @@ class UrsaLakestreamReaderTest {
                 .thenReturn(CompletableFuture.completedFuture(scanCursor));
         when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(15L)))
                 .thenThrow(new RuntimeException("synchronous timestamp read failure"));
+        doThrow(new IOException("transient cursor close failure"))
+                .doNothing()
+                .when(scanCursor)
+                .close();
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -542,7 +601,7 @@ class UrsaLakestreamReaderTest {
         ListOffsetsPartitionResponse response = reader.listOffsets(Map.of(tp, request)).get().get(tp);
 
         assertEquals(Errors.KAFKA_STORAGE_ERROR, response.error());
-        verify(scanCursor).close();
+        verify(scanCursor, times(2)).close();
     }
 
     @Test
@@ -696,10 +755,10 @@ class UrsaLakestreamReaderTest {
         }
     }
 
-    private static final class NoSuchStreamException extends RuntimeException {
+    private static final class ObjectNotFoundException extends RuntimeException {
         private static final long serialVersionUID = 1L;
 
-        private NoSuchStreamException(String message) {
+        private ObjectNotFoundException(String message) {
             super(message);
         }
     }

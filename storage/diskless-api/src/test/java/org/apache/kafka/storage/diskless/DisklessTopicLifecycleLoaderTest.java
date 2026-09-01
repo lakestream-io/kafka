@@ -30,7 +30,9 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -46,18 +48,18 @@ class DisklessTopicLifecycleLoaderTest {
     @BeforeEach
     void reset() {
         RecordingLifecycle.CLOSED.set(false);
-        RecordingLifecycle.registration = null;
+        RecordingLifecycle.reconciliation = null;
         RecordingLifecycle.classLoader = null;
         RecordingLifecycle.inventoryClassLoader = null;
         RecordingLifecycle.invocationClassLoader = null;
         RecordingLifecycle.closeClassLoader = null;
-        RecordingProducerStateStore.CLOSED.set(false);
-        RecordingProducerStateStore.deletedTopicId = null;
-        RecordingProducerStateStore.reconciliation = null;
-        RecordingProducerStateStore.classLoader = null;
-        RecordingProducerStateStore.inventoryClassLoader = null;
-        RecordingProducerStateStore.invocationClassLoader = null;
-        RecordingProducerStateStore.closeClassLoader = null;
+        RecordingProducerStateLifecycle.CLOSED.set(false);
+        RecordingProducerStateLifecycle.deletedTopicId = null;
+        RecordingProducerStateLifecycle.reconciliation = null;
+        RecordingProducerStateLifecycle.classLoader = null;
+        RecordingProducerStateLifecycle.inventoryClassLoader = null;
+        RecordingProducerStateLifecycle.invocationClassLoader = null;
+        RecordingProducerStateLifecycle.closeClassLoader = null;
         FailingCloseLifecycle.classLoader = null;
         FailingCloseLifecycle.FAIL_ON_CLOSE.set(true);
     }
@@ -71,10 +73,10 @@ class DisklessTopicLifecycleLoaderTest {
         try (DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(
                 config, RecordingLifecycle.class.getName())) {
             assertTrue(lifecycle.listManagedTopics().get().isEmpty());
-            lifecycle.registerTopic("orders", topicId, 3, Map.of("owner", "kafka"), 11).get();
+            lifecycle.reconcileTopic("orders", topicId, 3, Map.of("owner", "kafka"), 11).get();
         }
 
-        assertEquals("orders:" + topicId + ":3", RecordingLifecycle.registration);
+        assertEquals("orders:" + topicId + ":3", RecordingLifecycle.reconciliation);
         assertTrue(RecordingLifecycle.CLOSED.get());
         ClassLoader observedLoader = RecordingLifecycle.classLoader;
         assertSame(observedLoader, RecordingLifecycle.inventoryClassLoader);
@@ -89,26 +91,26 @@ class DisklessTopicLifecycleLoaderTest {
     }
 
     @Test
-    void testLoadsProducerStateStoreThroughSeparateSemanticSpi() throws Exception {
+    void testLoadsProducerStateLifecycleThroughSeparateSemanticSpi() throws Exception {
         UrsaStorageConfig config = ursaConfig(tempDir);
         Uuid topicId = Uuid.randomUuid();
 
-        try (DisklessProducerStateStore store = DisklessProducerStateStoreLoader.load(
-                config, RecordingProducerStateStore.class.getName())) {
+        try (DisklessProducerStateLifecycle store = DisklessProducerStateLifecycleLoader.load(
+                config, RecordingProducerStateLifecycle.class.getName())) {
             store.reconcileTopic("orders", topicId, 17).get();
             assertEquals(
-                    List.of(new DisklessProducerStateStore.ManagedProducerStateTopic(
+                    List.of(new DisklessProducerStateLifecycle.ManagedProducerStateTopic(
                             "orders", topicId, 17)),
                     store.listManagedTopics().get());
             store.deleteTopicSnapshots(topicId).get();
         }
 
-        assertEquals("orders:" + topicId + ":17", RecordingProducerStateStore.reconciliation);
-        assertEquals(topicId, RecordingProducerStateStore.deletedTopicId);
-        assertTrue(RecordingProducerStateStore.CLOSED.get());
-        assertSame(RecordingProducerStateStore.classLoader, RecordingProducerStateStore.inventoryClassLoader);
-        assertSame(RecordingProducerStateStore.classLoader, RecordingProducerStateStore.invocationClassLoader);
-        assertSame(RecordingProducerStateStore.classLoader, RecordingProducerStateStore.closeClassLoader);
+        assertEquals("orders:" + topicId + ":17", RecordingProducerStateLifecycle.reconciliation);
+        assertEquals(topicId, RecordingProducerStateLifecycle.deletedTopicId);
+        assertTrue(RecordingProducerStateLifecycle.CLOSED.get());
+        assertSame(RecordingProducerStateLifecycle.classLoader, RecordingProducerStateLifecycle.inventoryClassLoader);
+        assertSame(RecordingProducerStateLifecycle.classLoader, RecordingProducerStateLifecycle.invocationClassLoader);
+        assertSame(RecordingProducerStateLifecycle.classLoader, RecordingProducerStateLifecycle.closeClassLoader);
     }
 
     @Test
@@ -132,17 +134,17 @@ class DisklessTopicLifecycleLoaderTest {
     }
 
     @Test
-    void testLifecycleAndProducerStateStoreShareRuntimeUntilBothClose() throws Exception {
+    void testLifecycleAndProducerStateLifecycleShareRuntimeUntilBothClose() throws Exception {
         UrsaStorageConfig config = ursaConfig(tempDir);
         URL[] urls = DisklessTopicLifecycleLoader.classPathUrls(tempDir.toString());
         ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
 
         DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(
                 config, RecordingLifecycle.class.getName());
-        DisklessProducerStateStore store = DisklessProducerStateStoreLoader.load(
-                config, RecordingProducerStateStore.class.getName());
+        DisklessProducerStateLifecycle store = DisklessProducerStateLifecycleLoader.load(
+                config, RecordingProducerStateLifecycle.class.getName());
         ClassLoader sharedLoader = RecordingLifecycle.classLoader;
-        assertSame(sharedLoader, RecordingProducerStateStore.classLoader);
+        assertSame(sharedLoader, RecordingProducerStateLifecycle.classLoader);
 
         lifecycle.close();
         store.deleteTopicSnapshots(Uuid.randomUuid()).get();
@@ -186,6 +188,48 @@ class DisklessTopicLifecycleLoaderTest {
         }
     }
 
+    @Test
+    void testLazyLifecycleDoesNotLoadUntilUsedAndRetriesInitialization() throws Exception {
+        AtomicInteger loadAttempts = new AtomicInteger();
+        DisklessTopicLifecycle lifecycle = new LazyDisklessTopicLifecycle(() -> {
+            if (loadAttempts.incrementAndGet() == 1) {
+                throw new IllegalStateException("catalog unavailable");
+            }
+            return new RecordingLifecycle(null);
+        });
+
+        assertEquals(0, loadAttempts.get());
+        ExecutionException firstFailure = assertThrows(
+                ExecutionException.class,
+                () -> lifecycle.listManagedTopics().get());
+        assertTrue(firstFailure.getCause().getMessage().contains("catalog unavailable"));
+        assertTrue(lifecycle.listManagedTopics().get().isEmpty());
+        assertEquals(2, loadAttempts.get());
+        lifecycle.close();
+        assertTrue(RecordingLifecycle.CLOSED.get());
+    }
+
+    @Test
+    void testLazyProducerStateLifecycleDoesNotLoadUntilUsedAndRetriesInitialization() throws Exception {
+        AtomicInteger loadAttempts = new AtomicInteger();
+        DisklessProducerStateLifecycle store = new LazyDisklessProducerStateLifecycle(() -> {
+            if (loadAttempts.incrementAndGet() == 1) {
+                throw new IllegalStateException("oxia unavailable");
+            }
+            return new RecordingProducerStateLifecycle(null);
+        });
+
+        assertEquals(0, loadAttempts.get());
+        ExecutionException firstFailure = assertThrows(
+                ExecutionException.class,
+                () -> store.listManagedTopics().get());
+        assertTrue(firstFailure.getCause().getMessage().contains("oxia unavailable"));
+        assertTrue(store.listManagedTopics().get().isEmpty());
+        assertEquals(2, loadAttempts.get());
+        store.close();
+        assertTrue(RecordingProducerStateLifecycle.CLOSED.get());
+    }
+
     private static UrsaStorageConfig ursaConfig(Path classPath) throws Exception {
         return UrsaStorageConfig.fromConfigs(Map.of(
                 ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG, classPath.toString()));
@@ -193,7 +237,7 @@ class DisklessTopicLifecycleLoaderTest {
 
     public static final class RecordingLifecycle implements DisklessTopicLifecycle {
         static final AtomicBoolean CLOSED = new AtomicBoolean(false);
-        static volatile String registration;
+        static volatile String reconciliation;
         static volatile ClassLoader classLoader;
         static volatile ClassLoader inventoryClassLoader;
         static volatile ClassLoader invocationClassLoader;
@@ -210,19 +254,19 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
-        public CompletableFuture<Void> registerTopic(
+        public CompletableFuture<Void> reconcileTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
                 Map<String, String> properties,
                 long sourceRevision) {
-            registration = topicName + ":" + topicId + ":" + partitions;
+            reconciliation = topicName + ":" + topicId + ":" + partitions;
             invocationClassLoader = Thread.currentThread().getContextClassLoader();
             return CompletableFuture.completedFuture(null);
         }
 
         @Override
-        public CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId) {
+        public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
             return CompletableFuture.completedFuture(null);
         }
 
@@ -233,7 +277,7 @@ class DisklessTopicLifecycleLoaderTest {
         }
     }
 
-    public static final class RecordingProducerStateStore implements DisklessProducerStateStore {
+    public static final class RecordingProducerStateLifecycle implements DisklessProducerStateLifecycle {
         static final AtomicBoolean CLOSED = new AtomicBoolean(false);
         static volatile Uuid deletedTopicId;
         static volatile String reconciliation;
@@ -242,7 +286,7 @@ class DisklessTopicLifecycleLoaderTest {
         static volatile ClassLoader invocationClassLoader;
         static volatile ClassLoader closeClassLoader;
 
-        public RecordingProducerStateStore(UrsaStorageConfig config) {
+        public RecordingProducerStateLifecycle(UrsaStorageConfig config) {
             classLoader = Thread.currentThread().getContextClassLoader();
         }
 
@@ -305,7 +349,7 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
-        public CompletableFuture<Void> registerTopic(
+        public CompletableFuture<Void> reconcileTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
@@ -315,7 +359,7 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
-        public CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId) {
+        public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
             return CompletableFuture.completedFuture(null);
         }
 

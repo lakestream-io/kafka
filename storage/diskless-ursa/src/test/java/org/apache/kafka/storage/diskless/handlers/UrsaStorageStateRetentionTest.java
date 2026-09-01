@@ -27,6 +27,7 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -42,8 +43,8 @@ import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.StreamLayout;
 import io.lakestream.api.StreamMetadata;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.inOrder;
@@ -243,14 +244,14 @@ class UrsaStorageStateRetentionTest {
                         ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, 60_000L),
                 ignored -> Map.of())) {
             state.getOrCreatePartitionLog(tp);
-            state.updateTopicConfigAsync(tp, updatedConfig).get(5, TimeUnit.SECONDS);
+            state.applyTopicConfigAsync(tp.topic(), tp.topicId(), updatedConfig).get(5, TimeUnit.SECONDS);
 
             verify(logInstance).softTrim(10L);
         }
     }
 
     @Test
-    void testCleanupWaitsForSubmittedTrimBeforeClosingLeasedLog() throws Exception {
+    void testCleanupReturnsWithoutWaitingForSubmittedTrimAndClosesAfterItSettles() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("in-flight-trim", 0));
         StreamCatalog catalog = mock(StreamCatalog.class);
         Log logInstance = mock(Log.class);
@@ -291,11 +292,17 @@ class UrsaStorageStateRetentionTest {
             CompletableFuture<Boolean> cleanupFuture = CompletableFuture.supplyAsync(
                     () -> state.cleanupPartition(tp, false));
             assertTrue(trimAwaited.await(5, TimeUnit.SECONDS));
-            assertFalse(cleanupFuture.isDone());
+            assertTrue(cleanupFuture.get(5, TimeUnit.SECONDS));
+            verify(logInstance, never()).close();
+            assertThrows(IOException.class, () -> state.close(100L));
             verify(logInstance, never()).close();
 
             trimResult.complete(11L);
-            assertTrue(cleanupFuture.get(5, TimeUnit.SECONDS));
+            state.close(5_000L);
+            org.apache.kafka.test.TestUtils.waitForCondition(
+                    () -> state.retiredPartitionLogCount() == 0,
+                    5_000,
+                    "Expected Log close after the in-flight trim settled");
 
             InOrder closeOrder = inOrder(logInstance);
             closeOrder.verify(logInstance).softTrim(10L);

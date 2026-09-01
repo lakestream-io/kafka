@@ -18,7 +18,6 @@ package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.TopicIdPartition;
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.network.ListenerName;
 import org.apache.kafka.common.protocol.Errors;
@@ -161,7 +160,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
      * Updates the topic configuration in the diskless storage backend.
      * This is called when topic configs change (e.g., alter configs).
      */
-    public void updateTopicConfig(String topic, Properties config) {
+    public void applyTopicConfig(String topic, Properties config) {
         if (!enabled || engine == null || topic == null || config == null) {
             return;
         }
@@ -172,19 +171,17 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
         }
         Map<String, String> configMap = new LinkedHashMap<>();
         config.forEach((k, v) -> configMap.put(k.toString(), v.toString()));
-        engine.updateTopicConfig(
-                new TopicIdPartition(topicId, new TopicPartition(topic, 0)),
-                configMap);
+        engine.applyTopicConfig(topic, topicId, configMap);
     }
 
     /**
      * Deletes the topic configuration after the topic has been deleted.
      */
-    public void deleteTopicConfig(TopicIdPartition topicIdPartition) {
-        if (!enabled || engine == null || topicIdPartition == null) {
+    public void fenceDeletedTopic(String topicName, Uuid topicId) {
+        if (!enabled || engine == null || topicName == null || topicId == null) {
             return;
         }
-        engine.deleteTopicConfig(topicIdPartition);
+        engine.fenceDeletedTopic(topicName, topicId);
     }
 
     /**
@@ -604,11 +601,6 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             log.warn("Failed to cleanup diskless {} state for partition {}", component, tp, t);
             return false;
         }
-    }
-
-    // Visible for testing.
-    public Object getUrsaState() {
-        return engine;
     }
 
     @Override

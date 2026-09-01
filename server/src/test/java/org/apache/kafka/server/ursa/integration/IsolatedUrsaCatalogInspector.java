@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.server.ursa.integration;
 
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 
 import java.lang.reflect.Field;
@@ -28,13 +29,17 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Test-only access to the Lakestream catalog loaded inside the broker's isolated Ursa runtime.
+ * Test-only inspection of the Lakestream catalog loaded inside the broker's isolated Ursa runtime.
  *
  * <p>Lakestream API classes are plugin-private and must not be linked from the server test class
- * loader. This probe therefore reflects through the class loader that already owns the broker's
+ * loader. This inspector therefore reflects through the class loader that already owns the broker's
  * Ursa engine and exposes only JDK values to its callers.
  */
-final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
+final class IsolatedUrsaCatalogInspector implements AutoCloseable {
+    private static final String KAFKA_STREAM_IDENTITY_CLASS =
+            "org.apache.kafka.storage.diskless.handlers.KafkaStreamIdentity";
+    private static final String PRODUCER_STATE_SNAPSHOT_KEYS_CLASS =
+            "org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys";
     private static final String STREAM_CATALOG_CLASS = "io.lakestream.api.StreamCatalog";
     private static final String STREAM_CATALOG_LOADER_CLASS = "io.lakestream.api.StreamCatalogLoader";
     private static final String STREAM_IDENTIFIER_CLASS = "io.lakestream.api.StreamIdentifier";
@@ -67,17 +72,112 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
     private final Method positionFileTypeMethod;
     private boolean closed;
 
-    static IsolatedLakestreamCatalogProbe open(
+    static IsolatedUrsaCatalogInspector open(
             KafkaClusterTestKit cluster,
             String catalogUri,
             Properties properties
     ) throws Exception {
-        Object engine = cluster.brokers().values().iterator().next()
-                .replicaManager().disklessStorageSupport().getUrsaState();
-        return new IsolatedLakestreamCatalogProbe(engine, catalogUri, properties);
+        Object disklessStorageSupport = cluster.brokers().values().iterator().next()
+                .replicaManager().disklessStorageSupport();
+        Object engine = disklessStorageEngine(disklessStorageSupport);
+        return new IsolatedUrsaCatalogInspector(engine, catalogUri, properties);
     }
 
-    private IsolatedLakestreamCatalogProbe(
+    static Object disklessStorageEngine(Object disklessStorageSupport) throws Exception {
+        Field engineField = findField(disklessStorageSupport.getClass(), "engine");
+        if (engineField == null) {
+            throw new IllegalStateException("Diskless storage support does not expose its engine field");
+        }
+        engineField.setAccessible(true);
+        Object engine = engineField.get(disklessStorageSupport);
+        if (engine == null) {
+            throw new IllegalStateException("Diskless storage engine has not been initialized");
+        }
+        return engine;
+    }
+
+    static String namespace(KafkaClusterTestKit cluster) throws Exception {
+        return implementationStringConstant(cluster, KAFKA_STREAM_IDENTITY_CLASS, "NAMESPACE");
+    }
+
+    static String kafkaManagedProperty(KafkaClusterTestKit cluster) throws Exception {
+        return implementationStringConstant(
+                cluster, KAFKA_STREAM_IDENTITY_CLASS, "KAFKA_MANAGED_PROPERTY");
+    }
+
+    static String kafkaTopicNameProperty(KafkaClusterTestKit cluster) throws Exception {
+        return implementationStringConstant(
+                cluster, KAFKA_STREAM_IDENTITY_CLASS, "KAFKA_TOPIC_NAME_PROPERTY");
+    }
+
+    static String kafkaTopicIdProperty(KafkaClusterTestKit cluster) throws Exception {
+        return implementationStringConstant(
+                cluster, KAFKA_STREAM_IDENTITY_CLASS, "KAFKA_TOPIC_ID_PROPERTY");
+    }
+
+    static String kafkaSourceRevisionProperty(KafkaClusterTestKit cluster) throws Exception {
+        return implementationStringConstant(
+                cluster, KAFKA_STREAM_IDENTITY_CLASS, "KAFKA_SOURCE_REVISION_PROPERTY");
+    }
+
+    static String streamName(KafkaClusterTestKit cluster, String topicName, Uuid topicId) throws Exception {
+        return implementationStatic(
+                cluster,
+                KAFKA_STREAM_IDENTITY_CLASS,
+                "streamName",
+                new Class<?>[]{String.class, Uuid.class},
+                topicName,
+                topicId);
+    }
+
+    static String producerStateTopicIndexName(KafkaClusterTestKit cluster) throws Exception {
+        return implementationStatic(
+                cluster,
+                PRODUCER_STATE_SNAPSHOT_KEYS_CLASS,
+                "topicIndexName",
+                new Class<?>[0]);
+    }
+
+    static String producerStateTopicIndexKey(KafkaClusterTestKit cluster, String topicId) throws Exception {
+        return implementationStatic(
+                cluster,
+                PRODUCER_STATE_SNAPSHOT_KEYS_CLASS,
+                "topicIndexKey",
+                new Class<?>[]{String.class},
+                topicId);
+    }
+
+    static String producerStateSnapshotKey(
+            KafkaClusterTestKit cluster,
+            String topicId,
+            int partition
+    ) throws Exception {
+        return implementationStatic(
+                cluster,
+                PRODUCER_STATE_SNAPSHOT_KEYS_CLASS,
+                "snapshotKey",
+                new Class<?>[]{String.class, int.class},
+                topicId,
+                partition);
+    }
+
+    static String producerStateSnapshotKey(
+            KafkaClusterTestKit cluster,
+            String topicId,
+            int partition,
+            String zone
+    ) throws Exception {
+        return implementationStatic(
+                cluster,
+                PRODUCER_STATE_SNAPSHOT_KEYS_CLASS,
+                "snapshotKey",
+                new Class<?>[]{String.class, int.class, String.class},
+                topicId,
+                partition,
+                zone);
+    }
+
+    private IsolatedUrsaCatalogInspector(
             Object ursaEngine,
             String catalogUri,
             Properties properties
@@ -283,14 +383,55 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
         }
     }
 
+    private static String implementationStringConstant(
+            KafkaClusterTestKit cluster,
+            String className,
+            String fieldName
+    ) throws Exception {
+        ClassLoader implementationClassLoader = implementationClassLoader(cluster);
+        return withContextClassLoader(implementationClassLoader, () -> {
+            Class<?> implementationClass = Class.forName(className, true, implementationClassLoader);
+            return (String) implementationClass.getField(fieldName).get(null);
+        });
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T implementationStatic(
+            KafkaClusterTestKit cluster,
+            String className,
+            String methodName,
+            Class<?>[] parameterTypes,
+            Object... arguments
+    ) throws Exception {
+        ClassLoader implementationClassLoader = implementationClassLoader(cluster);
+        return withContextClassLoader(implementationClassLoader, () -> {
+            Class<?> implementationClass = Class.forName(className, true, implementationClassLoader);
+            Method method = implementationClass.getMethod(methodName, parameterTypes);
+            return (T) invoke(method, null, arguments);
+        });
+    }
+
+    private static ClassLoader implementationClassLoader(KafkaClusterTestKit cluster) throws Exception {
+        Object disklessStorageSupport = cluster.brokers().values().iterator().next()
+                .replicaManager().disklessStorageSupport();
+        return isolatedClassLoader(disklessStorageEngine(disklessStorageSupport));
+    }
+
     private static void closeResource(Object resource) throws Exception {
         ((AutoCloseable) resource).close();
     }
 
     private <T> T withContextClassLoader(CheckedSupplier<T> action) throws Exception {
+        return withContextClassLoader(classLoader, action);
+    }
+
+    private static <T> T withContextClassLoader(
+            ClassLoader contextClassLoader,
+            CheckedSupplier<T> action
+    ) throws Exception {
         Thread thread = Thread.currentThread();
         ClassLoader originalClassLoader = thread.getContextClassLoader();
-        thread.setContextClassLoader(classLoader);
+        thread.setContextClassLoader(contextClassLoader);
         try {
             return action.get();
         } finally {
@@ -307,7 +448,7 @@ final class IsolatedLakestreamCatalogProbe implements AutoCloseable {
         }
 
         ClassLoader candidate = pluginEngine.getClass().getClassLoader();
-        if (candidate == null || candidate == IsolatedLakestreamCatalogProbe.class.getClassLoader()) {
+        if (candidate == null || candidate == IsolatedUrsaCatalogInspector.class.getClassLoader()) {
             throw new IllegalStateException("Ursa engine is not loaded by an isolated class loader");
         }
         return candidate;

@@ -19,14 +19,11 @@ package org.apache.kafka.server.ursa.integration;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.TopicDescription;
-import org.apache.kafka.common.TopicIdPartition;
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.server.config.ServerLogConfigs;
-import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterAll;
@@ -57,7 +54,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  *
  * <p>Starts a real cluster with Oxia, then pauses the Oxia container to simulate unavailability.
  * Kafka topic creation must commit without waiting for Oxia, and the asynchronous diskless
- * lifecycle publisher must reconcile the committed topic into Lakestream after Oxia recovers.
+ * lifecycle reconciler must reconcile the committed topic into Lakestream after Oxia recovers.
  */
 @Timeout(value = 180, unit = TimeUnit.SECONDS)
 @Tag("integration")
@@ -106,7 +103,6 @@ public class UrsaStorageOxiaFailureE2ETest extends UrsaStorageE2ETestBase {
                 // ignore
             }
         }
-        // PLACEHOLDER_AFTER_ALL
         if (oxiaContainer != null) {
             oxiaContainer.stop();
         }
@@ -195,32 +191,30 @@ public class UrsaStorageOxiaFailureE2ETest extends UrsaStorageE2ETestBase {
             Uuid topicId,
             int expectedPartitions
     ) throws Exception {
-        TopicIdPartition topicIdPartition = new TopicIdPartition(
-                topicId,
-                new TopicPartition(topicName, 0));
-        String streamName = KafkaLogNaming.streamName(topicIdPartition);
+        String streamName = IsolatedUrsaCatalogInspector.streamName(cluster, topicName, topicId);
+        String namespace = IsolatedUrsaCatalogInspector.namespace(cluster);
 
-        try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
+        try (IsolatedUrsaCatalogInspector catalog = createCatalogInspector()) {
             TestUtils.waitForCondition(() -> {
                 if (!catalog.isStreamListed(
-                        KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS)) {
+                        namespace, streamName, 10, TimeUnit.SECONDS)) {
                     return false;
                 }
                 return catalog.partitionCount(
-                        KafkaLogNaming.NAMESPACE, streamName, 10, TimeUnit.SECONDS) == expectedPartitions;
+                        namespace, streamName, 10, TimeUnit.SECONDS) == expectedPartitions;
             }, 30_000, 100,
                     () -> "Timed out waiting for catalog stream reconciliation: "
-                            + KafkaLogNaming.NAMESPACE + "/" + streamName);
+                            + namespace + "/" + streamName);
         }
     }
 
-    private static IsolatedLakestreamCatalogProbe createCatalogProbe() throws Exception {
+    private static IsolatedUrsaCatalogInspector createCatalogInspector() throws Exception {
         String catalogUri = "oxia://" + oxiaContainer.getServiceAddress()
                 + "/" + ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
         Properties properties = new Properties();
         properties.setProperty("backendStorageType", "LOCAL");
         properties.setProperty("storagePath", baseDir.toString());
         properties.setProperty("oxiaStorageUrl", catalogUri);
-        return IsolatedLakestreamCatalogProbe.open(cluster, catalogUri, properties);
+        return IsolatedUrsaCatalogInspector.open(cluster, catalogUri, properties);
     }
 }

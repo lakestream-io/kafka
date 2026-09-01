@@ -17,6 +17,7 @@
 package org.apache.kafka.storage.diskless.idempotent;
 
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.RecordBatch;
@@ -39,6 +40,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -74,6 +76,7 @@ public class ProducerStateManager implements Closeable {
     private static final long REPLAY_MAX_BYTES_PER_READ = 1024L * 1024L;
     private static final long MAX_SNAPSHOT_VALUE_BYTES = 4L * 1024L * 1024L;
     private static final int SNAPSHOT_CLAIM_MAX_ATTEMPTS = 3;
+    private static final long CURSOR_CLOSE_RETRY_DELAY_MS = 100L;
 
     public enum RecoveryState {
         NOT_STARTED,
@@ -188,9 +191,12 @@ public class ProducerStateManager implements Closeable {
     private final int snapshotRecordThreshold;
     private final ScheduledExecutorService scheduler;
     private final boolean ownsScheduler;
+    private final String writerClaimKey;
     private volatile ScheduledFuture<?> periodicSnapshotTask;
 
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final ConcurrentHashMap<LogCursor, CompletableFuture<Void>> replayCursorCloses =
+            new ConcurrentHashMap<>();
     private final Map<Long, ProducerStateEntry> producers = new HashMap<>();
     private final List<PendingPrepareRequest> pendingPrepareRequests = new ArrayList<>();
     private CompletableFuture<Void> snapshotWriteTail = CompletableFuture.completedFuture(null);
@@ -202,6 +208,10 @@ public class ProducerStateManager implements Closeable {
     private Long ownedSnapshotVersionId;
     private boolean snapshotOwnershipLost;
     private boolean deleteSnapshotOnCleanup;
+    private CompletableFuture<Void> writerClaimAcquisition;
+    private CompletableFuture<Void> writerClaimRelease;
+    private AsyncOxiaClient writerClaimClient;
+    private boolean writerClaimHeld;
 
     private RecoveryState recoveryState = RecoveryState.NOT_STARTED;
     private boolean recoverySkippedDueToExcessiveReplay = false;
@@ -254,6 +264,8 @@ public class ProducerStateManager implements Closeable {
         this.snapshotRecordThreshold = snapshotRecordThreshold;
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler must not be null");
         this.ownsScheduler = ownsScheduler;
+        this.writerClaimKey = ProducerStateSnapshotKeys.writerClaimKey(
+                topicIdPartition.topicId().toString(), Uuid.randomUuid().toString());
         this.periodicSnapshotTask = null;
     }
 
@@ -447,7 +459,8 @@ public class ProducerStateManager implements Closeable {
         Set<PutOption> putOptions = snapshotPutOptions(
                 topicId, PutOption.IfVersionIdEquals(expectedVersionId));
 
-        return client.get(deletedTopicMarkerKey)
+        return ensureWriterClaim(client, deletedTopicMarkerKey)
+            .thenCompose(ignored -> client.get(deletedTopicMarkerKey))
             .thenCompose(markerBeforeWrite -> {
                 if (markerBeforeWrite != null) {
                     loseSnapshotOwnership(expectedVersionId);
@@ -604,18 +617,7 @@ public class ProducerStateManager implements Closeable {
                     return takeSnapshotLocked("close");
                 }
             });
-        if (ownsScheduler && scheduler != null) {
-            scheduler.shutdown();
-            try {
-                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                    scheduler.shutdownNow();
-                }
-            } catch (InterruptedException e) {
-                scheduler.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
-        }
-        return cleanupFuture.whenComplete((ignored, error) -> {
+        return releaseWriterClaimAfter(cleanupFuture).whenComplete((ignored, error) -> {
             synchronized (this) {
                 producers.clear();
                 recoveryState = RecoveryState.NOT_STARTED;
@@ -624,6 +626,9 @@ public class ProducerStateManager implements Closeable {
                 recordsSinceSnapshot = 0L;
                 snapshotRecordGeneration = 0L;
                 ownedSnapshotVersionId = null;
+            }
+            if (ownsScheduler && scheduler != null) {
+                scheduler.shutdown();
             }
         });
     }
@@ -758,12 +763,159 @@ public class ProducerStateManager implements Closeable {
         String topicId = topicIdPartition.topicId().toString();
         String snapshotKey = snapshotKey();
         String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
-        return readAndClaimSnapshot(
-                client,
-                snapshotKey,
-                deletedTopicMarkerKey,
-                topicId,
-                SNAPSHOT_CLAIM_MAX_ATTEMPTS);
+        return ensureWriterClaim(client, deletedTopicMarkerKey)
+                .thenCompose(ignored -> readAndClaimSnapshot(
+                        client,
+                        snapshotKey,
+                        deletedTopicMarkerKey,
+                        topicId,
+                        SNAPSHOT_CLAIM_MAX_ATTEMPTS));
+    }
+
+    private CompletableFuture<Void> ensureWriterClaim(
+            AsyncOxiaClient client,
+            String deletedTopicMarkerKey
+    ) {
+        synchronized (this) {
+            if (writerClaimHeld) {
+                return CompletableFuture.completedFuture(null);
+            }
+            if (writerClaimAcquisition != null) {
+                return writerClaimAcquisition;
+            }
+            writerClaimClient = client;
+            CompletableFuture<Void> acquisition = acquireWriterClaim(client, deletedTopicMarkerKey);
+            writerClaimAcquisition = acquisition;
+            acquisition.whenComplete((ignored, error) -> {
+                synchronized (this) {
+                    if (writerClaimAcquisition != acquisition) {
+                        return;
+                    }
+                    if (error == null) {
+                        writerClaimHeld = true;
+                    } else {
+                        writerClaimAcquisition = null;
+                    }
+                }
+            });
+            return acquisition;
+        }
+    }
+
+    private CompletableFuture<Void> acquireWriterClaim(
+            AsyncOxiaClient client,
+            String deletedTopicMarkerKey
+    ) {
+        return client.get(deletedTopicMarkerKey)
+                .thenCompose(markerBeforeClaim -> {
+                    if (markerBeforeClaim != null) {
+                        return CompletableFuture.failedFuture(deletedTopicException());
+                    }
+                    return client.get(writerClaimKey);
+                })
+                .thenCompose(existingClaim -> existingClaim == null
+                        ? client.put(
+                                writerClaimKey,
+                                new byte[0],
+                                Set.of(PutOption.IfRecordDoesNotExist, PutOption.AsEphemeralRecord))
+                                .thenApply(ignored -> null)
+                        : CompletableFuture.completedFuture(null))
+                .thenCompose(ignored -> verifyDeletionFenceAfterWriterClaim(
+                        client, deletedTopicMarkerKey));
+    }
+
+    private CompletableFuture<Void> verifyDeletionFenceAfterWriterClaim(
+            AsyncOxiaClient client,
+            String deletedTopicMarkerKey
+    ) {
+        CompletableFuture<GetResult> markerRead;
+        try {
+            markerRead = Objects.requireNonNull(
+                    client.get(deletedTopicMarkerKey),
+                    "Oxia deletion-fence read returned null future");
+        } catch (Throwable error) {
+            return deleteWriterClaimAfterFailure(client, error);
+        }
+        return markerRead.handle((markerAfterClaim, markerError) -> {
+            if (markerError == null && markerAfterClaim == null) {
+                return CompletableFuture.<Void>completedFuture(null);
+            }
+            Throwable failure = markerError == null
+                    ? deletedTopicException()
+                    : unwrapCompletionException(markerError);
+            return deleteWriterClaimAfterFailure(client, failure);
+        }).thenCompose(result -> result);
+    }
+
+    private CompletableFuture<Void> deleteWriterClaimAfterFailure(
+            AsyncOxiaClient client,
+            Throwable failure
+    ) {
+        return client.delete(writerClaimKey).handle((ignored, deleteError) -> {
+            if (deleteError != null) {
+                failure.addSuppressed(unwrapCompletionException(deleteError));
+            }
+            throw new CompletionException(failure);
+        });
+    }
+
+    private CompletableFuture<Void> releaseWriterClaimAfter(CompletableFuture<Void> operation) {
+        return operation.<CompletableFuture<Void>>handle((ignored, operationError) -> releaseWriterClaim()
+                        .<Void>handle((releaseIgnored, releaseError) -> {
+                            Throwable failure = operationError == null
+                                    ? null
+                                    : unwrapCompletionException(operationError);
+                            if (releaseError != null) {
+                                Throwable releaseFailure = unwrapCompletionException(releaseError);
+                                if (failure == null) {
+                                    failure = releaseFailure;
+                                } else {
+                                    failure.addSuppressed(releaseFailure);
+                                }
+                            }
+                            if (failure != null) {
+                                throw new CompletionException(failure);
+                            }
+                            return null;
+                        }))
+                .thenCompose(result -> result);
+    }
+
+    private CompletableFuture<Void> releaseWriterClaim() {
+        synchronized (this) {
+            if (writerClaimClient == null) {
+                return CompletableFuture.completedFuture(null);
+            }
+            if (writerClaimRelease != null) {
+                return writerClaimRelease;
+            }
+            AsyncOxiaClient client = writerClaimClient;
+            CompletableFuture<Void> acquisition = writerClaimAcquisition;
+            CompletableFuture<Void> release = (acquisition == null
+                    ? CompletableFuture.<Void>completedFuture(null)
+                    : acquisition.handle((ignored, error) -> null))
+                    .thenCompose(ignored -> client.delete(writerClaimKey).thenApply(deleted -> null));
+            writerClaimRelease = release;
+            release.whenComplete((ignored, error) -> {
+                synchronized (this) {
+                    if (writerClaimRelease != release) {
+                        return;
+                    }
+                    writerClaimRelease = null;
+                    if (error == null) {
+                        writerClaimHeld = false;
+                        writerClaimAcquisition = null;
+                        writerClaimClient = null;
+                    }
+                }
+            });
+            return release;
+        }
+    }
+
+    private IllegalStateException deletedTopicException() {
+        return new IllegalStateException(
+                "Producer state was permanently deleted for topic " + topicIdPartition.topicId());
     }
 
     private CompletableFuture<Void> readAndClaimSnapshot(
@@ -989,26 +1141,71 @@ public class ProducerStateManager implements Closeable {
         return logInstance.openEphemeralCursor(cursorName, cursorStartOffset)
             .thenCompose(cursor -> {
                 CompletableFuture<Void> replayFuture = new CompletableFuture<>();
+                CompletableFuture<Void> result = new CompletableFuture<>();
                 AtomicInteger replayEntries = new AtomicInteger();
                 replayFuture.whenComplete((__, error) -> {
-                    try {
-                        cursor.close();
-                    } catch (Exception e) {
-                        log.warn("[{}] Failed to close replay cursor", topicIdPartition, e);
-                    }
-                    if (error != null) {
-                        log.warn("[{}] Failed to replay producer state from log", topicIdPartition, error);
-                    } else {
-                        if (replayEntries.get() > 0) {
-                            takeSnapshotAsync("replay");
+                    closeReplayCursor(cursor).whenComplete((closeIgnored, closeError) -> {
+                        if (error != null) {
+                            log.warn("[{}] Failed to replay producer state from log", topicIdPartition, error);
+                            result.completeExceptionally(error);
+                        } else if (closeError != null) {
+                            result.completeExceptionally(closeError);
+                        } else {
+                            if (replayEntries.get() > 0) {
+                                takeSnapshotAsync("replay");
+                            }
+                            log.info("[{}] Finished replaying producer state from log, replayed {} entries",
+                                topicIdPartition, replayEntries.get());
+                            result.complete(null);
                         }
-                        log.info("[{}] Finished replaying producer state from log, replayed {} entries",
-                            topicIdPartition, replayEntries.get());
-                    }
+                    });
                 });
                 scheduleNextReplayRead(cursor, endOffset, hasNoSnapshot, replayEntries, replayFuture);
-                return replayFuture;
+                return result;
             });
+    }
+
+    private CompletableFuture<Void> closeReplayCursor(LogCursor cursor) {
+        CompletableFuture<Void> closeDrain = new CompletableFuture<>();
+        CompletableFuture<Void> existing = replayCursorCloses.putIfAbsent(cursor, closeDrain);
+        if (existing != null) {
+            return existing;
+        }
+        closeDrain.whenComplete((ignored, error) -> replayCursorCloses.remove(cursor, closeDrain));
+        scheduleReplayCursorClose(cursor, closeDrain, false);
+        return closeDrain;
+    }
+
+    private void scheduleReplayCursorClose(
+            LogCursor cursor,
+            CompletableFuture<Void> closeDrain,
+            boolean delayed) {
+        if (closeDrain.isDone()) {
+            return;
+        }
+        Runnable closeTask = () -> {
+            try {
+                cursor.close();
+                closeDrain.complete(null);
+            } catch (Throwable closeError) {
+                log.warn("[{}] Failed to close replay cursor; retaining it for retry",
+                        topicIdPartition, closeError);
+                scheduleReplayCursorClose(cursor, closeDrain, true);
+            }
+        };
+        try {
+            if (delayed) {
+                scheduler.schedule(closeTask, CURSOR_CLOSE_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
+            } else {
+                scheduler.execute(closeTask);
+            }
+        } catch (RuntimeException scheduleError) {
+            log.warn("[{}] Failed to schedule replay cursor close; retaining it for retry",
+                    topicIdPartition, scheduleError);
+            CompletableFuture.delayedExecutor(
+                    CURSOR_CLOSE_RETRY_DELAY_MS,
+                    TimeUnit.MILLISECONDS).execute(closeTask);
+        }
     }
 
     private void asyncReplayEntries(LogCursor cursor,

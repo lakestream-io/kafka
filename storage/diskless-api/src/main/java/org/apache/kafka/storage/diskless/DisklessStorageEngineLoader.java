@@ -29,10 +29,7 @@ import java.util.function.Function;
 
 public final class DisklessStorageEngineLoader {
 
-    private static final String DEFAULT_URSA_STORAGE_DIR = "ursa-storage";
-    private static final String URSA_ENGINE_CLASS =
-            "org.apache.kafka.storage.diskless.handlers.UrsaStorageEngineImpl";
-
+    private static final String DEFAULT_DISKLESS_STORAGE_DIR = "ursa-storage";
     private DisklessStorageEngineLoader() {
     }
 
@@ -43,14 +40,19 @@ public final class DisklessStorageEngineLoader {
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier) {
-        return load(
-                time,
-                brokerId,
+        DisklessStorageProvider.StorageEngineContext context =
+                new DisklessStorageProvider.StorageEngineContext(
+                        time,
+                        brokerId,
+                        ursaConfig,
+                        brokerTopicStats,
+                        logConfigDefaults,
+                        topicConfigSupplier);
+        return DisklessStorageProviderLoader.load(
                 ursaConfig,
-                brokerTopicStats,
-                logConfigDefaults,
-                topicConfigSupplier,
-                URSA_ENGINE_CLASS);
+                "storage engine",
+                provider -> provider.createStorageEngine(context),
+                LeasedDisklessStorageEngine::new);
     }
 
     static DisklessStorageEngine load(
@@ -91,14 +93,14 @@ public final class DisklessStorageEngineLoader {
                 throw rethrow(t);
             }
         } catch (Exception e) {
-            throw new KafkaException("Failed to load Ursa diskless storage engine", e);
+            throw new KafkaException("Failed to load diskless storage engine", e);
         }
     }
 
     static URL[] classPathUrls(String configuredClassPath) throws Exception {
         String classPath = KafkaPluginClassPaths.configuredOrDefault(
                 configuredClassPath,
-                DEFAULT_URSA_STORAGE_DIR,
+                DEFAULT_DISKLESS_STORAGE_DIR,
                 DisklessStorageEngineLoader.class);
         return KafkaPluginClassPaths.toUrls(classPath);
     }
@@ -110,6 +112,6 @@ public final class DisklessStorageEngineLoader {
         if (t instanceof Error error) {
             throw error;
         }
-        return new KafkaException("Failed to load Ursa diskless storage engine", t);
+        return new KafkaException("Failed to load diskless storage engine", t);
     }
 }

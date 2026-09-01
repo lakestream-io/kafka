@@ -16,8 +16,6 @@
  */
 package org.apache.kafka.storage.diskless.handlers;
 
-import org.apache.kafka.common.TopicIdPartition;
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.storage.diskless.DisklessTopicLifecycle;
 
@@ -55,7 +53,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
 
     @Override
     public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
-        return catalog.listStreamEntries(KafkaLogNaming.NAMESPACE)
+        return catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE)
                 .thenApply(entries -> entries.stream()
                         .map(entry -> managedTopic(entry.identifier(), entry.properties()))
                         .filter(Objects::nonNull)
@@ -63,7 +61,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     }
 
     @Override
-    public CompletableFuture<Void> registerTopic(
+    public CompletableFuture<Void> reconcileTopic(
             String topicName,
             Uuid topicId,
             int partitions,
@@ -74,7 +72,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
                     new IllegalArgumentException("partitions must be at least 1"));
         }
         StreamIdentifier identifier = streamIdentifier(topicName, topicId);
-        Map<String, String> propertySnapshot = KafkaLogNaming.streamProperties(
+        Map<String, String> propertySnapshot = KafkaStreamIdentity.streamProperties(
                 topicName, topicId, properties, sourceRevision);
         return loadOrCreate(identifier, partitions, propertySnapshot)
                 .thenCompose(metadata -> reconcileStream(
@@ -82,7 +80,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     }
 
     @Override
-    public CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId) {
+    public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
         return catalog.dropStream(streamIdentifier(topicName, topicId), true).thenApply(ignored -> null);
     }
 
@@ -140,12 +138,12 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     private static ManagedTopic managedTopic(
             StreamIdentifier identifier,
             Map<String, String> properties) {
-        if (!"true".equals(properties.get(KafkaLogNaming.KAFKA_MANAGED_PROPERTY))) {
+        if (!"true".equals(properties.get(KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY))) {
             return null;
         }
-        String topicName = properties.get(KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY);
-        String topicIdValue = properties.get(KafkaLogNaming.KAFKA_TOPIC_ID_PROPERTY);
-        String sourceRevisionValue = properties.get(KafkaLogNaming.KAFKA_SOURCE_REVISION_PROPERTY);
+        String topicName = properties.get(KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY);
+        String topicIdValue = properties.get(KafkaStreamIdentity.KAFKA_TOPIC_ID_PROPERTY);
+        String sourceRevisionValue = properties.get(KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY);
         if (topicName == null || topicName.isBlank()
                 || topicIdValue == null || topicIdValue.isBlank()
                 || sourceRevisionValue == null || sourceRevisionValue.isBlank()) {
@@ -181,9 +179,8 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     static StreamIdentifier streamIdentifier(String topicName, Uuid topicId) {
         Objects.requireNonNull(topicName, "topicName must not be null");
         Objects.requireNonNull(topicId, "topicId must not be null");
-        TopicIdPartition topicIdPartition = new TopicIdPartition(
-                topicId, new TopicPartition(topicName, 0));
         return StreamIdentifier.of(
-                KafkaLogNaming.NAMESPACE, KafkaLogNaming.streamName(topicIdPartition));
+                KafkaStreamIdentity.NAMESPACE,
+                KafkaStreamIdentity.streamName(topicName, topicId));
     }
 }

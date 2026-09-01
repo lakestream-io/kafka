@@ -1,7 +1,7 @@
 Diskless Storage Docker Setup
 ==============================
 
-This directory contains Docker Compose configuration for running Kafka with **Diskless/Ursa Storage** - a tiered storage solution that stores data in remote S3-compatible storage instead of local disks.
+This directory contains Docker Compose configuration for running Kafka with **Diskless/Ursa Storage**. For enabled topics, Ursa is the primary storage layer rather than a tier that sits behind Kafka's local log.
 
 ## Architecture
 
@@ -23,7 +23,7 @@ This directory contains Docker Compose configuration for running Kafka with **Di
 ```
 
 - **Oxia**: Distributed metadata store for producer state persistence
-- **MinIO**: S3-compatible object storage for log segments
+- **MinIO**: S3-compatible object storage for Ursa WAL and compacted objects
 - **Kafka Brokers**: 3-node cluster with diskless storage enabled
 
 ## Prerequisites
@@ -152,7 +152,7 @@ mvn -B -ntp -pl ursa-storage-compact -am -DskipTests clean package
 
 # From the Kafka repository:
 docker build -t ursa-compact:standalone-s3-e2e \
-  -f docker/examples/docker-compose-files/cluster/ursa/ursa-compact-ue.Dockerfile \
+  -f docker/examples/docker-compose-files/cluster/ursa/ursa-compactor.Dockerfile \
   </path/to/ursa-storage>
 ```
 
@@ -309,7 +309,7 @@ Access the MinIO console at http://localhost:19001
 - **Username**: minioadmin
 - **Password**: minioadmin
 
-You can browse the `kafka-ursa` bucket to see stored log segments.
+You can browse the `kafka-ursa` bucket to see Ursa WAL and compacted objects.
 
 ## Configuration
 

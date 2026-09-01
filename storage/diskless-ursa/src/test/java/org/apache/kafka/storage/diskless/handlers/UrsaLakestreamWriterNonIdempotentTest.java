@@ -46,6 +46,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import io.lakestream.api.Log;
 import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.exception.LogFencedException;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.netty.buffer.ByteBuf;
 
@@ -60,6 +61,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -79,7 +81,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
         partitionLog.close();
 
         verify(logInstance, never()).fence();
-        verify(logInstance).close();
+        verify(logInstance, timeout(5_000)).close();
     }
 
     @Test
@@ -179,7 +181,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
 
         verify(replacementLog, never()).fence();
         verify(staleLog, never()).fence();
-        verify(staleLog).close();
+        verify(staleLog, timeout(5_000)).close();
 
         replacementPartitionLog.close();
     }
@@ -398,7 +400,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
         TopicIdPartition tp = testTopicPartition();
         Log logInstance = mock(Log.class);
         when(logInstance.append(anyInt(), any(ByteBuf.class)))
-                .thenReturn(CompletableFuture.failedFuture(new IllegalStateException("stream 17 is fenced")));
+                .thenReturn(CompletableFuture.failedFuture(new LogFencedException("stream 17 is fenced")));
 
         UrsaStorageState state = mock(UrsaStorageState.class);
         UrsaPartitionLog partitionLog = attachPartitionLog(state, tp, logInstance);
@@ -413,7 +415,32 @@ class UrsaLakestreamWriterNonIdempotentTest {
             assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, response.error);
             verify(state).removePartitionLog(eq(tp), same(partitionLog));
             verify(logInstance, never()).fence();
-            verify(logInstance).close();
+            verify(logInstance, timeout(5_000)).close();
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void testUnrelatedClosedFailureDoesNotInvalidatePartitionLog() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        when(logInstance.append(anyInt(), any(ByteBuf.class)))
+                .thenReturn(CompletableFuture.failedFuture(
+                        new ChannelClosedException("storage channel closed")));
+
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        UrsaPartitionLog partitionLog = attachPartitionLog(state, tp, logInstance);
+        UrsaLakestreamWriter writer = new UrsaLakestreamWriter(state);
+        MemoryRecords records = MemoryRecords.withRecords(
+                Compression.NONE,
+                new SimpleRecord("a".getBytes(StandardCharsets.UTF_8)));
+
+        try {
+            PartitionResponse response = writer.write(Map.of(tp, records), DisklessClientZone.NO_ZONE)
+                    .get(5, TimeUnit.SECONDS).get(tp);
+            assertEquals(Errors.KAFKA_STORAGE_ERROR, response.error);
+            verify(state, never()).removePartitionLog(eq(tp), same(partitionLog));
         } finally {
             writer.close();
         }
@@ -461,6 +488,14 @@ class UrsaLakestreamWriterNonIdempotentTest {
         UrsaStorageState state = mock(UrsaStorageState.class);
         attachPartitionLog(state, tp, logInstance);
         return state;
+    }
+
+    private static final class ChannelClosedException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        private ChannelClosedException(String message) {
+            super(message);
+        }
     }
 
     private static UrsaPartitionLog attachPartitionLog(

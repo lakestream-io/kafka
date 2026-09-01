@@ -22,8 +22,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
-/** Kafka-owned producer-state persistence operations needed by the controller. */
-public interface DisklessProducerStateStore extends AutoCloseable {
+/** Controller-side lifecycle operations for Kafka-owned producer-state snapshots. */
+public interface DisklessProducerStateLifecycle extends AutoCloseable {
 
     /**
      * A Kafka topic incarnation whose producer-state snapshots are durably owned by this store.
@@ -31,7 +31,7 @@ public interface DisklessProducerStateStore extends AutoCloseable {
      * <p>The source revision is the KRaft metadata revision last reconciled into the ownership
      * manifest. A controller must not delete an inventory entry until its metadata image has
      * reached at least this revision. This guards against a newly elected, lagging controller
-     * deleting producer state created from a newer image. A terminal deletion journal can use
+     * deleting producer state created from a newer image. An active cleanup journal can use
      * revision zero when its active manifest was absent or corrupt: its permanent deletion fence,
      * rather than that fallback revision, establishes that the topic incarnation cannot be live.
      */
@@ -62,12 +62,11 @@ public interface DisklessProducerStateStore extends AutoCloseable {
     CompletableFuture<Void> reconcileTopic(String topicName, Uuid topicId, long sourceRevision);
 
     /**
-     * Lists every topic incarnation with a durable producer-state ownership record.
+     * Lists every topic incarnation with an active producer-state ownership or cleanup record.
      *
-     * <p>This includes permanent-deletion journals. Keeping deleted incarnations enumerable is
-     * required because a writer that passed its first deletion-fence read can publish one final
-     * snapshot before observing the fence. A later inventory pass must still be able to discover
-     * and remove that snapshot after either process crashes.
+     * <p>An interrupted deletion remains enumerable through its active cleanup journal. A
+     * completed deletion keeps only its permanent fence, which is deliberately excluded from
+     * inventory so historical topic incarnations do not make every reconciliation scan grow.
      */
     CompletableFuture<List<ManagedProducerStateTopic>> listManagedTopics();
 
@@ -75,9 +74,10 @@ public interface DisklessProducerStateStore extends AutoCloseable {
      * Permanently fences one Kafka topic incarnation and deletes all of its producer snapshots.
      *
      * <p>The durable deletion fence remains after cleanup, so the same immutable Kafka topic ID
-     * can never recreate producer state. Before the active ownership manifest is removed, it is
-     * moved into the durable deletion journal. Repeated calls are therefore able to clean a late
-     * snapshot left by a writer that crashed before its post-write fence check.
+     * can never recreate producer state. The implementation first persists an active cleanup
+     * journal, then installs the fence and waits for ephemeral writer claims to drain before
+     * deleting snapshots and the ownership manifest. The cleanup journal is removed only after
+     * cleanup completes, so an interrupted deletion remains discoverable and retryable.
      */
     CompletableFuture<Void> deleteTopicSnapshots(Uuid topicId);
 }

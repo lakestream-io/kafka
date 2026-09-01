@@ -17,6 +17,7 @@
 package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.ProduceResponse;
@@ -275,6 +276,7 @@ class DisklessStorageEngineLoaderTest {
                 package plugin;
 
                 import org.apache.kafka.common.TopicIdPartition;
+                import org.apache.kafka.common.Uuid;
                 import org.apache.kafka.common.record.internal.MemoryRecords;
                 import org.apache.kafka.common.requests.FetchRequest;
                 import org.apache.kafka.common.requests.ProduceResponse;
@@ -331,6 +333,16 @@ class DisklessStorageEngineLoaderTest {
                     public boolean cleanupPartition(TopicIdPartition tp, boolean deletePartition) {
                         requirePluginResource("cleanupPartition");
                         return true;
+                    }
+
+                    @Override
+                    public void applyTopicConfig(String topicName, Uuid topicId, Map<String, String> config) {
+                        requirePluginResource("applyTopicConfig");
+                    }
+
+                    @Override
+                    public void fenceDeletedTopic(String topicName, Uuid topicId) {
+                        requirePluginResource("fenceDeletedTopic");
                     }
 
                     @Override
@@ -408,6 +420,14 @@ class DisklessStorageEngineLoaderTest {
         @Override
         public boolean cleanupPartition(TopicIdPartition tp, boolean deletePartition) {
             return false;
+        }
+
+        @Override
+        public void applyTopicConfig(String topicName, Uuid topicId, Map<String, String> config) {
+        }
+
+        @Override
+        public void fenceDeletedTopic(String topicName, Uuid topicId) {
         }
 
         @Override

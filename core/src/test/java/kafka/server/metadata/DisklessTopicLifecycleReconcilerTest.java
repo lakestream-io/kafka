@@ -43,8 +43,8 @@ import org.apache.kafka.image.loader.LoaderManifestType;
 import org.apache.kafka.metadata.LeaderRecoveryState;
 import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.raft.LeaderAndEpoch;
-import org.apache.kafka.storage.diskless.DisklessProducerStateStore;
-import org.apache.kafka.storage.diskless.DisklessProducerStateStore.ManagedProducerStateTopic;
+import org.apache.kafka.storage.diskless.DisklessProducerStateLifecycle;
+import org.apache.kafka.storage.diskless.DisklessProducerStateLifecycle.ManagedProducerStateTopic;
 import org.apache.kafka.storage.diskless.DisklessTopicLifecycle;
 import org.apache.kafka.storage.diskless.DisklessTopicLifecycle.ManagedTopic;
 import org.apache.kafka.test.TestUtils;
@@ -65,9 +65,9 @@ import java.util.function.IntFunction;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class DisklessTopicLifecyclePublisherTest {
+class DisklessTopicLifecycleReconcilerTest {
 
-    private record Registration(
+    private record Reconciliation(
             String topicName,
             Uuid topicId,
             int partitions,
@@ -76,16 +76,15 @@ class DisklessTopicLifecyclePublisherTest {
     }
 
     private static final class RecordingLifecycle implements DisklessTopicLifecycle {
-        final List<String> registeredTopics = new CopyOnWriteArrayList<>();
-        final List<Registration> registrations = new CopyOnWriteArrayList<>();
-        final List<String> unregisteredTopics = new CopyOnWriteArrayList<>();
-        final AtomicInteger registerAttempts = new AtomicInteger();
-        final AtomicInteger unregisterAttempts = new AtomicInteger();
+        final List<Reconciliation> reconciliations = new CopyOnWriteArrayList<>();
+        final List<String> deletedTopics = new CopyOnWriteArrayList<>();
+        final AtomicInteger reconcileAttempts = new AtomicInteger();
+        final AtomicInteger deleteAttempts = new AtomicInteger();
         final AtomicInteger listAttempts = new AtomicInteger();
         IntFunction<CompletableFuture<List<ManagedTopic>>> listBehavior =
                 attempt -> CompletableFuture.completedFuture(List.of());
-        IntFunction<CompletableFuture<Void>> registerBehavior = attempt -> CompletableFuture.completedFuture(null);
-        IntFunction<CompletableFuture<Void>> unregisterBehavior = attempt -> CompletableFuture.completedFuture(null);
+        IntFunction<CompletableFuture<Void>> reconcileBehavior = attempt -> CompletableFuture.completedFuture(null);
+        IntFunction<CompletableFuture<Void>> deleteBehavior = attempt -> CompletableFuture.completedFuture(null);
 
         @Override
         public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
@@ -93,22 +92,21 @@ class DisklessTopicLifecyclePublisherTest {
         }
 
         @Override
-        public CompletableFuture<Void> registerTopic(
+        public CompletableFuture<Void> reconcileTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
                 Map<String, String> properties,
                 long sourceRevision) {
-            registeredTopics.add(topicName + ":" + topicId + ":" + partitions);
-            registrations.add(new Registration(
+            reconciliations.add(new Reconciliation(
                     topicName, topicId, partitions, Map.copyOf(properties), sourceRevision));
-            return registerBehavior.apply(registerAttempts.incrementAndGet());
+            return reconcileBehavior.apply(reconcileAttempts.incrementAndGet());
         }
 
         @Override
-        public CompletableFuture<Void> unregisterTopic(String topicName, Uuid topicId) {
-            unregisteredTopics.add(topicName + ":" + topicId);
-            return unregisterBehavior.apply(unregisterAttempts.incrementAndGet());
+        public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
+            deletedTopics.add(topicName + ":" + topicId);
+            return deleteBehavior.apply(deleteAttempts.incrementAndGet());
         }
 
         @Override
@@ -116,7 +114,7 @@ class DisklessTopicLifecyclePublisherTest {
         }
     }
 
-    private static final class RecordingProducerStateStore implements DisklessProducerStateStore {
+    private static final class RecordingProducerStateLifecycle implements DisklessProducerStateLifecycle {
         final List<ManagedProducerStateTopic> reconciledTopics = new CopyOnWriteArrayList<>();
         final List<String> deletedTopics = new CopyOnWriteArrayList<>();
         final AtomicInteger listAttempts = new AtomicInteger();
@@ -168,9 +166,9 @@ class DisklessTopicLifecyclePublisherTest {
                 AclsImage.EMPTY, ScramImage.EMPTY, DelegationTokenImage.EMPTY);
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
 
         MetadataDelta delta = new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build();
         delta.replay(new TopicRecord().setName(disklessTopic).setTopicId(topicId));
@@ -179,24 +177,24 @@ class DisklessTopicLifecyclePublisherTest {
         }
         delta.replay(disklessConfigRecord(disklessTopic));
 
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
-        assertTrue(lifecycle.registeredTopics.isEmpty(), "No registration expected before becoming leader");
-        assertTrue(lifecycle.unregisteredTopics.isEmpty(), "No cleanup expected before becoming leader");
-        assertTrue(producerStateStore.deletedTopics.isEmpty(), "No calls expected before becoming leader");
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        assertTrue(lifecycle.reconciliations.isEmpty(), "No reconciliation expected before becoming leader");
+        assertTrue(lifecycle.deletedTopics.isEmpty(), "No cleanup expected before becoming leader");
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty(), "No calls expected before becoming leader");
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 1,
-                5_000, "Expected full image registration after becoming leader");
+                () -> lifecycle.reconciliations.size() == 1,
+                5_000, "Expected full image reconciliation after becoming leader");
         assertEquals(
-                new Registration(
+                new Reconciliation(
                         disklessTopic,
                         topicId,
                         partitions,
                         Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true"),
                         10),
-                lifecycle.registrations.get(0));
-        publisher.close();
+                lifecycle.reconciliations.get(0));
+        reconciler.close();
     }
 
     @Test
@@ -217,25 +215,25 @@ class DisklessTopicLifecyclePublisherTest {
         lifecycle.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
                 new ManagedTopic(currentTopic, currentTopicId, 10),
                 new ManagedTopic(orphanTopic, orphanTopicId, 10)));
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onMetadataUpdate(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(orphanTopicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(orphanTopicId.toString()),
                 5_000,
                 "Expected cold-start reconciliation to delete the Catalog orphan");
-        assertEquals(List.of(orphanTopic + ":" + orphanTopicId), lifecycle.unregisteredTopics);
-        assertEquals(List.of(orphanTopicId.toString()), producerStateStore.deletedTopics);
-        assertTrue(lifecycle.unregisteredTopics.stream()
+        assertEquals(List.of(orphanTopic + ":" + orphanTopicId), lifecycle.deletedTopics);
+        assertEquals(List.of(orphanTopicId.toString()), producerStateLifecycle.deletedTopics);
+        assertTrue(lifecycle.deletedTopics.stream()
                 .noneMatch(topic -> topic.endsWith(currentTopicId.toString())));
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -244,25 +242,25 @@ class DisklessTopicLifecyclePublisherTest {
         Uuid orphanTopicId = Uuid.randomUuid();
         MetadataImage image = emptyImage(10);
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
                 new ManagedProducerStateTopic(orphanTopic, orphanTopicId, 10)));
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onMetadataUpdate(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(orphanTopicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(orphanTopicId.toString()),
                 5_000,
                 "Expected cold-start reconciliation to delete orphan producer state");
-        assertTrue(lifecycle.unregisteredTopics.isEmpty(),
+        assertTrue(lifecycle.deletedTopics.isEmpty(),
                 "A producer-state-only orphan must not fabricate a Catalog deletion");
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -270,13 +268,13 @@ class DisklessTopicLifecyclePublisherTest {
         String topicName = "newer-producer-state-topic";
         Uuid topicId = Uuid.randomUuid();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
                 new ManagedProducerStateTopic(topicName, topicId, 11)));
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 (message, cause) -> { },
                 10,
                 100,
@@ -284,30 +282,30 @@ class DisklessTopicLifecyclePublisherTest {
                 10,
                 1_000);
         MetadataImage staleImage = emptyImage(10);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 staleImage,
                 loaderManifest(staleImage.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.listAttempts.get() == 1,
+                () -> producerStateLifecycle.listAttempts.get() == 1,
                 5_000,
                 "Expected producer-state inventory for the stale image");
-        assertTrue(producerStateStore.deletedTopics.isEmpty(),
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty(),
                 "A lagging controller must not delete producer state from a newer revision");
 
         MetadataImage caughtUpImage = emptyImage(11);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(staleImage).build(),
                 caughtUpImage,
                 loaderManifest(caughtUpImage.provenance()));
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(topicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(topicId.toString()),
                 5_000,
                 "Expected cleanup after the controller reaches the producer-state source revision");
-        assertTrue(lifecycle.unregisteredTopics.isEmpty());
-        publisher.close();
+        assertTrue(lifecycle.deletedTopics.isEmpty());
+        reconciler.close();
     }
 
     @Test
@@ -322,38 +320,38 @@ class DisklessTopicLifecyclePublisherTest {
                 ClientQuotasImage.EMPTY, ProducerIdsImage.EMPTY,
                 AclsImage.EMPTY, ScramImage.EMPTY, DelegationTokenImage.EMPTY);
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
                 new ManagedProducerStateTopic(topicName, topicId, 10)));
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onMetadataUpdate(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 1
-                        && producerStateStore.listAttempts.get() == 1,
+                () -> lifecycle.reconcileAttempts.get() == 1
+                        && producerStateLifecycle.listAttempts.get() == 1,
                 5_000,
-                "Expected registration and producer-state inventory");
-        assertTrue(producerStateStore.deletedTopics.isEmpty());
-        assertTrue(lifecycle.unregisteredTopics.isEmpty());
-        publisher.close();
+                "Expected reconciliation and producer-state inventory");
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty());
+        assertTrue(lifecycle.deletedTopics.isEmpty());
+        reconciler.close();
     }
 
     @Test
-    void testProducerStateManifestCompletesBeforeCatalogRegistration() throws Exception {
+    void testProducerStateManifestCompletesBeforeCatalogReconciliation() throws Exception {
         String topicName = "manifest-first-topic";
         Uuid topicId = Uuid.randomUuid();
         CompletableFuture<Void> pendingManifest = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.reconcileBehavior = attempt -> pendingManifest;
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.reconcileBehavior = attempt -> pendingManifest;
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         MetadataDelta delta = topicCreationDelta(
                 MetadataImage.EMPTY,
                 topicName,
@@ -362,42 +360,42 @@ class DisklessTopicLifecyclePublisherTest {
                 Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true"));
         MetadataImage image = delta.apply(new MetadataProvenance(10, 0, 0, true));
 
-        publisher.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.reconcileAttempts.get() == 1,
+                () -> producerStateLifecycle.reconcileAttempts.get() == 1,
                 5_000,
                 "Expected producer-state manifest reconciliation");
-        assertEquals(0, lifecycle.registerAttempts.get(),
-                "Catalog registration must wait for the durable producer-state manifest");
+        assertEquals(0, lifecycle.reconcileAttempts.get(),
+                "Catalog reconciliation must wait for the durable producer-state manifest");
         pendingManifest.complete(null);
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 1,
+                () -> lifecycle.reconcileAttempts.get() == 1,
                 5_000,
-                "Expected Catalog registration after the manifest becomes durable");
-        publisher.close();
+                "Expected Catalog reconciliation after the manifest becomes durable");
+        reconciler.close();
     }
 
     @Test
     void testCloseCancelsHungProducerStateInventory() throws Exception {
         CompletableFuture<List<ManagedProducerStateTopic>> hungInventory = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.listBehavior = attempt -> hungInventory;
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.listBehavior = attempt -> hungInventory;
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
         MetadataImage image = emptyImage(10);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         TestUtils.waitForCondition(
-                () -> producerStateStore.listAttempts.get() == 1,
+                () -> producerStateLifecycle.listAttempts.get() == 1,
                 5_000,
                 "Expected a producer-state inventory attempt");
 
-        publisher.close();
+        reconciler.close();
 
         assertTrue(hungInventory.isCancelled(),
                 "Close must cancel a hung producer-state inventory");
@@ -415,15 +413,15 @@ class DisklessTopicLifecyclePublisherTest {
         lifecycle.listBehavior = attempt -> attempt == 1
                 ? oldImageInventory
                 : newerImageInventory;
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
         MetadataImage initialImage = emptyImage(0);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 initialImage,
                 loaderManifest(initialImage.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         TestUtils.waitForCondition(
                 () -> lifecycle.listAttempts.get() == 1,
                 5_000,
@@ -436,7 +434,7 @@ class DisklessTopicLifecyclePublisherTest {
                 1,
                 Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true"));
         MetadataImage createdImage = creationDelta.apply(new MetadataProvenance(1, 0, 0, true));
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 creationDelta,
                 createdImage,
                 loaderManifest(createdImage.provenance()));
@@ -447,22 +445,22 @@ class DisklessTopicLifecyclePublisherTest {
                 5_000,
                 "Expected stale result to trigger inventory against the newer image");
         newerImageInventory.complete(List.of(new ManagedTopic(topicName, topicId, 1)));
-        assertTrue(lifecycle.unregisteredTopics.isEmpty(), "Stale inventory must not delete a current topic");
-        assertTrue(producerStateStore.deletedTopics.isEmpty());
-        publisher.close();
+        assertTrue(lifecycle.deletedTopics.isEmpty(), "Stale inventory must not delete a current topic");
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty());
+        reconciler.close();
     }
 
     @Test
-    void testUnrelatedMetadataRevisionDoesNotReregisterEveryDisklessTopic() throws Exception {
+    void testUnrelatedMetadataRevisionDoesNotReconcileEveryDisklessTopic() throws Exception {
         String topicName = "stable-topic";
         Uuid topicId = Uuid.randomUuid();
         CompletableFuture<List<ManagedTopic>> firstInventory = new CompletableFuture<>();
         CompletableFuture<List<ManagedTopic>> secondInventory = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
         lifecycle.listBehavior = attempt -> attempt == 1 ? firstInventory : secondInventory;
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         MetadataDelta creationDelta = topicCreationDelta(
                 MetadataImage.EMPTY,
@@ -471,18 +469,18 @@ class DisklessTopicLifecyclePublisherTest {
                 1,
                 Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true"));
         MetadataImage createdImage = creationDelta.apply(new MetadataProvenance(1, 0, 0, true));
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 creationDelta,
                 createdImage,
                 loaderManifest(createdImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 1 && lifecycle.listAttempts.get() == 1,
+                () -> lifecycle.reconciliations.size() == 1 && lifecycle.listAttempts.get() == 1,
                 5_000,
-                "Expected initial registration and inventory");
+                "Expected initial reconciliation and inventory");
 
         MetadataDelta unrelatedDelta = new MetadataDelta.Builder().setImage(createdImage).build();
         MetadataImage unrelatedImage = unrelatedDelta.apply(new MetadataProvenance(2, 0, 0, true));
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 unrelatedDelta,
                 unrelatedImage,
                 loaderManifest(unrelatedImage.provenance()));
@@ -493,10 +491,10 @@ class DisklessTopicLifecyclePublisherTest {
                 "Expected inventory to restart against the newer image");
         secondInventory.complete(List.of(new ManagedTopic(topicName, topicId, 1)));
 
-        assertEquals(1, lifecycle.registrations.size(),
+        assertEquals(1, lifecycle.reconciliations.size(),
                 "An unrelated image revision must not rewrite every Catalog topic");
-        assertEquals(1, lifecycle.registrations.get(0).sourceRevision());
-        publisher.close();
+        assertEquals(1, lifecycle.reconciliations.get(0).sourceRevision());
+        reconciler.close();
     }
 
     @Test
@@ -507,35 +505,35 @@ class DisklessTopicLifecyclePublisherTest {
         RecordingLifecycle lifecycle = new RecordingLifecycle();
         lifecycle.listBehavior = attempt -> CompletableFuture.completedFuture(List.of(
                 new ManagedTopic(topicName, topicId, 11)));
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onMetadataUpdate(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 staleImage,
                 loaderManifest(staleImage.provenance()));
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         assertEquals(1, lifecycle.listAttempts.get());
-        assertTrue(lifecycle.unregisteredTopics.isEmpty(),
+        assertTrue(lifecycle.deletedTopics.isEmpty(),
                 "A lagging controller must not delete Catalog state from a newer KRaft revision");
-        assertTrue(producerStateStore.deletedTopics.isEmpty());
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty());
 
         MetadataImage caughtUpImage = emptyImage(11);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(staleImage).build(),
                 caughtUpImage,
                 loaderManifest(caughtUpImage.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(topicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(topicId.toString()),
                 5_000,
                 "Expected deletion once the controller image reaches the Catalog source revision");
-        assertEquals(List.of(topicName + ":" + topicId), lifecycle.unregisteredTopics);
-        publisher.close();
+        assertEquals(List.of(topicName + ":" + topicId), lifecycle.deletedTopics);
+        reconciler.close();
     }
 
     @Test
@@ -553,40 +551,40 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage staleImage = emptyImage(10);
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
 
         // Seed the state which can result when revision 11 arrives while a revision 10 full-image
         // reconciliation is still being prepared, then run the stale snapshot deterministically.
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 creationDelta,
                 newerImage,
                 loaderManifest(newerImage.provenance()));
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(newerImage).build(),
                 staleImage,
                 loaderManifest(staleImage.provenance()));
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
-        assertTrue(lifecycle.unregisteredTopics.isEmpty(),
-                "A stale full image must not turn a newer remembered registration into a deletion");
-        assertTrue(producerStateStore.deletedTopics.isEmpty());
+        assertTrue(lifecycle.deletedTopics.isEmpty(),
+                "A stale full image must not turn a newer remembered reconciliation into a deletion");
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty());
 
         MetadataImage caughtUpImage = emptyImage(11);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(staleImage).build(),
                 caughtUpImage,
                 loaderManifest(caughtUpImage.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(topicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(topicId.toString()),
                 5_000,
                 "Expected deletion once a full image reaches the remembered source revision");
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -597,29 +595,29 @@ class DisklessTopicLifecyclePublisherTest {
         lifecycle.listBehavior = attempt -> attempt == 1
                 ? CompletableFuture.failedFuture(new RuntimeException("temporary inventory failure"))
                 : CompletableFuture.completedFuture(List.of(new ManagedTopic(orphanTopic, orphanTopicId, 10)));
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
         List<Throwable> faults = new CopyOnWriteArrayList<>();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 (message, cause) -> faults.add(cause),
                 5,
                 10);
         MetadataImage image = emptyImage(10);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(orphanTopicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(orphanTopicId.toString()),
                 5_000,
                 "Expected inventory retry to discover and delete the orphan");
         assertEquals(2, lifecycle.listAttempts.get());
         assertEquals(1, faults.size());
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -630,11 +628,11 @@ class DisklessTopicLifecyclePublisherTest {
         lifecycle.listBehavior = attempt -> attempt == 2
                 ? CompletableFuture.completedFuture(List.of(new ManagedTopic(orphanTopic, orphanTopicId, 10)))
                 : CompletableFuture.completedFuture(List.of());
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 (message, cause) -> { },
                 5,
                 10,
@@ -642,19 +640,19 @@ class DisklessTopicLifecyclePublisherTest {
                 10,
                 100);
         MetadataImage image = emptyImage(10);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(orphanTopicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(orphanTopicId.toString()),
                 5_000,
                 "Expected the next active-controller inventory to delete a late orphan");
         assertTrue(lifecycle.listAttempts.get() >= 2);
-        assertTrue(lifecycle.unregisteredTopics.contains(orphanTopic + ":" + orphanTopicId));
-        publisher.close();
+        assertTrue(lifecycle.deletedTopics.contains(orphanTopic + ":" + orphanTopicId));
+        reconciler.close();
     }
 
     @Test
@@ -673,12 +671,12 @@ class DisklessTopicLifecyclePublisherTest {
             }
             return CompletableFuture.completedFuture(List.of());
         };
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
         List<Throwable> faults = new CopyOnWriteArrayList<>();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 (message, cause) -> faults.add(cause),
                 5,
                 10,
@@ -686,20 +684,20 @@ class DisklessTopicLifecyclePublisherTest {
                 10,
                 20);
         MetadataImage image = emptyImage(10);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(orphanTopicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(orphanTopicId.toString()),
                 5_000,
                 "Expected inventory to recover after one timed-out call");
         assertTrue(lifecycle.listAttempts.get() >= 2);
         assertTrue(faults.stream().anyMatch(TimeoutException.class::isInstance));
         assertTrue(hungInventory.isCancelled(), "Timed-out inventory source must be cancelled");
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -707,26 +705,26 @@ class DisklessTopicLifecyclePublisherTest {
         CompletableFuture<List<ManagedTopic>> hungInventory = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
         lifecycle.listBehavior = attempt -> hungInventory;
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { });
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { });
         MetadataImage image = emptyImage(10);
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 image,
                 loaderManifest(image.provenance()));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         TestUtils.waitForCondition(
                 () -> lifecycle.listAttempts.get() == 1,
                 5_000,
                 "Expected a Catalog inventory attempt");
 
-        publisher.close();
+        reconciler.close();
 
         assertTrue(hungInventory.isCancelled(), "Close must cancel a hung Catalog inventory");
     }
 
     @Test
-    void testCommittedDisklessTopicCreationReconcilesCompleteRegistration() throws Exception {
+    void testCommittedDisklessTopicCreationReconcilesCompleteTopicState() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         int partitions = 3;
@@ -738,21 +736,21 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(10, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 1,
-                5_000, "Expected committed diskless topic registration");
+                () -> lifecycle.reconciliations.size() == 1,
+                5_000, "Expected committed diskless topic reconciliation");
         assertEquals(
-                new Registration(disklessTopic, topicId, partitions, configs, 10),
-                lifecycle.registrations.get(0));
-        assertTrue(lifecycle.unregisteredTopics.isEmpty());
-        assertTrue(producerStateStore.deletedTopics.isEmpty());
-        publisher.close();
+                new Reconciliation(disklessTopic, topicId, partitions, configs, 10),
+                lifecycle.reconciliations.get(0));
+        assertTrue(lifecycle.deletedTopics.isEmpty());
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty());
+        reconciler.close();
     }
 
     @Test
@@ -765,26 +763,26 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage createdImage = creationDelta.apply(new MetadataProvenance(10, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 1,
+                () -> lifecycle.reconciliations.size() == 1,
                 5_000,
-                "Expected initial registration");
+                "Expected initial reconciliation");
 
         MetadataDelta configDelta = new MetadataDelta.Builder().setImage(createdImage).build();
         configDelta.replay(configRecord(disklessTopic, TopicConfig.RETENTION_MS_CONFIG, "12345"));
         MetadataImage updatedImage = configDelta.apply(new MetadataProvenance(11, 0, 0, true));
-        publisher.onMetadataUpdate(configDelta, updatedImage, loaderManifest(updatedImage.provenance()));
+        reconciler.onMetadataUpdate(configDelta, updatedImage, loaderManifest(updatedImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 2,
+                () -> lifecycle.reconciliations.size() == 2,
                 5_000,
-                "Expected config change registration");
+                "Expected config change reconciliation");
         assertEquals(
-                new Registration(
+                new Reconciliation(
                         disklessTopic,
                         topicId,
                         1,
@@ -792,12 +790,12 @@ class DisklessTopicLifecyclePublisherTest {
                                 TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                                 TopicConfig.RETENTION_MS_CONFIG, "12345"),
                         11),
-                lifecycle.registrations.get(1));
-        publisher.close();
+                lifecycle.reconciliations.get(1));
+        reconciler.close();
     }
 
     @Test
-    void testConfigChangeWhileInitialRegistrationIsPendingRunsLatestRegistration()
+    void testConfigChangeWhileInitialReconciliationIsPendingRunsLatestReconciliation()
             throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
@@ -810,38 +808,38 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage createdImage = creationDelta.apply(
                 new MetadataProvenance(10, 0, 0, true));
 
-        CompletableFuture<Void> initialRegistration = new CompletableFuture<>();
+        CompletableFuture<Void> initialReconciliation = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> attempt == 1
-                ? initialRegistration
+        lifecycle.reconcileBehavior = attempt -> attempt == 1
+                ? initialReconciliation
                 : CompletableFuture.completedFuture(null);
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(
                 creationDelta, createdImage, loaderManifest(createdImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 1,
+                () -> lifecycle.reconcileAttempts.get() == 1,
                 5_000,
-                "Expected initial registration to remain pending");
+                "Expected initial reconciliation to remain pending");
 
         MetadataDelta configDelta = new MetadataDelta.Builder().setImage(createdImage).build();
         configDelta.replay(configRecord(
                 disklessTopic, TopicConfig.RETENTION_MS_CONFIG, "12345"));
         MetadataImage updatedImage = configDelta.apply(
                 new MetadataProvenance(11, 0, 0, true));
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 configDelta, updatedImage, loaderManifest(updatedImage.provenance()));
 
-        assertEquals(1, lifecycle.registerAttempts.get(),
-                "The newer registration must remain serialized behind the initial call");
-        initialRegistration.complete(null);
+        assertEquals(1, lifecycle.reconcileAttempts.get(),
+                "The newer reconciliation must remain serialized behind the initial call");
+        initialReconciliation.complete(null);
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 2,
+                () -> lifecycle.reconcileAttempts.get() == 2,
                 5_000,
-                "Expected the latest config snapshot after initial registration completed");
+                "Expected the latest config snapshot after initial reconciliation completed");
         assertEquals(
-                new Registration(
+                new Reconciliation(
                         disklessTopic,
                         topicId,
                         1,
@@ -849,12 +847,12 @@ class DisklessTopicLifecyclePublisherTest {
                                 TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                                 TopicConfig.RETENTION_MS_CONFIG, "12345"),
                         11),
-                lifecycle.registrations.get(1));
-        publisher.close();
+                lifecycle.reconciliations.get(1));
+        reconciler.close();
     }
 
     @Test
-    void testManyQueuedRevisionsCoalesceToLatestRegistration()
+    void testManyQueuedRevisionsCoalesceToLatestReconciliation()
             throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
@@ -865,20 +863,20 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage createdImage = creationDelta.apply(
                 new MetadataProvenance(10, 0, 0, true));
 
-        CompletableFuture<Void> initialRegistration = new CompletableFuture<>();
+        CompletableFuture<Void> initialReconciliation = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> attempt == 1
-                ? initialRegistration
+        lifecycle.reconcileBehavior = attempt -> attempt == 1
+                ? initialReconciliation
                 : CompletableFuture.completedFuture(null);
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(
                 creationDelta, createdImage, loaderManifest(createdImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 1,
+                () -> lifecycle.reconcileAttempts.get() == 1,
                 5_000,
-                "Expected initial registration to remain pending");
+                "Expected initial reconciliation to remain pending");
 
         MetadataImage updatedImage = createdImage;
         for (int revision = 1; revision <= 1_000; revision++) {
@@ -887,25 +885,25 @@ class DisklessTopicLifecyclePublisherTest {
                     disklessTopic, TopicConfig.RETENTION_MS_CONFIG, Integer.toString(revision)));
             updatedImage = configDelta.apply(
                     new MetadataProvenance(10L + revision, 0, 0, true));
-            publisher.onMetadataUpdate(
+            reconciler.onMetadataUpdate(
                     configDelta, updatedImage, loaderManifest(updatedImage.provenance()));
         }
 
-        assertEquals(1, lifecycle.registerAttempts.get(),
+        assertEquals(1, lifecycle.reconcileAttempts.get(),
                 "Only the current source attempt may be in flight");
-        assertEquals(1, publisher.activeTopicRunnerCountForTesting());
-        assertEquals(1, publisher.pendingTopicRevisionCountForTesting(topicId),
+        assertEquals(1, reconciler.activeTopicRunnerCountForTesting());
+        assertEquals(1, reconciler.pendingTopicRevisionCountForTesting(topicId),
                 "All queued revisions must collapse into one latest desired state");
-        assertEquals(1, publisher.pendingSourceAttemptCountForTesting());
+        assertEquals(1, reconciler.pendingSourceAttemptCountForTesting());
 
-        initialRegistration.complete(null);
+        initialReconciliation.complete(null);
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 2,
+                () -> lifecycle.reconcileAttempts.get() == 2,
                 5_000,
-                "Expected only the latest queued registration supplier to start");
-        assertEquals(2, lifecycle.registrations.size());
+                "Expected only the latest queued reconciliation supplier to start");
+        assertEquals(2, lifecycle.reconciliations.size());
         assertEquals(
-                new Registration(
+                new Reconciliation(
                         disklessTopic,
                         topicId,
                         1,
@@ -913,16 +911,16 @@ class DisklessTopicLifecyclePublisherTest {
                                 TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                                 TopicConfig.RETENTION_MS_CONFIG, "1000"),
                         1_010),
-                lifecycle.registrations.get(1));
+                lifecycle.reconciliations.get(1));
         TestUtils.waitForCondition(
-                () -> publisher.activeTopicRunnerCountForTesting() == 0,
+                () -> reconciler.activeTopicRunnerCountForTesting() == 0,
                 5_000,
                 "Expected the bounded runner state to retire after the latest revision completed");
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
-    void testCreatePartitionsReregistersCompletePartitionCountWithoutDuplicatingCreation() throws Exception {
+    void testCreatePartitionsReconcilesCompletePartitionCountWithoutDuplicatingCreation() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         Map<String, String> configs = Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true");
@@ -931,39 +929,39 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage createdImage = creationDelta.apply(new MetadataProvenance(10, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 1,
-                5_000, "Expected exactly one registration for topic creation");
+                () -> lifecycle.reconciliations.size() == 1,
+                5_000, "Expected exactly one reconciliation for topic creation");
 
         MetadataDelta expansionDelta = new MetadataDelta.Builder().setImage(createdImage).build();
         expansionDelta.replay(partitionRecord(topicId, 1));
         expansionDelta.replay(partitionRecord(topicId, 2));
         MetadataImage expandedImage = expansionDelta.apply(new MetadataProvenance(11, 0, 0, true));
-        publisher.onMetadataUpdate(expansionDelta, expandedImage, loaderManifest(expandedImage.provenance()));
+        reconciler.onMetadataUpdate(expansionDelta, expandedImage, loaderManifest(expandedImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 2,
-                5_000, "Expected CreatePartitions to refresh catalog registration");
-        assertEquals(List.of(1, 3), lifecycle.registrations.stream()
-                .map(Registration::partitions)
+                () -> lifecycle.reconciliations.size() == 2,
+                5_000, "Expected CreatePartitions to refresh catalog reconciliation");
+        assertEquals(List.of(1, 3), lifecycle.reconciliations.stream()
+                .map(Reconciliation::partitions)
                 .toList());
 
         MetadataDelta unchangedCountDelta = new MetadataDelta.Builder().setImage(expandedImage).build();
         unchangedCountDelta.replay(partitionRecord(topicId, 0));
         MetadataImage unchangedCountImage = unchangedCountDelta.apply(
                 new MetadataProvenance(12, 0, 0, true));
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 unchangedCountDelta,
                 unchangedCountImage,
                 loaderManifest(unchangedCountImage.provenance()));
         Thread.sleep(50);
-        assertEquals(2, lifecycle.registrations.size(),
-                "Partition metadata updates with an unchanged count must not re-register");
-        publisher.close();
+        assertEquals(2, lifecycle.reconciliations.size(),
+                "Partition metadata updates with an unchanged count must not reconcile");
+        reconciler.close();
     }
 
     @Test
@@ -975,18 +973,18 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(10, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
-        assertTrue(lifecycle.registeredTopics.isEmpty());
-        publisher.close();
+        assertTrue(lifecycle.reconciliations.isEmpty());
+        reconciler.close();
     }
 
     @Test
-    void testDeletionSupersedesBlockedRegistration() throws Exception {
+    void testDeletionSupersedesBlockedReconciliation() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         Map<String, String> configs = Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true");
@@ -997,39 +995,39 @@ class DisklessTopicLifecyclePublisherTest {
         deletionDelta.replay(new RemoveTopicRecord().setTopicId(topicId));
         MetadataImage deletedImage = deletionDelta.apply(new MetadataProvenance(2, 0, 0, true));
 
-        CompletableFuture<Void> registrationGate = new CompletableFuture<>();
+        CompletableFuture<Void> reconciliationGate = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> registrationGate;
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        lifecycle.reconcileBehavior = attempt -> reconciliationGate;
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
-        publisher.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
-        publisher.onMetadataUpdate(deletionDelta, deletedImage, loaderManifest(deletedImage.provenance()));
+        reconciler.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
+        reconciler.onMetadataUpdate(deletionDelta, deletedImage, loaderManifest(deletedImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 1,
-                5_000, "Expected registration to start");
+                () -> lifecycle.reconciliations.size() == 1,
+                5_000, "Expected reconciliation to start");
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisteredTopics.size() == 1
-                        && producerStateStore.deletedTopics.size() == 1,
-                5_000, "Expected both deletion branches to complete while registration remains blocked");
-        assertTrue(registrationGate.isCancelled(),
-                "Deletion must cancel the superseded registration source");
-        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.unregisteredTopics);
-        assertEquals(List.of(topicId.toString()), producerStateStore.deletedTopics);
+                () -> lifecycle.deletedTopics.size() == 1
+                        && producerStateLifecycle.deletedTopics.size() == 1,
+                5_000, "Expected both deletion branches to complete while reconciliation remains blocked");
+        assertTrue(reconciliationGate.isCancelled(),
+                "Deletion must cancel the superseded reconciliation source");
+        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.deletedTopics);
+        assertEquals(List.of(topicId.toString()), producerStateLifecycle.deletedTopics);
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
         Thread.sleep(50);
-        assertEquals(1, lifecycle.unregisterAttempts.get(),
-                "A completed durable unregister must retire the desired deletion state");
-        assertEquals(1, producerStateStore.deleteAttempts.get());
-        publisher.close();
+        assertEquals(1, lifecycle.deleteAttempts.get(),
+                "A completed durable delete must retire the desired deletion state");
+        assertEquals(1, producerStateLifecycle.deleteAttempts.get());
+        reconciler.close();
     }
 
     @Test
-    void testDeletionFenceMakesLateRegistrationCompletionHarmless() throws Exception {
+    void testDeletionFenceMakesLateReconciliationCompletionHarmless() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         Map<String, String> configs = Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true");
@@ -1040,37 +1038,37 @@ class DisklessTopicLifecyclePublisherTest {
         deletionDelta.replay(new RemoveTopicRecord().setTopicId(topicId));
         MetadataImage deletedImage = deletionDelta.apply(new MetadataProvenance(2, 0, 0, true));
 
-        CompletableFuture<Void> registrationGate = new CompletableFuture<>() {
+        CompletableFuture<Void> reconciliationGate = new CompletableFuture<>() {
             @Override
             public boolean cancel(boolean mayInterruptIfRunning) {
                 return false;
             }
         };
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> registrationGate;
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        lifecycle.reconcileBehavior = attempt -> reconciliationGate;
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
 
-        publisher.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
-        publisher.onMetadataUpdate(deletionDelta, deletedImage, loaderManifest(deletedImage.provenance()));
+        reconciler.onMetadataUpdate(creationDelta, createdImage, loaderManifest(createdImage.provenance()));
+        reconciler.onMetadataUpdate(deletionDelta, deletedImage, loaderManifest(deletedImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisterAttempts.get() == 1
-                        && producerStateStore.deleteAttempts.get() == 1,
-                5_000, "Expected immediate deletion while registration remains blocked");
+                () -> lifecycle.deleteAttempts.get() == 1
+                        && producerStateLifecycle.deleteAttempts.get() == 1,
+                5_000, "Expected immediate deletion while reconciliation remains blocked");
 
-        registrationGate.complete(null);
+        reconciliationGate.complete(null);
         Thread.sleep(50);
-        assertEquals(1, lifecycle.registerAttempts.get());
+        assertEquals(1, lifecycle.reconcileAttempts.get());
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
         Thread.sleep(50);
-        assertEquals(1, lifecycle.unregisterAttempts.get(),
-                "The lifecycle provider owns fencing late registration completion");
-        assertEquals(1, producerStateStore.deleteAttempts.get());
-        publisher.close();
+        assertEquals(1, lifecycle.deleteAttempts.get(),
+                "The lifecycle provider owns fencing late reconciliation completion");
+        assertEquals(1, producerStateLifecycle.deleteAttempts.get());
+        reconciler.close();
     }
 
     @Test
@@ -1082,34 +1080,34 @@ class DisklessTopicLifecyclePublisherTest {
                 MetadataImage.EMPTY, firstTopic, firstTopicId, 1, configs);
         MetadataImage firstImage = firstDelta.apply(new MetadataProvenance(1, 0, 0, true));
 
-        CompletableFuture<Void> firstRegistration = new CompletableFuture<>();
+        CompletableFuture<Void> firstReconciliation = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> attempt == 1
-                ? firstRegistration
+        lifecycle.reconcileBehavior = attempt -> attempt == 1
+                ? firstReconciliation
                 : CompletableFuture.completedFuture(null);
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { }, 5, 10);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(firstDelta, firstImage, loaderManifest(firstImage.provenance()));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { }, 5, 10);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(firstDelta, firstImage, loaderManifest(firstImage.provenance()));
 
         String secondTopic = "second-topic";
         Uuid secondTopicId = Uuid.randomUuid();
         MetadataDelta secondDelta = topicCreationDelta(firstImage, secondTopic, secondTopicId, 1, configs);
         MetadataImage secondImage = secondDelta.apply(new MetadataProvenance(2, 0, 0, true));
-        publisher.onMetadataUpdate(secondDelta, secondImage, loaderManifest(secondImage.provenance()));
+        reconciler.onMetadataUpdate(secondDelta, secondImage, loaderManifest(secondImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 2,
-                5_000, "Expected second topic to register while first topic remains blocked");
-        assertEquals(List.of(firstTopic, secondTopic), lifecycle.registrations.stream()
-                .map(Registration::topicName)
+                () -> lifecycle.reconciliations.size() == 2,
+                5_000, "Expected second topic to reconcile while first topic remains blocked");
+        assertEquals(List.of(firstTopic, secondTopic), lifecycle.reconciliations.stream()
+                .map(Reconciliation::topicName)
                 .toList());
-        firstRegistration.complete(null);
-        publisher.close();
+        firstReconciliation.complete(null);
+        reconciler.close();
     }
 
     @Test
-    void testRegistrationKeepsRetryingBeyondThreeAttempts() throws Exception {
+    void testReconciliationKeepsRetryingBeyondThreeAttempts() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         MetadataDelta delta = topicCreationDelta(
@@ -1121,29 +1119,29 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(10, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> attempt < 5
+        lifecycle.reconcileBehavior = attempt -> attempt < 5
                 ? CompletableFuture.failedFuture(new RuntimeException("transient failure"))
                 : CompletableFuture.completedFuture(null);
         List<Throwable> faults = new CopyOnWriteArrayList<>();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                new RecordingProducerStateStore(),
+                new RecordingProducerStateLifecycle(),
                 (message, cause) -> faults.add(cause),
                 5,
                 10);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 5,
-                5_000, "Expected registration retry to recover");
+                () -> lifecycle.reconcileAttempts.get() == 5,
+                5_000, "Expected reconciliation retry to recover");
         assertEquals(4, faults.size());
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
-    void testRepeatedSynchronousRegistrationFailuresKeepOneOperationSlot() throws Exception {
+    void testRepeatedSynchronousReconciliationFailuresKeepOneOperationSlot() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         MetadataDelta delta = topicCreationDelta(
@@ -1156,40 +1154,40 @@ class DisklessTopicLifecyclePublisherTest {
 
         CompletableFuture<Void> terminalAttempt = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> {
+        lifecycle.reconcileBehavior = attempt -> {
             if (attempt <= 100) {
                 throw new RuntimeException("synchronous failure " + attempt);
             }
             return terminalAttempt;
         };
         List<Throwable> faults = new CopyOnWriteArrayList<>();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                new RecordingProducerStateStore(),
+                new RecordingProducerStateLifecycle(),
                 (message, cause) -> faults.add(cause),
                 1,
                 1);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 101,
+                () -> lifecycle.reconcileAttempts.get() == 101,
                 5_000,
                 "Expected the bounded runner to reach the pending terminal attempt");
-        assertEquals(1, publisher.activeTopicRunnerCountForTesting());
-        assertEquals(0, publisher.pendingTopicRevisionCountForTesting(topicId));
-        assertEquals(1, publisher.pendingSourceAttemptCountForTesting());
-        assertEquals(0, publisher.pendingTopicRetryDelayCountForTesting());
+        assertEquals(1, reconciler.activeTopicRunnerCountForTesting());
+        assertEquals(0, reconciler.pendingTopicRevisionCountForTesting(topicId));
+        assertEquals(1, reconciler.pendingSourceAttemptCountForTesting());
+        assertEquals(0, reconciler.pendingTopicRetryDelayCountForTesting());
         assertEquals(100, faults.size());
 
         terminalAttempt.complete(null);
         TestUtils.waitForCondition(
-                () -> publisher.activeTopicRunnerCountForTesting() == 0,
+                () -> reconciler.activeTopicRunnerCountForTesting() == 0,
                 5_000,
                 "Expected the runner to retire after recovery");
-        assertEquals(0, publisher.pendingSourceAttemptCountForTesting());
-        publisher.close();
+        assertEquals(0, reconciler.pendingSourceAttemptCountForTesting());
+        reconciler.close();
     }
 
     @Test
@@ -1202,47 +1200,47 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage firstImage = firstDelta.apply(new MetadataProvenance(1, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> attempt == 1
+        lifecycle.reconcileBehavior = attempt -> attempt == 1
                 ? CompletableFuture.failedFuture(new RuntimeException("old controller attempt failed"))
                 : CompletableFuture.completedFuture(null);
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { }, 10_000, 10_000);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(firstDelta, firstImage, loaderManifest(firstImage.provenance()));
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { }, 10_000, 10_000);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(firstDelta, firstImage, loaderManifest(firstImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 1
-                        && publisher.pendingTopicRetryDelayCountForTesting() == 1,
+                () -> lifecycle.reconcileAttempts.get() == 1
+                        && reconciler.pendingTopicRetryDelayCountForTesting() == 1,
                 5_000, "Expected the old generation to wait on one retry delay");
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
-        assertEquals(0, publisher.activeTopicRunnerCountForTesting());
-        assertEquals(0, publisher.pendingTopicRetryDelayCountForTesting(),
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        assertEquals(0, reconciler.activeTopicRunnerCountForTesting());
+        assertEquals(0, reconciler.pendingTopicRetryDelayCountForTesting(),
                 "Leadership loss must detach and cancel the old retry delay");
 
         String secondTopic = "second-topic";
         Uuid secondTopicId = Uuid.randomUuid();
         MetadataDelta secondDelta = topicCreationDelta(firstImage, secondTopic, secondTopicId, 2, configs);
         MetadataImage secondImage = secondDelta.apply(new MetadataProvenance(2, 0, 0, true));
-        publisher.onMetadataUpdate(secondDelta, secondImage, loaderManifest(secondImage.provenance()));
-        assertEquals(1, lifecycle.registerAttempts.get(), "Old leadership must not start a retry");
+        reconciler.onMetadataUpdate(secondDelta, secondImage, loaderManifest(secondImage.provenance()));
+        assertEquals(1, lifecycle.reconcileAttempts.get(), "Old leadership must not start a retry");
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
 
         TestUtils.waitForCondition(
-                () -> lifecycle.registrations.size() == 3,
+                () -> lifecycle.reconciliations.size() == 3,
                 5_000, "Expected new leadership generation to reconcile");
-        assertEquals(2, lifecycle.registrations.stream()
-                .filter(registration -> registration.topicName().equals(firstTopic))
+        assertEquals(2, lifecycle.reconciliations.stream()
+                .filter(reconciliation -> reconciliation.topicName().equals(firstTopic))
                 .count());
-        assertEquals(1, lifecycle.registrations.stream()
-                .filter(registration -> registration.topicName().equals(secondTopic))
+        assertEquals(1, lifecycle.reconciliations.stream()
+                .filter(reconciliation -> reconciliation.topicName().equals(secondTopic))
                 .count());
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
-    void testLeadershipLossCancelsPendingRegistrationAndNewLeaderReconciles() throws Exception {
+    void testLeadershipLossCancelsPendingReconciliationAndNewLeaderReconciles() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         Map<String, String> configs = Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true");
@@ -1250,37 +1248,37 @@ class DisklessTopicLifecyclePublisherTest {
                 MetadataImage.EMPTY, disklessTopic, topicId, 1, configs);
         MetadataImage image = delta.apply(new MetadataProvenance(1, 0, 0, true));
 
-        List<CompletableFuture<Void>> registrationSources = new CopyOnWriteArrayList<>();
+        List<CompletableFuture<Void>> reconciliationSources = new CopyOnWriteArrayList<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> {
+        lifecycle.reconcileBehavior = attempt -> {
             CompletableFuture<Void> source = new CompletableFuture<>();
-            registrationSources.add(source);
+            reconciliationSources.add(source);
             return source;
         };
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
 
         for (int generation = 0; generation < 3; generation++) {
             int expectedAttempts = generation + 1;
             TestUtils.waitForCondition(
-                    () -> lifecycle.registerAttempts.get() == expectedAttempts,
+                    () -> lifecycle.reconcileAttempts.get() == expectedAttempts,
                     5_000,
                     "Expected a pending source for leadership generation " + generation);
-            publisher.onControllerChange(new LeaderAndEpoch(
+            reconciler.onControllerChange(new LeaderAndEpoch(
                     OptionalInt.of(2), generation * 2 + 2));
-            assertTrue(registrationSources.get(generation).isCancelled(),
+            assertTrue(reconciliationSources.get(generation).isCancelled(),
                     "Leadership loss must cancel each retired generation's source");
-            assertEquals(0, publisher.activeTopicRunnerCountForTesting());
+            assertEquals(0, reconciler.activeTopicRunnerCountForTesting());
             if (generation < 2) {
-                publisher.onControllerChange(new LeaderAndEpoch(
+                reconciler.onControllerChange(new LeaderAndEpoch(
                         OptionalInt.of(1), generation * 2 + 3));
             }
         }
 
-        assertEquals(3, lifecycle.registerAttempts.get());
-        publisher.close();
+        assertEquals(3, lifecycle.reconcileAttempts.get());
+        reconciler.close();
     }
 
     @Test
@@ -1301,34 +1299,34 @@ class DisklessTopicLifecyclePublisherTest {
         CompletableFuture<Void> catalogDeletion = new CompletableFuture<>();
         CompletableFuture<Void> snapshotDeletion = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.unregisterBehavior = attempt -> catalogDeletion;
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.deleteBehavior = attempt -> snapshotDeletion;
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(
+        lifecycle.deleteBehavior = attempt -> catalogDeletion;
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.deleteBehavior = attempt -> snapshotDeletion;
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(
                 deletionDelta,
                 deletedImage,
                 loaderManifest(deletedImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisterAttempts.get() == 1
-                        && producerStateStore.deleteAttempts.get() == 1,
+                () -> lifecycle.deleteAttempts.get() == 1
+                        && producerStateLifecycle.deleteAttempts.get() == 1,
                 5_000,
                 "Expected both deletion branches to remain pending");
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
 
         assertTrue(catalogDeletion.isCancelled(),
                 "Leadership loss must cancel the pending Catalog source");
         assertTrue(snapshotDeletion.isCancelled(),
                 "Leadership loss must cancel the pending producer-state source");
-        assertEquals(0, publisher.activeTopicRunnerCountForTesting());
-        publisher.close();
+        assertEquals(0, reconciler.activeTopicRunnerCountForTesting());
+        reconciler.close();
     }
 
     @Test
-    void testCloseCancelsPendingRegistrationAndFencesRetry() throws Exception {
+    void testCloseCancelsPendingReconciliationAndFencesRetry() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         MetadataDelta delta = topicCreationDelta(
@@ -1341,22 +1339,22 @@ class DisklessTopicLifecyclePublisherTest {
 
         CompletableFuture<Void> firstAttempt = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> firstAttempt;
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, new RecordingProducerStateStore(), (message, cause) -> { }, 10, 20);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        lifecycle.reconcileBehavior = attempt -> firstAttempt;
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, new RecordingProducerStateLifecycle(), (message, cause) -> { }, 10, 20);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.registerAttempts.get() == 1,
-                5_000, "Expected first registration attempt");
+                () -> lifecycle.reconcileAttempts.get() == 1,
+                5_000, "Expected first reconciliation attempt");
 
-        publisher.close();
+        reconciler.close();
         assertTrue(firstAttempt.isCancelled(), "Close must cancel the current source attempt");
-        assertEquals(1, lifecycle.registerAttempts.get());
+        assertEquals(1, lifecycle.reconcileAttempts.get());
     }
 
     @Test
-    void testCloseCancelsPendingRegistrationRetryDelay() throws Exception {
+    void testCloseCancelsPendingReconciliationRetryDelay() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         MetadataDelta delta = topicCreationDelta(
@@ -1368,31 +1366,31 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage image = delta.apply(new MetadataProvenance(10, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.registerBehavior = attempt -> CompletableFuture.failedFuture(
-                new RuntimeException("registration unavailable"));
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        lifecycle.reconcileBehavior = attempt -> CompletableFuture.failedFuture(
+                new RuntimeException("reconciliation unavailable"));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                new RecordingProducerStateStore(),
+                new RecordingProducerStateLifecycle(),
                 (message, cause) -> { },
                 10_000,
                 10_000);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
         TestUtils.waitForCondition(
-                () -> publisher.pendingTopicRetryDelayCountForTesting() == 1,
+                () -> reconciler.pendingTopicRetryDelayCountForTesting() == 1,
                 5_000,
                 "Expected one pending retry delay before close");
 
-        publisher.close();
+        reconciler.close();
 
-        assertEquals(0, publisher.activeTopicRunnerCountForTesting());
-        assertEquals(0, publisher.pendingTopicRetryDelayCountForTesting());
-        assertEquals(1, lifecycle.registerAttempts.get());
+        assertEquals(0, reconciler.activeTopicRunnerCountForTesting());
+        assertEquals(0, reconciler.pendingTopicRetryDelayCountForTesting());
+        assertEquals(1, lifecycle.reconcileAttempts.get());
     }
 
     @Test
-    void testDisklessTopicDeletionUnregistersCatalogAndCleansProducerState() throws Exception {
+    void testDisklessTopicDeletionDeletesCatalogAndCleansProducerState() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         int partitions = 2;
@@ -1410,18 +1408,18 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(2, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.size() == 1,
+                () -> producerStateLifecycle.deletedTopics.size() == 1,
                 5_000, "Expected diskless topic cleanup");
-        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.unregisteredTopics);
-        assertEquals(List.of(topicId.toString()), producerStateStore.deletedTopics);
-        publisher.close();
+        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.deletedTopics);
+        assertEquals(List.of(topicId.toString()), producerStateLifecycle.deletedTopics);
+        reconciler.close();
     }
 
     @Test
@@ -1440,19 +1438,19 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(2, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
-        assertTrue(lifecycle.unregisteredTopics.isEmpty());
-        assertTrue(producerStateStore.deletedTopics.isEmpty());
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        assertTrue(lifecycle.deletedTopics.isEmpty());
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty());
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.size() == 1,
+                () -> producerStateLifecycle.deletedTopics.size() == 1,
                 5_000, "Expected passive deletion to reconcile after becoming leader");
-        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.unregisteredTopics);
-        publisher.close();
+        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.deletedTopics);
+        reconciler.close();
     }
 
     @Test
@@ -1460,11 +1458,11 @@ class DisklessTopicLifecyclePublisherTest {
         List<String> topicNames = List.of("first-topic", "second-topic", "third-topic");
         List<Uuid> topicIds = List.of(Uuid.randomUuid(), Uuid.randomUuid(), Uuid.randomUuid());
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 (message, cause) -> { },
                 5,
                 10,
@@ -1482,25 +1480,25 @@ class DisklessTopicLifecyclePublisherTest {
             deletionDelta.replay(new RemoveTopicRecord().setTopicId(topicIds.get(index)));
             MetadataImage deletedImage = deletionDelta.apply(
                     new MetadataProvenance(index * 2L + 2, 0, 0, true));
-            publisher.onMetadataUpdate(
+            reconciler.onMetadataUpdate(
                     deletionDelta,
                     deletedImage,
                     loaderManifest(deletedImage.provenance()));
         }
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.size() == 2,
+                () -> producerStateLifecycle.deletedTopics.size() == 2,
                 5_000, "Expected only the bounded passive deletion history to reconcile");
         assertEquals(
                 Set.of(topicIds.get(1).toString(), topicIds.get(2).toString()),
-                Set.copyOf(producerStateStore.deletedTopics));
+                Set.copyOf(producerStateLifecycle.deletedTopics));
         assertEquals(
                 Set.of(
                         topicNames.get(1) + ":" + topicIds.get(1),
                         topicNames.get(2) + ":" + topicIds.get(2)),
-                Set.copyOf(lifecycle.unregisteredTopics));
-        publisher.close();
+                Set.copyOf(lifecycle.deletedTopics));
+        reconciler.close();
     }
 
     @Test
@@ -1521,28 +1519,28 @@ class DisklessTopicLifecyclePublisherTest {
 
         CompletableFuture<Void> oldLeadershipCatalogAttempt = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.unregisterBehavior = attempt -> attempt == 1
+        lifecycle.deleteBehavior = attempt -> attempt == 1
                 ? oldLeadershipCatalogAttempt
                 : CompletableFuture.completedFuture(null);
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                producerStateStore,
+                producerStateLifecycle,
                 (message, cause) -> { },
                 5,
                 10,
                 1);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(
                 activeDeletionDelta,
                 activeDeletedImage,
                 loaderManifest(activeDeletedImage.provenance()));
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.contains(activeTopicId.toString()),
+                () -> producerStateLifecycle.deletedTopics.contains(activeTopicId.toString()),
                 5_000, "Expected active snapshot deletion to proceed independently");
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
         for (int index = 0; index < 2; index++) {
             String passiveTopic = "passive-topic-" + index;
             Uuid passiveTopicId = Uuid.randomUuid();
@@ -1559,20 +1557,20 @@ class DisklessTopicLifecyclePublisherTest {
             passiveDeletionDelta.replay(new RemoveTopicRecord().setTopicId(passiveTopicId));
             MetadataImage passiveDeletedImage = passiveDeletionDelta.apply(
                     new MetadataProvenance(index * 2L + 4, 0, 0, true));
-            publisher.onMetadataUpdate(
+            reconciler.onMetadataUpdate(
                     passiveDeletionDelta,
                     passiveDeletedImage,
                     loaderManifest(passiveDeletedImage.provenance()));
         }
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
         oldLeadershipCatalogAttempt.completeExceptionally(new RuntimeException("old leadership failed"));
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisteredTopics.stream()
+                () -> lifecycle.deletedTopics.stream()
                         .filter(entry -> entry.equals(activeTopic + ":" + activeTopicId))
                         .count() == 2,
                 5_000, "Expected new leadership to retry the protected active deletion");
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -1593,7 +1591,7 @@ class DisklessTopicLifecyclePublisherTest {
         CompletableFuture<Void> oldDeletion = new CompletableFuture<>();
         CompletableFuture<Void> newDeletion = new CompletableFuture<>();
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.unregisterBehavior = attempt -> {
+        lifecycle.deleteBehavior = attempt -> {
             if (attempt == 1) {
                 return oldDeletion;
             }
@@ -1602,37 +1600,37 @@ class DisklessTopicLifecyclePublisherTest {
             }
             return CompletableFuture.completedFuture(null);
         };
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
                 1,
                 lifecycle,
-                new RecordingProducerStateStore(),
+                new RecordingProducerStateLifecycle(),
                 (message, cause) -> { },
                 5,
                 10);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(
                 deletionDelta,
                 deletedImage,
                 loaderManifest(deletedImage.provenance()));
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisterAttempts.get() == 1,
+                () -> lifecycle.deleteAttempts.get() == 1,
                 5_000,
                 "Expected the old leadership deletion to remain pending");
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisterAttempts.get() == 2,
+                () -> lifecycle.deleteAttempts.get() == 2,
                 5_000,
                 "Expected a deletion attempt owned by the new generation");
 
         oldDeletion.complete(null);
         newDeletion.completeExceptionally(new RuntimeException("new generation retry"));
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisterAttempts.get() == 3,
+                () -> lifecycle.deleteAttempts.get() == 3,
                 5_000,
                 "Expected the new generation desired state to survive the old callback");
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -1654,23 +1652,146 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(2, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
-        assertTrue(lifecycle.unregisteredTopics.isEmpty());
-        assertTrue(producerStateStore.deletedTopics.isEmpty());
-        publisher.close();
+        assertTrue(lifecycle.deletedTopics.isEmpty());
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty());
+        reconciler.close();
+    }
+
+    @Test
+    void testInternalTopicWithDisklessConfigIsNeverReconciled() throws Exception {
+        String internalTopic = "__consumer_offsets";
+        Uuid topicId = Uuid.randomUuid();
+        RecordingLifecycle lifecycle = new RecordingLifecycle();
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+
+        MetadataDelta delta = topicCreationDelta(
+                MetadataImage.EMPTY,
+                internalTopic,
+                topicId,
+                1,
+                Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true"));
+        MetadataImage image = delta.apply(new MetadataProvenance(10, 0, 0, true));
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+
+        Thread.sleep(50);
+        assertEquals(0, producerStateLifecycle.reconcileAttempts.get());
+        assertEquals(0, lifecycle.reconcileAttempts.get());
+        reconciler.close();
+    }
+
+    @Test
+    void testHungReconciliationIsCancelledAndRetriedAfterTimeout() throws Exception {
+        String topicName = "timed-out-reconciliation";
+        Uuid topicId = Uuid.randomUuid();
+        CompletableFuture<Void> hungManifest = new CompletableFuture<>();
+        RecordingLifecycle lifecycle = new RecordingLifecycle();
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.reconcileBehavior = attempt -> attempt == 1
+                ? hungManifest
+                : CompletableFuture.completedFuture(null);
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1,
+                lifecycle,
+                producerStateLifecycle,
+                (message, cause) -> failures.add(cause),
+                5,
+                10,
+                10_000,
+                10_000,
+                10_000,
+                25);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+
+        MetadataDelta delta = topicCreationDelta(
+                MetadataImage.EMPTY,
+                topicName,
+                topicId,
+                1,
+                Map.of(TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true"));
+        MetadataImage image = delta.apply(new MetadataProvenance(10, 0, 0, true));
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+
+        TestUtils.waitForCondition(
+                () -> producerStateLifecycle.reconcileAttempts.get() >= 2
+                        && lifecycle.reconcileAttempts.get() == 1,
+                5_000,
+                "Expected timed-out producer-state reconciliation to be retried");
+        assertTrue(hungManifest.isCancelled());
+        TestUtils.waitForCondition(
+                () -> failures.stream().anyMatch(TimeoutException.class::isInstance),
+                5_000,
+                "Expected the reconciliation timeout to be reported");
+        reconciler.close();
+    }
+
+    @Test
+    void testHungDeletionIsCancelledAndRetriedAfterTimeout() throws Exception {
+        String topicName = "timed-out-deletion";
+        Uuid topicId = Uuid.randomUuid();
+        MetadataImage oldImage = new MetadataImage(
+                new MetadataProvenance(1, 0, 0, true),
+                FeaturesImage.EMPTY,
+                ClusterImage.EMPTY,
+                topicsImage(topicName, topicId, 1),
+                configsImageWithDisklessEnabled(topicName),
+                ClientQuotasImage.EMPTY,
+                ProducerIdsImage.EMPTY,
+                AclsImage.EMPTY,
+                ScramImage.EMPTY,
+                DelegationTokenImage.EMPTY);
+        MetadataDelta delta = new MetadataDelta.Builder().setImage(oldImage).build();
+        delta.replay(new RemoveTopicRecord().setTopicId(topicId));
+        MetadataImage image = delta.apply(new MetadataProvenance(2, 0, 0, true));
+        CompletableFuture<Void> hungCatalogDeletion = new CompletableFuture<>();
+        RecordingLifecycle lifecycle = new RecordingLifecycle();
+        lifecycle.deleteBehavior = attempt -> attempt == 1
+                ? hungCatalogDeletion
+                : CompletableFuture.completedFuture(null);
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1,
+                lifecycle,
+                producerStateLifecycle,
+                (message, cause) -> failures.add(cause),
+                5,
+                10,
+                10_000,
+                10_000,
+                10_000,
+                25);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+
+        TestUtils.waitForCondition(
+                () -> lifecycle.deleteAttempts.get() >= 2,
+                5_000,
+                "Expected timed-out catalog deletion to be retried");
+        assertTrue(hungCatalogDeletion.isCancelled());
+        TestUtils.waitForCondition(
+                () -> failures.stream().anyMatch(TimeoutException.class::isInstance),
+                5_000,
+                "Expected the deletion timeout to be reported");
+        reconciler.close();
     }
 
     @Test
     void testDeltaIgnoredWhenNotActiveController() {
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> { });
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> { });
 
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
@@ -1683,15 +1804,15 @@ class DisklessTopicLifecyclePublisherTest {
                 AclsImage.EMPTY, ScramImage.EMPTY, DelegationTokenImage.EMPTY);
 
         MetadataDelta delta = new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build();
-        publisher.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
+        reconciler.onMetadataUpdate(delta, image, loaderManifest(image.provenance()));
 
-        assertTrue(lifecycle.unregisteredTopics.isEmpty(), "No calls expected when not active controller");
-        assertTrue(producerStateStore.deletedTopics.isEmpty(), "No calls expected when not active controller");
-        publisher.close();
+        assertTrue(lifecycle.deletedTopics.isEmpty(), "No calls expected when not active controller");
+        assertTrue(producerStateLifecycle.deletedTopics.isEmpty(), "No calls expected when not active controller");
+        reconciler.close();
     }
 
     @Test
-    void testCatalogUnregisterAndProducerStateCleanupProceedIndependently() throws Exception {
+    void testCatalogDeleteAndProducerStateCleanupProceedIndependently() throws Exception {
         String disklessTopic = "diskless-topic";
         Uuid topicId = Uuid.randomUuid();
         int partitions = 2;
@@ -1708,32 +1829,32 @@ class DisklessTopicLifecyclePublisherTest {
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
         CompletableFuture<Void> catalogGate = new CompletableFuture<>();
-        lifecycle.unregisterBehavior = attempt -> catalogGate;
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.deleteBehavior = attempt -> attempt == 1
+        lifecycle.deleteBehavior = attempt -> catalogGate;
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.deleteBehavior = attempt -> attempt == 1
                 ? CompletableFuture.failedFuture(new RuntimeException("producer state unavailable"))
                 : CompletableFuture.completedFuture(null);
         List<String> faults = new CopyOnWriteArrayList<>();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> faults.add(message), 5, 10);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> faults.add(message), 5, 10);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deleteAttempts.get() == 2,
-                5_000, "Expected producer-state cleanup to retry while catalog unregister remains blocked");
-        assertEquals(1, lifecycle.unregisterAttempts.get());
+                () -> producerStateLifecycle.deleteAttempts.get() == 2,
+                5_000, "Expected producer-state cleanup to retry while catalog delete remains blocked");
+        assertEquals(1, lifecycle.deleteAttempts.get());
         assertEquals(1, faults.size());
         assertTrue(faults.get(0).contains("delete producer-state snapshots"));
         catalogGate.complete(null);
 
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(2), 2));
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 3));
         Thread.sleep(50);
-        assertEquals(1, lifecycle.unregisterAttempts.get(),
+        assertEquals(1, lifecycle.deleteAttempts.get(),
                 "Completed deletion must be forgotten before the next leadership generation");
-        assertEquals(2, producerStateStore.deleteAttempts.get());
-        publisher.close();
+        assertEquals(2, producerStateLifecycle.deleteAttempts.get());
+        reconciler.close();
     }
 
     @Test
@@ -1752,27 +1873,27 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(2, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        lifecycle.unregisterBehavior = attempt -> {
+        lifecycle.deleteBehavior = attempt -> {
             if (attempt == 1) {
                 throw new RuntimeException("synchronous catalog failure");
             }
             return CompletableFuture.completedFuture(null);
         };
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
         List<String> faults = new CopyOnWriteArrayList<>();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> faults.add(message), 5, 10);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> faults.add(message), 5, 10);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deletedTopics.size() == 1,
+                () -> producerStateLifecycle.deletedTopics.size() == 1,
                 5_000, "Expected producer-state cleanup after synchronous catalog failure");
         TestUtils.waitForCondition(
-                () -> lifecycle.unregisterAttempts.get() == 2,
-                5_000, "Expected catalog unregister to retry independently");
+                () -> lifecycle.deleteAttempts.get() == 2,
+                5_000, "Expected catalog delete to retry independently");
         assertEquals(1, faults.size());
-        publisher.close();
+        reconciler.close();
     }
 
     @Test
@@ -1791,23 +1912,23 @@ class DisklessTopicLifecyclePublisherTest {
         MetadataImage newImage = delta.apply(new MetadataProvenance(2, 0, 0, true));
 
         RecordingLifecycle lifecycle = new RecordingLifecycle();
-        RecordingProducerStateStore producerStateStore = new RecordingProducerStateStore();
-        producerStateStore.deleteBehavior = attempt -> attempt == 1
+        RecordingProducerStateLifecycle producerStateLifecycle = new RecordingProducerStateLifecycle();
+        producerStateLifecycle.deleteBehavior = attempt -> attempt == 1
                 ? CompletableFuture.failedFuture(new RuntimeException("producer state unavailable"))
                 : CompletableFuture.completedFuture(null);
         List<String> faults = new CopyOnWriteArrayList<>();
-        DisklessTopicLifecyclePublisher publisher = new DisklessTopicLifecyclePublisher(
-                1, lifecycle, producerStateStore, (message, cause) -> faults.add(message), 5, 10);
-        publisher.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
-        publisher.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
+        DisklessTopicLifecycleReconciler reconciler = new DisklessTopicLifecycleReconciler(
+                1, lifecycle, producerStateLifecycle, (message, cause) -> faults.add(message), 5, 10);
+        reconciler.onControllerChange(new LeaderAndEpoch(OptionalInt.of(1), 1));
+        reconciler.onMetadataUpdate(delta, newImage, loaderManifest(newImage.provenance()));
 
         TestUtils.waitForCondition(
-                () -> producerStateStore.deleteAttempts.get() == 2,
+                () -> producerStateLifecycle.deleteAttempts.get() == 2,
                 5_000, "Expected producer-state cleanup retry");
-        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.unregisteredTopics);
+        assertEquals(List.of(disklessTopic + ":" + topicId), lifecycle.deletedTopics);
         assertEquals(1, faults.size());
         assertTrue(faults.get(0).contains("delete producer-state snapshots"));
-        publisher.close();
+        reconciler.close();
     }
 
     private static MetadataDelta topicCreationDelta(

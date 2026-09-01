@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -109,13 +110,14 @@ class LogCursorPoolTest {
         LogCursorPool.Lease activeLease = pool.acquire(1L).get();
         CompletableFuture<LogCursorPool.Lease> waiter = pool.acquire(2L);
 
-        pool.close();
+        CompletableFuture<Void> closeDrain = pool.closeAsync();
 
         ExecutionException waiterError = assertThrows(ExecutionException.class, waiter::get);
         assertTrue(waiterError.getCause() instanceof IllegalStateException);
         verify(cursor, never()).close();
 
         activeLease.close();
+        closeDrain.get(5, java.util.concurrent.TimeUnit.SECONDS);
         verify(cursor).close();
 
         ExecutionException closedError = assertThrows(ExecutionException.class, () -> pool.acquire(3L).get());
@@ -132,11 +134,12 @@ class LogCursorPoolTest {
         LogCursorPool pool = new LogCursorPool(logInstance, "test-cursor", 1);
         CompletableFuture<LogCursorPool.Lease> acquireFuture = pool.acquire(1L);
 
-        pool.close();
+        CompletableFuture<Void> closeDrain = pool.closeAsync();
         openFuture.complete(cursor);
 
         ExecutionException acquireError = assertThrows(ExecutionException.class, acquireFuture::get);
         assertTrue(acquireError.getCause() instanceof IllegalStateException);
+        closeDrain.get(5, java.util.concurrent.TimeUnit.SECONDS);
         verify(cursor).close();
     }
 
@@ -154,11 +157,12 @@ class LogCursorPoolTest {
         pool.acquire(1L).get().close();
         CompletableFuture<LogCursorPool.Lease> acquireFuture = pool.acquire(2L);
 
-        pool.close();
+        CompletableFuture<Void> closeDrain = pool.closeAsync();
         seekFuture.complete(null);
 
         ExecutionException acquireError = assertThrows(ExecutionException.class, acquireFuture::get);
         assertTrue(acquireError.getCause() instanceof IllegalStateException);
+        closeDrain.get(5, java.util.concurrent.TimeUnit.SECONDS);
         verify(cursor).close();
     }
 
@@ -181,7 +185,7 @@ class LogCursorPoolTest {
         }
         verify(logInstance, times(1)).openEphemeralCursor(anyString(), anyLong());
 
-        pool.close();
+        pool.closeAsync().get(5, java.util.concurrent.TimeUnit.SECONDS);
         verify(cursor).close();
     }
 
@@ -208,8 +212,27 @@ class LogCursorPoolTest {
         verify(logInstance, times(1)).openEphemeralCursor(anyString(), anyLong());
         verify(cursor, times(1)).seek(2L);
 
-        pool.close();
+        pool.closeAsync().get(5, java.util.concurrent.TimeUnit.SECONDS);
         verify(cursor).close();
+    }
+
+    @Test
+    void testTransientCursorCloseFailureRetainsHandleAndRetries() throws Exception {
+        Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        when(logInstance.openEphemeralCursor(anyString(), anyLong()))
+                .thenReturn(CompletableFuture.completedFuture(cursor));
+        doThrow(new RuntimeException("transient close failure"))
+                .doNothing()
+                .when(cursor)
+                .close();
+
+        LogCursorPool pool = new LogCursorPool(logInstance, "test-cursor", 1);
+        pool.acquire(1L).get().close();
+
+        pool.closeAsync().get(5, java.util.concurrent.TimeUnit.SECONDS);
+
+        verify(cursor, times(2)).close();
     }
 
     @Test

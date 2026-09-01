@@ -180,8 +180,8 @@ public class ServerLogConfigs {
     // Ursa Storage configurations
     public static final String URSA_STORAGE_ENABLE_CONFIG = "ursa.storage.enable";
     public static final boolean URSA_STORAGE_ENABLE_DEFAULT = false;
-    public static final String URSA_STORAGE_ENABLE_DOC = "Enable Ursa storage mode instead of object storage. " +
-            "When enabled, diskless storage will use Ursa StorageApi for stream-based storage.";
+    public static final String URSA_STORAGE_ENABLE_DOC = "Enable Ursa diskless storage mode instead of Kafka local logs. " +
+            "When enabled, record durability is provided by the configured Lakestream runtime.";
 
     public static final String URSA_STORAGE_TOPIC_DEFAULT_ENABLE_CONFIG = "ursa.storage.topic.default.enable";
     public static final boolean URSA_STORAGE_TOPIC_DEFAULT_ENABLE_DEFAULT = false;
@@ -209,10 +209,6 @@ public class ServerLogConfigs {
     public static final String URSA_OXIA_SERVICE_URL_DEFAULT = "oxia://localhost:6648/default";
     public static final String URSA_OXIA_SERVICE_URL_DOC = "The Oxia service URL for Ursa storage metadata. " +
             "The format should be 'oxia://host:port/[namespace]'. If the namespace is not provided, 'default' will be used.";
-
-    public static final String URSA_STORAGE_WAL_DIRECTORY_CONFIG = "ursa.storage.wal.directory";
-    public static final String URSA_STORAGE_WAL_DIRECTORY_DEFAULT = "/tmp/ursa-wal";
-    public static final String URSA_STORAGE_WAL_DIRECTORY_DOC = "The directory for Ursa storage write-ahead log.";
 
     // Deprecated (do not use annotation to pass checkstyle check)
     public static final String URSA_STORAGE_NAMESPACE_CONFIG = "ursa.storage.namespace";

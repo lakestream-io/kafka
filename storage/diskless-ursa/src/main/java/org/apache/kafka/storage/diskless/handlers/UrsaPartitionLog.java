@@ -39,7 +39,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
@@ -58,6 +57,8 @@ import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
 import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogOffset;
+import io.lakestream.api.exception.LogFencedException;
+import io.lakestream.api.exception.NoSuchStreamException;
 import io.netty.buffer.ByteBuf;
 import io.oxia.client.api.AsyncOxiaClient;
 
@@ -67,6 +68,7 @@ final class UrsaPartitionLog {
     private static final long UNKNOWN_TIMESTAMP = -1L;
     private static final int MAX_ENTRIES_PER_FETCH = 10;
     private static final int FETCH_CURSOR_POOL_SIZE = 4;
+    private static final long CURSOR_CLOSE_RETRY_DELAY_MS = 100L;
 
     private final TopicIdPartition topicIdPartition;
     private final UrsaStorageState state;
@@ -85,8 +87,13 @@ final class UrsaPartitionLog {
     private final Set<OwnedWritePayload> ownedWritePayloads = ConcurrentHashMap.newKeySet();
     private CompletableFuture<Long> activeTrimFuture;
     private volatile LogCursorPool fetchCursorPool;
+    private LogCursorPool closingFetchCursorPool;
+    private final CompletableFuture<Void> cursorLifecycleDrain = new CompletableFuture<>();
+    private int activeCursorLifecycles;
+    private boolean cursorLifecyclesSealed;
     private volatile boolean closed;
     private CompletableFuture<Void> logCloseAttempt;
+    private final CompletableFuture<Void> logCloseDrain = new CompletableFuture<>();
     private boolean logClosed;
     private final ConcurrentHashMap<String, ProducerStateManager> producerStateManagers = new ConcurrentHashMap<>();
 
@@ -772,6 +779,9 @@ final class UrsaPartitionLog {
             long startOffset,
             long maxOffset,
             long targetTimestamp) {
+        if (!startCursorLifecycle()) {
+            return CompletableFuture.failedFuture(ownershipLostException());
+        }
         CompletableFuture<LogCursor> cursorFuture;
         try {
             cursorFuture = logInstance.openEphemeralCursor(
@@ -780,6 +790,7 @@ final class UrsaPartitionLog {
                 throw new IllegalStateException("Log.openEphemeralCursor returned null future");
             }
         } catch (Throwable openError) {
+            completeCursorLifecycle();
             return CompletableFuture.failedFuture(openError);
         }
         return runWithClosingCursor(
@@ -823,6 +834,9 @@ final class UrsaPartitionLog {
             Log logInstance,
             long startOffset,
             long maxOffset) {
+        if (!startCursorLifecycle()) {
+            return CompletableFuture.failedFuture(ownershipLostException());
+        }
         CompletableFuture<LogCursor> cursorFuture;
         try {
             cursorFuture = logInstance.openEphemeralCursor(
@@ -831,6 +845,7 @@ final class UrsaPartitionLog {
                 throw new IllegalStateException("Log.openEphemeralCursor returned null future");
             }
         } catch (Throwable openError) {
+            completeCursorLifecycle();
             return CompletableFuture.failedFuture(openError);
         }
         return runWithClosingCursor(
@@ -878,16 +893,26 @@ final class UrsaPartitionLog {
         CompletableFuture<T> result = new CompletableFuture<>();
         cursorFuture.whenComplete((cursor, openError) -> {
             if (openError != null) {
+                completeCursorLifecycle();
                 completeFromSource(result, cursorFuture, null, openError);
                 return;
             }
             if (cursor == null) {
+                completeCursorLifecycle();
                 result.completeExceptionally(
                         new IllegalStateException("Log.openEphemeralCursor returned null cursor"));
                 return;
             }
+            CompletableFuture<Void> closeDrain = new CompletableFuture<>();
+            closeDrain.whenComplete((ignored, closeError) -> completeCursorLifecycle());
+            if (closed) {
+                startCursorClose(cursor, closeDrain, purpose, false);
+                closeDrain.whenComplete((ignored, closeError) ->
+                        result.completeExceptionally(ownershipLostException()));
+                return;
+            }
             if (result.isDone()) {
-                closeCursorQuietly(cursor, purpose);
+                startCursorClose(cursor, closeDrain, purpose, false);
                 return;
             }
 
@@ -898,16 +923,89 @@ final class UrsaPartitionLog {
                     throw new IllegalStateException("Cursor operation returned null future");
                 }
             } catch (Throwable operationError) {
-                closeCursorQuietly(cursor, purpose);
-                result.completeExceptionally(operationError);
+                startCursorClose(cursor, closeDrain, purpose, false);
+                closeDrain.whenComplete((ignored, closeError) -> result.completeExceptionally(operationError));
                 return;
             }
             operationFuture.whenComplete((value, operationError) -> {
-                closeCursorQuietly(cursor, purpose);
-                completeFromSource(result, operationFuture, value, operationError);
+                startCursorClose(cursor, closeDrain, purpose, false);
+                closeDrain.whenComplete((ignored, closeError) ->
+                        completeFromSource(result, operationFuture, value, operationError));
             });
         });
         return result;
+    }
+
+    private synchronized boolean startCursorLifecycle() {
+        if (closed || cursorLifecyclesSealed) {
+            return false;
+        }
+        activeCursorLifecycles++;
+        return true;
+    }
+
+    private void completeCursorLifecycle() {
+        boolean drained;
+        synchronized (this) {
+            activeCursorLifecycles--;
+            drained = cursorLifecyclesSealed && activeCursorLifecycles == 0;
+        }
+        if (drained) {
+            cursorLifecycleDrain.complete(null);
+        }
+    }
+
+    private CompletableFuture<Void> sealCursorLifecycles() {
+        boolean drained;
+        synchronized (this) {
+            cursorLifecyclesSealed = true;
+            drained = activeCursorLifecycles == 0;
+        }
+        if (drained) {
+            cursorLifecycleDrain.complete(null);
+        }
+        return cursorLifecycleDrain;
+    }
+
+    private void startCursorClose(
+            LogCursor cursor,
+            CompletableFuture<Void> closeDrain,
+            String purpose,
+            boolean delayed) {
+        if (closeDrain.isDone()) {
+            return;
+        }
+        Runnable closeTask = () -> {
+            try {
+                cursor.close();
+                closeDrain.complete(null);
+            } catch (Throwable closeError) {
+                log.warn("Failed to close {} cursor for partition {}; retaining it for retry",
+                        purpose, topicIdPartition, closeError);
+                startCursorClose(cursor, closeDrain, purpose, true);
+            }
+        };
+        try {
+            ScheduledExecutorService closeScheduler = state.retiredResourceCloseScheduler();
+            if (closeScheduler != null && delayed) {
+                closeScheduler.schedule(
+                        closeTask, CURSOR_CLOSE_RETRY_DELAY_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } else if (closeScheduler != null) {
+                closeScheduler.execute(closeTask);
+            } else if (delayed) {
+                CompletableFuture.delayedExecutor(
+                        CURSOR_CLOSE_RETRY_DELAY_MS,
+                        java.util.concurrent.TimeUnit.MILLISECONDS).execute(closeTask);
+            } else {
+                CompletableFuture.runAsync(closeTask);
+            }
+        } catch (RuntimeException scheduleError) {
+            log.warn("Failed to schedule {} cursor close for partition {}; retaining it for retry",
+                    purpose, topicIdPartition, scheduleError);
+            CompletableFuture.delayedExecutor(
+                    CURSOR_CLOSE_RETRY_DELAY_MS,
+                    java.util.concurrent.TimeUnit.MILLISECONDS).execute(closeTask);
+        }
     }
 
     private <T> CompletableFuture<T> consumeLogEntries(
@@ -954,42 +1052,33 @@ final class UrsaPartitionLog {
         }
     }
 
-    private void closeCursorQuietly(LogCursor cursor, String purpose) {
-        try {
-            cursor.close();
-        } catch (Exception e) {
-            log.warn("Failed to close {} cursor for partition {}", purpose, topicIdPartition, e);
-        }
-    }
-
     private CompletableFuture<ListOffsetsPartitionResponse> listOffsetsNotFound() {
         return CompletableFuture.completedFuture(ListOffsetsPartitionResponse.success(topicIdPartition, -1L, -1L));
     }
 
     private Errors mapException(Throwable error) {
         Throwable cause = unwrapCompletionException(error);
-        if (cause instanceof NotLeaderOrFollowerException || isClosedOrFenced(cause)) {
+        if (hasCause(cause, NotLeaderOrFollowerException.class)
+                || hasCause(cause, LogFencedException.class)) {
             invalidate();
             return Errors.NOT_LEADER_OR_FOLLOWER;
         }
-        if (isNotFound(cause)) {
+        if (hasCause(cause, NoSuchStreamException.class)) {
             invalidate();
             return Errors.UNKNOWN_TOPIC_OR_PARTITION;
-        }
-        if (isOffsetOutOfRange(cause)) {
-            return Errors.OFFSET_OUT_OF_RANGE;
         }
         return Errors.KAFKA_STORAGE_ERROR;
     }
 
     private PartitionResponse writeErrorResponse(Throwable error) {
         Throwable cause = unwrapCompletionException(error);
-        if (cause instanceof NotLeaderOrFollowerException || isClosedOrFenced(cause)) {
+        if (hasCause(cause, NotLeaderOrFollowerException.class)
+                || hasCause(cause, LogFencedException.class)) {
             invalidate();
             log.info("Partition log is no longer local owner for partition {}", topicIdPartition, cause);
             return new PartitionResponse(Errors.NOT_LEADER_OR_FOLLOWER);
         }
-        if (isNotFound(cause)) {
+        if (hasCause(cause, NoSuchStreamException.class)) {
             invalidate();
             log.debug("Partition log is not provisioned yet for partition {}", topicIdPartition, cause);
             return new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION);
@@ -1007,52 +1096,10 @@ final class UrsaPartitionLog {
         return cause;
     }
 
-    private static boolean isClosedOrFenced(Throwable error) {
+    private static boolean hasCause(Throwable error, Class<? extends Throwable> type) {
         Throwable cause = error;
         while (cause != null) {
-            String className = cause.getClass().getSimpleName();
-            String message = cause.getMessage();
-            if (className.contains("Fenced")
-                    || className.contains("AlreadyClosed")
-                    || className.contains("ClosedException")
-                    || isClosedOrFencedMessage(message)) {
-                return true;
-            }
-            cause = cause.getCause();
-        }
-        return false;
-    }
-
-    private static boolean isClosedOrFencedMessage(String message) {
-        if (message == null) {
-            return false;
-        }
-        String normalized = message.trim().toLowerCase(Locale.ROOT);
-        if (normalized.equals("already closed") || normalized.startsWith("already closed:")) {
-            return true;
-        }
-        boolean lifecycleSubject = normalized.startsWith("stream ") || normalized.startsWith("log ");
-        return lifecycleSubject
-                && (normalized.endsWith(" is fenced") || normalized.endsWith(" is closed"));
-    }
-
-    private static boolean isNotFound(Throwable error) {
-        Throwable cause = error;
-        while (cause != null) {
-            String className = cause.getClass().getSimpleName();
-            if (className.contains("NotFound") || className.contains("NoSuchStream")) {
-                return true;
-            }
-            cause = cause.getCause();
-        }
-        return false;
-    }
-
-    private static boolean isOffsetOutOfRange(Throwable error) {
-        Throwable cause = error;
-        while (cause != null) {
-            String className = cause.getClass().getSimpleName();
-            if (className.contains("OffsetOutOfRange") || className.contains("NoSuchOffset")) {
+            if (type.isInstance(cause)) {
                 return true;
             }
             cause = cause.getCause();
@@ -1103,13 +1150,11 @@ final class UrsaPartitionLog {
 
     CompletableFuture<Void> close(boolean deletePartition) {
         CompletableFuture<Log> retentionFuture;
-        CompletableFuture<Long> trimFuture;
         boolean firstClose;
         synchronized (this) {
             firstClose = !closed;
             closed = true;
             retentionFuture = inFlightRetention.getAndSet(null);
-            trimFuture = activeTrimFuture;
         }
         if (firstClose) {
             pendingRetention.set(null);
@@ -1117,26 +1162,13 @@ final class UrsaPartitionLog {
             if (retentionFuture != null) {
                 retentionFuture.cancel(false);
             }
-            awaitTrimCompletion(trimFuture);
             cleanupWriteState();
             cleanupGlobalState();
             cleanup(deletePartition);
         }
         CompletableFuture<Void> closeAttempt = retryCloseLog();
         state.trackRetiredPartitionLog(this, closeAttempt);
-        return closeAttempt;
-    }
-
-    private void awaitTrimCompletion(CompletableFuture<Long> trimFuture) {
-        if (trimFuture == null) {
-            return;
-        }
-        trimFuture.handle((ignored, error) -> {
-            if (error != null) {
-                log.debug("Retention trim settled with an error while closing {}", topicIdPartition, error);
-            }
-            return null;
-        }).join();
+        return logCloseDrain;
     }
 
     void cleanupWriteState() {
@@ -1152,12 +1184,12 @@ final class UrsaPartitionLog {
     }
 
     void cleanupReadState() {
-        closeFetchCursorPool();
+        retireCursorPools();
     }
 
     boolean cleanupGlobalState() {
         boolean cleaned = logMetrics.remove(topicIdPartition);
-        return closeFetchCursorPool() || cleaned;
+        return retireCursorPools() || cleaned;
     }
 
     private synchronized boolean cleanupProducerState(String zone, boolean deletePartition) {
@@ -1299,7 +1331,7 @@ final class UrsaPartitionLog {
             inFlightRetention.compareAndSet(retentionFuture, null);
             if (error != null && !closed) {
                 Throwable cause = unwrapCompletionException(error);
-                if (isClosedOrFenced(cause)) {
+                if (hasCause(cause, LogFencedException.class)) {
                     invalidate();
                 } else {
                     log.warn("Failed to apply retention for {}", topicIdPartition, error);
@@ -1350,17 +1382,24 @@ final class UrsaPartitionLog {
                 throw new NotLeaderOrFollowerException("Partition log already replaced");
             }
             if (fetchCursorPool == null) {
-                fetchCursorPool = new LogCursorPool(
-                        logInstance,
-                        fetchCursorNamePrefix(topicIdPartition),
-                        FETCH_CURSOR_POOL_SIZE);
+                ScheduledExecutorService closeScheduler = state.retiredResourceCloseScheduler();
+                fetchCursorPool = closeScheduler == null
+                        ? new LogCursorPool(
+                                logInstance,
+                                fetchCursorNamePrefix(topicIdPartition),
+                                FETCH_CURSOR_POOL_SIZE)
+                        : new LogCursorPool(
+                                logInstance,
+                                fetchCursorNamePrefix(topicIdPartition),
+                                FETCH_CURSOR_POOL_SIZE,
+                                closeScheduler);
                 try {
                     logMetrics.register(topicIdPartition, logInstance);
-                } catch (Throwable registrationError) {
+                } catch (Throwable metricRegistrationError) {
                     logMetrics.remove(topicIdPartition);
                     fetchCursorPool.close();
                     fetchCursorPool = null;
-                    throw registrationError;
+                    throw metricRegistrationError;
                 }
             }
             initialized.complete(logInstance);
@@ -1369,25 +1408,35 @@ final class UrsaPartitionLog {
 
     synchronized CompletableFuture<Void> retryCloseLog() {
         if (logClosed) {
+            logCloseDrain.complete(null);
             return CompletableFuture.completedFuture(null);
         }
         if (logCloseAttempt != null && !logCloseAttempt.isDone()) {
             return logCloseAttempt;
         }
 
-        CompletableFuture<Void> attempt = logFuture
+        CompletableFuture<Void> trimDrain = activeTrimFuture == null
+                ? CompletableFuture.completedFuture(null)
+                : activeTrimFuture.handle((ignored, error) -> {
+                    if (error != null) {
+                        log.debug("Retention trim settled with an error while closing {}",
+                                topicIdPartition, error);
+                    }
+                    return null;
+                });
+        CompletableFuture<Void> cursorDrain = closeCursorPools();
+        CompletableFuture<Void> attempt = CompletableFuture.allOf(trimDrain, cursorDrain)
+                .thenCompose(ignored -> logFuture
                 .handle((logInstance, openError) -> {
                     if (openError != null || logInstance == null) {
                         return CompletableFuture.<Void>completedFuture(null);
                     }
-                    try {
-                        logInstance.close();
-                        return CompletableFuture.<Void>completedFuture(null);
-                    } catch (Throwable closeError) {
-                        return CompletableFuture.<Void>failedFuture(closeError);
-                    }
+                    CompletableFuture<Void> closeFuture = state.runRetiredResourceClose(logInstance::close);
+                    return closeFuture == null
+                            ? CompletableFuture.runAsync(() -> closeLogHandle(logInstance))
+                            : closeFuture;
                 })
-                .thenCompose(Function.identity());
+                .thenCompose(Function.identity()));
         logCloseAttempt = attempt;
         attempt.whenComplete((ignored, error) -> {
             synchronized (UrsaPartitionLog.this) {
@@ -1395,6 +1444,7 @@ final class UrsaPartitionLog {
                     logCloseAttempt = null;
                     if (error == null) {
                         logClosed = true;
+                        logCloseDrain.complete(null);
                     }
                 }
             }
@@ -1402,21 +1452,36 @@ final class UrsaPartitionLog {
         return attempt;
     }
 
-    private boolean closeFetchCursorPool() {
-        LogCursorPool pool;
-        synchronized (this) {
-            pool = fetchCursorPool;
-            fetchCursorPool = null;
-        }
-        if (pool == null) {
-            return false;
-        }
+    private static void closeLogHandle(Log logInstance) {
         try {
-            pool.close();
-        } catch (Exception e) {
-            log.warn("Failed to close fetch cursor pool for partition {}", topicIdPartition, e);
+            logInstance.close();
+        } catch (Throwable closeError) {
+            throw new CompletionException(closeError);
         }
-        return true;
+    }
+
+    private boolean retireCursorPools() {
+        LogCursorPool fetchPool;
+        synchronized (this) {
+            fetchPool = fetchCursorPool;
+            fetchCursorPool = null;
+            if (closingFetchCursorPool == null) {
+                closingFetchCursorPool = fetchPool;
+            }
+        }
+        if (fetchPool != null) {
+            fetchPool.close();
+        }
+        return fetchPool != null;
+    }
+
+    private synchronized CompletableFuture<Void> closeCursorPools() {
+        List<CompletableFuture<Void>> closes = new ArrayList<>(2);
+        if (closingFetchCursorPool != null) {
+            closes.add(closingFetchCursorPool.closeAsync());
+        }
+        closes.add(sealCursorLifecycles());
+        return CompletableFuture.allOf(closes.toArray(new CompletableFuture<?>[0]));
     }
 
     private static List<ProducerStateManager.AppendBatch> buildAppendBatches(MemoryRecords records) {

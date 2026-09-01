@@ -563,7 +563,7 @@ class BrokerServer(
         if (e != null) brokerMetadataPublisher.firstPublishFuture.completeExceptionally(e)
       })
       metadataPublishers.add(brokerMetadataPublisher)
-      metadataPublishers.add(new DisklessStateReconcilerPublisher(
+      metadataPublishers.add(new DisklessBrokerTopicDeletionReconciler(
         disklessStorageSupport,
         (topic: String) => replicaManager.maybeRemoveTopicMetrics(topic)
       ))

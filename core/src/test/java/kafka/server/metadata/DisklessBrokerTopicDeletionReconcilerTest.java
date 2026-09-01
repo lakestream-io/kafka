@@ -65,24 +65,24 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
-class DisklessStateReconcilerPublisherTest {
+class DisklessBrokerTopicDeletionReconcilerTest {
 
     @Test
     void testOnMetadataUpdateReconcilesEvenWithoutTopicsDelta() {
         DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
         @SuppressWarnings("unchecked")
         Consumer<String> callback = mock(Consumer.class);
-        DisklessStateReconcilerPublisher publisher =
-                new DisklessStateReconcilerPublisher(support, callback);
+        DisklessBrokerTopicDeletionReconciler reconciler =
+                new DisklessBrokerTopicDeletionReconciler(support, callback);
 
-        publisher.onMetadataUpdate(
+        reconciler.onMetadataUpdate(
                 new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build(),
                 MetadataImage.EMPTY,
                 mock(LoaderManifest.class)
         );
 
         verify(support).reconcileTrackedPartitions(eq(Collections.emptySet()), same(callback));
-        verify(support, never()).deleteTopicConfig(any());
+        verify(support, never()).fenceDeletedTopic(any(), any());
     }
 
     @Test
@@ -97,20 +97,18 @@ class DisklessStateReconcilerPublisherTest {
         DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
         @SuppressWarnings("unchecked")
         Consumer<String> callback = mock(Consumer.class);
-        DisklessStateReconcilerPublisher publisher =
-                new DisklessStateReconcilerPublisher(support, callback);
+        DisklessBrokerTopicDeletionReconciler reconciler =
+                new DisklessBrokerTopicDeletionReconciler(support, callback);
 
-        publisher.onMetadataUpdate(delta, MetadataImage.EMPTY, mock(LoaderManifest.class));
+        reconciler.onMetadataUpdate(delta, MetadataImage.EMPTY, mock(LoaderManifest.class));
 
         Set<TopicIdPartition> deletedPartitions = Set.of(
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 0)),
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 1)),
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 2))
         );
-        TopicIdPartition topicIdentity =
-                new TopicIdPartition(topicId, new TopicPartition(topicName, 0));
         InOrder lifecycleOrder = inOrder(support);
-        lifecycleOrder.verify(support).deleteTopicConfig(topicIdentity);
+        lifecycleOrder.verify(support).fenceDeletedTopic(topicName, topicId);
         lifecycleOrder.verify(support).reconcileTrackedPartitions(eq(deletedPartitions), same(callback));
     }
 
@@ -126,8 +124,8 @@ class DisklessStateReconcilerPublisherTest {
         DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
         @SuppressWarnings("unchecked")
         Consumer<String> callback = mock(Consumer.class);
-        DisklessStateReconcilerPublisher publisher =
-                new DisklessStateReconcilerPublisher(support, callback);
+        DisklessBrokerTopicDeletionReconciler reconciler =
+                new DisklessBrokerTopicDeletionReconciler(support, callback);
         TopicIdPartition topicIdentity =
                 new TopicIdPartition(topicId, new TopicPartition(topicName, 0));
         Set<TopicIdPartition> deletedPartitions = Set.of(topicIdentity);
@@ -137,9 +135,9 @@ class DisklessStateReconcilerPublisherTest {
             fenceStarted.countDown();
             assertTrue(allowFenceToComplete.await(10, TimeUnit.SECONDS));
             return null;
-        }).when(support).deleteTopicConfig(topicIdentity);
+        }).when(support).fenceDeletedTopic(topicName, topicId);
 
-        CompletableFuture<Void> update = CompletableFuture.runAsync(() -> publisher.onMetadataUpdate(
+        CompletableFuture<Void> update = CompletableFuture.runAsync(() -> reconciler.onMetadataUpdate(
                 delta,
                 MetadataImage.EMPTY,
                 mock(LoaderManifest.class)
@@ -166,13 +164,33 @@ class DisklessStateReconcilerPublisherTest {
         DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
         @SuppressWarnings("unchecked")
         Consumer<String> callback = mock(Consumer.class);
-        DisklessStateReconcilerPublisher publisher =
-                new DisklessStateReconcilerPublisher(support, callback);
+        DisklessBrokerTopicDeletionReconciler reconciler =
+                new DisklessBrokerTopicDeletionReconciler(support, callback);
 
-        publisher.onMetadataUpdate(delta, MetadataImage.EMPTY, mock(LoaderManifest.class));
+        reconciler.onMetadataUpdate(delta, MetadataImage.EMPTY, mock(LoaderManifest.class));
 
         verify(support).reconcileTrackedPartitions(eq(Collections.emptySet()), same(callback));
-        verify(support, never()).deleteTopicConfig(any());
+        verify(support, never()).fenceDeletedTopic(any(), any());
+    }
+
+    @Test
+    void testOnMetadataUpdateIgnoresInternalTopicWithDisklessConfig() {
+        Uuid topicId = Uuid.randomUuid();
+        MetadataImage oldImage = metadataImage("__consumer_offsets", topicId, 2, true);
+
+        MetadataDelta delta = new MetadataDelta.Builder().setImage(oldImage).build();
+        delta.replay(new RemoveTopicRecord().setTopicId(topicId));
+
+        DisklessStorageReplicaManagerSupport support = mock(DisklessStorageReplicaManagerSupport.class);
+        @SuppressWarnings("unchecked")
+        Consumer<String> callback = mock(Consumer.class);
+        DisklessBrokerTopicDeletionReconciler reconciler =
+                new DisklessBrokerTopicDeletionReconciler(support, callback);
+
+        reconciler.onMetadataUpdate(delta, MetadataImage.EMPTY, mock(LoaderManifest.class));
+
+        verify(support).reconcileTrackedPartitions(eq(Collections.emptySet()), same(callback));
+        verify(support, never()).fenceDeletedTopic(any(), any());
     }
 
     private static MetadataImage metadataImage(String topicName, Uuid topicId, int partitions, boolean disklessEnabled) {

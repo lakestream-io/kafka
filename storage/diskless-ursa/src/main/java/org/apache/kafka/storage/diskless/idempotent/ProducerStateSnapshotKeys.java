@@ -18,13 +18,13 @@ package org.apache.kafka.storage.diskless.idempotent;
 
 import org.apache.kafka.storage.diskless.DisklessClientZone;
 
-/**
- * Oxia key builder for diskless producer-state snapshots.
- */
+/** Oxia key builder for diskless producer-state snapshots. */
 public final class ProducerStateSnapshotKeys {
 
     private static final String SNAPSHOT_PREFIX = "producer-state-snapshot/";
     private static final String DELETED_TOPIC_PREFIX = "producer-state-snapshot-deleted/";
+    private static final String CLEANUP_JOURNAL_PREFIX = "producer-state-snapshot-cleanup/";
+    private static final String WRITER_CLAIM_PREFIX = "producer-state-snapshot-writer/";
     private static final String TOPIC_INDEX_NAME = "producer-state-snapshot-topic";
 
     private ProducerStateSnapshotKeys() {
@@ -52,6 +52,36 @@ public final class ProducerStateSnapshotKeys {
     /** Exclusive upper bound used to enumerate every durable deleted-topic marker. */
     public static String deletedTopicMarkerEndExclusive() {
         return DELETED_TOPIC_PREFIX + '\uffff';
+    }
+
+    /** Active cleanup journal used to resume interrupted snapshot deletion. */
+    public static String cleanupJournalKey(String topicId) {
+        return CLEANUP_JOURNAL_PREFIX + topicId;
+    }
+
+    /** Prefix shared by active cleanup journals. */
+    public static String cleanupJournalPrefix() {
+        return CLEANUP_JOURNAL_PREFIX;
+    }
+
+    /** Exclusive upper bound used to enumerate active cleanup journals. */
+    public static String cleanupJournalEndExclusive() {
+        return CLEANUP_JOURNAL_PREFIX + '\uffff';
+    }
+
+    /** Prefix shared by ephemeral writer claims for one exact topic incarnation. */
+    public static String writerClaimPrefix(String topicId) {
+        return WRITER_CLAIM_PREFIX + topicId + "/";
+    }
+
+    /** Exclusive upper bound used to enumerate active writer claims for one topic. */
+    public static String writerClaimEndExclusive(String topicId) {
+        return writerClaimPrefix(topicId) + '\uffff';
+    }
+
+    /** Unique ephemeral claim held by one producer-state manager. */
+    public static String writerClaimKey(String topicId, String managerId) {
+        return writerClaimPrefix(topicId) + managerId;
     }
 
     /** Oxia secondary index used to enumerate snapshots for one topic without a namespace scan. */

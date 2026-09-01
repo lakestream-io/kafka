@@ -921,6 +921,10 @@ public class ReplicationControlManager {
 
     private DisklessCreateTopicResult prepareDisklessCreateTopic(CreatableTopic topic, Map<String, String> creationConfigs) {
         if (Topic.isInternal(topic.name())) {
+            if (Boolean.parseBoolean(creationConfigs.get(URSA_STORAGE_ENABLE_CONFIG))) {
+                return DisklessCreateTopicResult.error(new ApiError(INVALID_REQUEST,
+                    "Kafka internal topic " + topic.name() + " cannot use diskless storage."));
+            }
             return DisklessCreateTopicResult.success(false, false);
         }
         String disklessEnableConfigValue = creationConfigs.get(URSA_STORAGE_ENABLE_CONFIG);

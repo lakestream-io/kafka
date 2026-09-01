@@ -17,7 +17,7 @@
 package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.Uuid;
-import org.apache.kafka.storage.diskless.DisklessProducerStateStore.ManagedProducerStateTopic;
+import org.apache.kafka.storage.diskless.DisklessProducerStateLifecycle.ManagedProducerStateTopic;
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 
@@ -38,7 +38,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
@@ -49,15 +51,17 @@ import io.oxia.client.api.options.DeleteOption;
 import io.oxia.client.api.options.ListOption;
 import io.oxia.client.api.options.PutOption;
 
-/** Oxia-backed persistence operations for Kafka-owned producer-state snapshots. */
-public final class OxiaDisklessProducerStateStore implements DisklessProducerStateStore {
-    private static final Logger log = LoggerFactory.getLogger(OxiaDisklessProducerStateStore.class);
+/** Oxia-backed lifecycle operations for Kafka-owned producer-state snapshots. */
+public final class OxiaDisklessProducerStateLifecycle implements DisklessProducerStateLifecycle {
+    private static final Logger log = LoggerFactory.getLogger(OxiaDisklessProducerStateLifecycle.class);
     private static final long CONNECT_TIMEOUT_SECONDS = 10;
     private static final long INVENTORY_READ_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
     private static final int DELETE_BATCH_SIZE = 32;
     private static final int INVENTORY_READ_BATCH_SIZE = 32;
     private static final int MAX_DELETE_PASSES = 10;
     private static final int MAX_MANIFEST_CAS_ATTEMPTS = 32;
+    private static final long WRITER_CLAIM_RETRY_DELAY_MILLIS = 100;
+    private static final int MAX_WRITER_CLAIM_POLLS = 100;
     private static final String MANAGED_TOPIC_PREFIX = "producer-state-managed-topic/";
     private static final int MANIFEST_MAGIC = 0x4b50534d;
     private static final short MANIFEST_VERSION = 1;
@@ -66,25 +70,55 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
 
     private final AsyncOxiaClient client;
     private final long inventoryReadTimeoutMs;
+    private final Executor writerClaimRetryExecutor;
+    private final int maxWriterClaimPolls;
 
-    public OxiaDisklessProducerStateStore(UrsaStorageConfig config) throws Exception {
+    public OxiaDisklessProducerStateLifecycle(UrsaStorageConfig config) throws Exception {
         Objects.requireNonNull(config, "config must not be null");
         this.client = new OxiaServiceUrl(config.getUrsaOxiaServiceUrl())
                 .client()
                 .get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         this.inventoryReadTimeoutMs = INVENTORY_READ_TIMEOUT_MILLIS;
+        this.writerClaimRetryExecutor = CompletableFuture.delayedExecutor(
+                WRITER_CLAIM_RETRY_DELAY_MILLIS, TimeUnit.MILLISECONDS);
+        this.maxWriterClaimPolls = MAX_WRITER_CLAIM_POLLS;
     }
 
-    OxiaDisklessProducerStateStore(AsyncOxiaClient client) {
-        this(client, INVENTORY_READ_TIMEOUT_MILLIS);
+    OxiaDisklessProducerStateLifecycle(AsyncOxiaClient client) {
+        this(client, INVENTORY_READ_TIMEOUT_MILLIS, CompletableFuture.delayedExecutor(
+                WRITER_CLAIM_RETRY_DELAY_MILLIS, TimeUnit.MILLISECONDS), MAX_WRITER_CLAIM_POLLS);
     }
 
-    OxiaDisklessProducerStateStore(AsyncOxiaClient client, long inventoryReadTimeoutMs) {
+    OxiaDisklessProducerStateLifecycle(AsyncOxiaClient client, long inventoryReadTimeoutMs) {
+        this(client, inventoryReadTimeoutMs, CompletableFuture.delayedExecutor(
+                WRITER_CLAIM_RETRY_DELAY_MILLIS, TimeUnit.MILLISECONDS), MAX_WRITER_CLAIM_POLLS);
+    }
+
+    OxiaDisklessProducerStateLifecycle(
+            AsyncOxiaClient client,
+            long inventoryReadTimeoutMs,
+            Executor writerClaimRetryExecutor
+    ) {
+        this(client, inventoryReadTimeoutMs, writerClaimRetryExecutor, MAX_WRITER_CLAIM_POLLS);
+    }
+
+    OxiaDisklessProducerStateLifecycle(
+            AsyncOxiaClient client,
+            long inventoryReadTimeoutMs,
+            Executor writerClaimRetryExecutor,
+            int maxWriterClaimPolls
+    ) {
         this.client = Objects.requireNonNull(client, "client must not be null");
         if (inventoryReadTimeoutMs <= 0) {
             throw new IllegalArgumentException("inventoryReadTimeoutMs must be positive");
         }
         this.inventoryReadTimeoutMs = inventoryReadTimeoutMs;
+        this.writerClaimRetryExecutor = Objects.requireNonNull(
+                writerClaimRetryExecutor, "writerClaimRetryExecutor must not be null");
+        if (maxWriterClaimPolls <= 0) {
+            throw new IllegalArgumentException("maxWriterClaimPolls must be positive");
+        }
+        this.maxWriterClaimPolls = maxWriterClaimPolls;
     }
 
     @Override
@@ -225,17 +259,10 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
     @Override
     public CompletableFuture<Void> deleteTopicSnapshots(Uuid topicId) {
         Objects.requireNonNull(topicId, "topicId must not be null");
-        String topicIdString = topicId.toString();
-        String topicPrefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicIdString);
-        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicIdString);
-        return putDeletionJournalIfAbsent(topicId, deletedTopicMarkerKey)
-                .thenCompose(ignored -> client.deleteRange(topicPrefix, topicPrefix + '\uffff'))
-                .thenCompose(ignored -> deleteTopicSnapshots(topicIdString, topicPrefix, 0))
-                .thenCompose(ignored -> moveManifestToDeletionJournal(
-                        topicId, MAX_MANIFEST_CAS_ATTEMPTS));
+        return new ProducerStateDeletion(topicId).start();
     }
 
-    private CompletableFuture<Void> putDeletionJournalIfAbsent(
+    private CompletableFuture<Void> putDeletionFenceIfAbsent(
             Uuid topicId,
             String deletedTopicMarkerKey
     ) {
@@ -244,6 +271,43 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
                 deletedTopicMarkerKey,
                 fallbackJournal,
                 Set.of(PutOption.IfRecordDoesNotExist))
+                .handle((ignored, error) -> {
+                    if (error == null) {
+                        return null;
+                    }
+                    Throwable failure = unwrapCompletionException(error);
+                    if (isConditionalConflict(failure)) {
+                        return null;
+                    }
+                    throw new CompletionException(failure);
+                });
+    }
+
+    private CompletableFuture<Void> putCleanupJournalIfAbsent(
+            Uuid topicId,
+            String cleanupJournalKey
+    ) {
+        String manifestKey = managedTopicKey(topicId);
+        return client.get(manifestKey).thenCompose(existing -> {
+            byte[] journalValue = serializeManifest(deletedTopicJournal(topicId));
+            if (existing != null) {
+                try {
+                    ManagedProducerStateTopic current = deserializeManifest(existing.value());
+                    requireManifestIdentity(manifestKey, topicId, current);
+                    journalValue = serializeManifest(current);
+                } catch (RuntimeException malformedManifest) {
+                    log.warn(
+                            "Using a fallback cleanup journal for malformed producer-state manifest {}",
+                            manifestKey,
+                            malformedManifest);
+                }
+            }
+            return putIfAbsent(cleanupJournalKey, journalValue);
+        });
+    }
+
+    private CompletableFuture<Void> putIfAbsent(String key, byte[] value) {
+        return client.put(key, value, Set.of(PutOption.IfRecordDoesNotExist))
                 .handle((ignored, error) -> {
                     if (error == null) {
                         return null;
@@ -291,7 +355,7 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
         return result;
     }
 
-    private CompletableFuture<Void> moveManifestToDeletionJournal(
+    private CompletableFuture<Void> deleteManifest(
             Uuid topicId,
             int attemptsRemaining
     ) {
@@ -300,42 +364,190 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
                     "Producer-state ownership manifest kept changing while deleting topic " + topicId));
         }
         String manifestKey = managedTopicKey(topicId);
-        String journalKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
         return client.get(manifestKey).thenCompose(existing -> {
             if (existing == null) {
                 return CompletableFuture.completedFuture(null);
             }
             long versionId = requireVersionId(existing);
-            byte[] candidateJournalValue;
-            try {
-                ManagedProducerStateTopic current = deserializeManifest(existing.value());
-                requireManifestIdentity(manifestKey, topicId, current);
-                candidateJournalValue = serializeManifest(current);
-            } catch (RuntimeException malformedManifest) {
-                log.warn(
-                        "Removing malformed producer-state ownership manifest {} after its deletion "
-                                + "journal was durably fenced",
-                        manifestKey,
-                        malformedManifest);
-                candidateJournalValue = serializeManifest(deletedTopicJournal(topicId));
-            }
-            byte[] journalValue = candidateJournalValue;
-            return client.put(journalKey, journalValue)
-                    .thenCompose(ignored -> client.delete(
-                            manifestKey,
-                            Set.of(DeleteOption.IfVersionIdEquals(versionId))))
+            return client.delete(manifestKey, Set.of(DeleteOption.IfVersionIdEquals(versionId)))
                     .handle((ignored, deleteError) -> {
                         if (deleteError == null) {
                             return CompletableFuture.<Void>completedFuture(null);
                         }
                         Throwable failure = unwrapCompletionException(deleteError);
                         if (failure instanceof UnexpectedVersionIdException) {
-                            return moveManifestToDeletionJournal(topicId, attemptsRemaining - 1);
+                            return deleteManifest(topicId, attemptsRemaining - 1);
                         }
                         return CompletableFuture.<Void>failedFuture(failure);
                     })
                     .thenCompose(result -> result);
         });
+    }
+
+    private final class ProducerStateDeletion {
+        private final Uuid topicId;
+        private final String topicIdString;
+        private final String topicPrefix;
+        private final String deletedTopicMarkerKey;
+        private final String cleanupJournalKey;
+        private final CompletableFuture<Void> result = new CompletableFuture<>();
+        private volatile CompletableFuture<?> activeStage;
+
+        private ProducerStateDeletion(Uuid topicId) {
+            this.topicId = topicId;
+            this.topicIdString = topicId.toString();
+            this.topicPrefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicIdString);
+            this.deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicIdString);
+            this.cleanupJournalKey = ProducerStateSnapshotKeys.cleanupJournalKey(topicIdString);
+        }
+
+        private CompletableFuture<Void> start() {
+            result.whenComplete((ignored, error) -> {
+                if (result.isCancelled()) {
+                    CompletableFuture<?> stage = activeStage;
+                    if (stage != null) {
+                        stage.cancel(true);
+                    }
+                }
+            });
+            execute(
+                    putCleanupJournalIfAbsent(topicId, cleanupJournalKey),
+                    this::installDeletionFence);
+            return result;
+        }
+
+        private void installDeletionFence() {
+            execute(
+                    putDeletionFenceIfAbsent(topicId, deletedTopicMarkerKey),
+                    this::waitForWriters);
+        }
+
+        private void waitForWriters() {
+            execute(
+                    new WriterClaimDrain(topicIdString).start(),
+                    this::deleteSnapshotRange);
+        }
+
+        private void deleteSnapshotRange() {
+            execute(
+                    client.deleteRange(topicPrefix, topicPrefix + '\uffff'),
+                    this::deleteIndexedSnapshots);
+        }
+
+        private void deleteIndexedSnapshots() {
+            execute(
+                    deleteTopicSnapshots(topicIdString, topicPrefix, 0),
+                    this::deleteOwnershipManifest);
+        }
+
+        private void deleteOwnershipManifest() {
+            execute(
+                    deleteManifest(topicId, MAX_MANIFEST_CAS_ATTEMPTS),
+                    this::retireCleanupJournal);
+        }
+
+        private void retireCleanupJournal() {
+            execute(
+                    client.delete(cleanupJournalKey),
+                    () -> result.complete(null));
+        }
+
+        private void execute(CompletableFuture<?> stage, Runnable next) {
+            if (result.isDone()) {
+                stage.cancel(true);
+                return;
+            }
+            activeStage = Objects.requireNonNull(stage, "Producer-state deletion stage returned null future");
+            stage.whenComplete((ignored, error) -> {
+                if (result.isDone()) {
+                    return;
+                }
+                if (error != null) {
+                    result.completeExceptionally(unwrapCompletionException(error));
+                    return;
+                }
+                next.run();
+            });
+        }
+    }
+
+    private final class WriterClaimDrain {
+        private final String topicId;
+        private final String claimPrefix;
+        private final CompletableFuture<Void> result = new CompletableFuture<>();
+        private volatile CompletableFuture<?> activeStage;
+
+        private WriterClaimDrain(String topicId) {
+            this.topicId = topicId;
+            this.claimPrefix = ProducerStateSnapshotKeys.writerClaimPrefix(topicId);
+        }
+
+        private CompletableFuture<Void> start() {
+            result.whenComplete((ignored, error) -> {
+                if (result.isCancelled()) {
+                    CompletableFuture<?> stage = activeStage;
+                    if (stage != null) {
+                        stage.cancel(true);
+                    }
+                }
+            });
+            poll(maxWriterClaimPolls);
+            return result;
+        }
+
+        private void poll(int attemptsRemaining) {
+            if (result.isDone()) {
+                return;
+            }
+            CompletableFuture<List<String>> listFuture;
+            try {
+                listFuture = Objects.requireNonNull(
+                        client.list(
+                                claimPrefix,
+                                ProducerStateSnapshotKeys.writerClaimEndExclusive(topicId)),
+                        "Oxia writer-claim list returned null future");
+            } catch (Throwable error) {
+                result.completeExceptionally(error);
+                return;
+            }
+            activeStage = listFuture;
+            listFuture.whenComplete((activeClaims, listError) -> {
+                if (result.isDone()) {
+                    return;
+                }
+                if (listError != null) {
+                    result.completeExceptionally(unwrapCompletionException(listError));
+                } else if (activeClaims.isEmpty()) {
+                    result.complete(null);
+                } else if (attemptsRemaining <= 1) {
+                    result.completeExceptionally(new TimeoutException(
+                            "Timed out waiting for producer-state writers to release topic " + topicId));
+                } else {
+                    scheduleNextPoll(attemptsRemaining - 1);
+                }
+            });
+        }
+
+        private void scheduleNextPoll(int attemptsRemaining) {
+            CompletableFuture<Void> delay;
+            try {
+                delay = CompletableFuture.runAsync(() -> { }, writerClaimRetryExecutor);
+            } catch (Throwable error) {
+                result.completeExceptionally(error);
+                return;
+            }
+            activeStage = delay;
+            delay.whenComplete((ignored, delayError) -> {
+                if (result.isDone()) {
+                    return;
+                }
+                if (delayError != null) {
+                    result.completeExceptionally(unwrapCompletionException(delayError));
+                } else {
+                    poll(attemptsRemaining);
+                }
+            });
+        }
     }
 
     private final class ManagedTopicInventory {
@@ -353,17 +565,17 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
             CompletableFuture<List<String>> manifestKeys = listKeys(
                     MANAGED_TOPIC_PREFIX,
                     MANAGED_TOPIC_PREFIX + '\uffff');
-            CompletableFuture<List<String>> deletionJournalKeys = listKeys(
-                    ProducerStateSnapshotKeys.deletedTopicMarkerPrefix(),
-                    ProducerStateSnapshotKeys.deletedTopicMarkerEndExclusive());
-            CompletableFuture.allOf(manifestKeys, deletionJournalKeys)
+            CompletableFuture<List<String>> cleanupJournalKeys = listKeys(
+                    ProducerStateSnapshotKeys.cleanupJournalPrefix(),
+                    ProducerStateSnapshotKeys.cleanupJournalEndExclusive());
+            CompletableFuture.allOf(manifestKeys, cleanupJournalKeys)
                     .whenComplete((ignored, listError) -> {
                         if (listError != null) {
                             fail(listError);
                             return;
                         }
                         if (!result.isDone()) {
-                            readInventoryEntries(manifestKeys.join(), deletionJournalKeys.join());
+                            readInventoryEntries(manifestKeys.join(), cleanupJournalKeys.join());
                         }
                     });
             return result;
@@ -381,12 +593,12 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
 
         private void readInventoryEntries(
                 List<String> manifestKeys,
-                List<String> deletionJournalKeys
+                List<String> cleanupJournalKeys
         ) {
             List<InventoryKey> inventoryKeys = new ArrayList<>(
-                    manifestKeys.size() + deletionJournalKeys.size());
+                    manifestKeys.size() + cleanupJournalKeys.size());
             manifestKeys.forEach(key -> inventoryKeys.add(new InventoryKey(key, false)));
-            deletionJournalKeys.forEach(key -> inventoryKeys.add(new InventoryKey(key, true)));
+            cleanupJournalKeys.forEach(key -> inventoryKeys.add(new InventoryKey(key, true)));
 
             CompletableFuture<Map<Uuid, ManagedProducerStateTopic>> batches =
                     CompletableFuture.completedFuture(new HashMap<>());
@@ -420,7 +632,7 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
             }
             List<CompletableFuture<ManagedProducerStateTopic>> reads = batch.stream()
                     .map(inventoryKey -> readInventoryEntry(
-                            inventoryKey.key(), inventoryKey.deletionJournal()))
+                            inventoryKey.key(), inventoryKey.cleanupJournal()))
                     .toList();
             return CompletableFuture.allOf(reads.toArray(CompletableFuture[]::new))
                     .thenApply(ignored -> {
@@ -430,7 +642,7 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
                                 topicsById.merge(
                                         topic.topicId(),
                                         topic,
-                                        OxiaDisklessProducerStateStore::preferInventoryEntry);
+                                        OxiaDisklessProducerStateLifecycle::preferInventoryEntry);
                             }
                         }
                         return topicsById;
@@ -439,7 +651,7 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
 
         private CompletableFuture<ManagedProducerStateTopic> readInventoryEntry(
                 String key,
-                boolean deletionJournal
+            boolean cleanupJournal
         ) {
             CompletableFuture<GetResult> source;
             try {
@@ -449,8 +661,8 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
             } catch (RuntimeException error) {
                 return CompletableFuture.failedFuture(error);
             }
-            return source.thenApply(getResult -> deletionJournal
-                    ? readDeletionJournal(key, getResult)
+            return source.thenApply(getResult -> cleanupJournal
+                    ? readCleanupJournal(key, getResult)
                     : readManifestIsolatingCorruption(key, getResult));
         }
 
@@ -472,7 +684,7 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
         }
     }
 
-    private record InventoryKey(String key, boolean deletionJournal) {
+    private record InventoryKey(String key, boolean cleanupJournal) {
     }
 
     private static ManagedProducerStateTopic readManifestIsolatingCorruption(
@@ -491,17 +703,17 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
         }
     }
 
-    private static ManagedProducerStateTopic readDeletionJournal(String key, GetResult result) {
+    private static ManagedProducerStateTopic readCleanupJournal(String key, GetResult result) {
         if (result == null) {
             return null;
         }
-        String prefix = ProducerStateSnapshotKeys.deletedTopicMarkerPrefix();
+        String prefix = ProducerStateSnapshotKeys.cleanupJournalPrefix();
         Uuid topicId;
         try {
             topicId = Uuid.fromString(key.substring(prefix.length()));
         } catch (RuntimeException malformedKey) {
             log.warn(
-                    "Skipping malformed producer-state deletion journal key {}; other inventory "
+                    "Skipping malformed producer-state cleanup journal key {}; other inventory "
                             + "entries will still be reconciled",
                     key,
                     malformedKey);
@@ -511,13 +723,13 @@ public final class OxiaDisklessProducerStateStore implements DisklessProducerSta
             ManagedProducerStateTopic topic = deserializeManifest(result.value());
             if (!topicId.equals(topic.topicId())) {
                 throw new IllegalStateException(
-                        "Producer-state deletion journal identity does not match key " + key);
+                        "Producer-state cleanup journal identity does not match key " + key);
             }
             return topic;
         } catch (RuntimeException malformedJournal) {
             log.warn(
-                    "Using the topic ID from malformed producer-state deletion journal {}; the "
-                            + "durable fence remains discoverable",
+                    "Using the topic ID from malformed producer-state cleanup journal {}; cleanup "
+                            + "remains discoverable",
                     key,
                     malformedJournal);
             return deletedTopicJournal(topicId);
