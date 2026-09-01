@@ -37,7 +37,6 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 import org.apache.kafka.common.test.TestKitNodes;
 import org.apache.kafka.metadata.BrokerState;
 import org.apache.kafka.server.config.ServerLogConfigs;
-import org.apache.kafka.server.util.Json;
 import org.apache.kafka.storage.diskless.handlers.KafkaLogNaming;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 import org.apache.kafka.test.TestUtils;
@@ -61,7 +60,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -72,12 +70,9 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-import io.lakestream.ursa.storage.Key;
-import io.lakestream.ursa.storage.impl.StorageFormat;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.OxiaClientBuilder;
-import io.oxia.client.api.options.GetOption;
 import io.oxia.client.api.options.PutOption;
 import io.oxia.testcontainers.OxiaContainer;
 
@@ -692,11 +687,13 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                         topicId, new TopicPartition(topicName, 0));
                 setTopicConfig(admin, topicResource, TopicConfig.RETENTION_MS_CONFIG, "60000");
                 waitForUrsaTopicConfig(topicIdPartition, Map.of(
+                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, topicName,
                         TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                         TopicConfig.RETENTION_MS_CONFIG, "60000"));
 
                 setTopicConfig(admin, topicResource, TopicConfig.RETENTION_BYTES_CONFIG, "1048576");
                 waitForUrsaTopicConfig(topicIdPartition, Map.of(
+                        KafkaLogNaming.KAFKA_TOPIC_NAME_PROPERTY, topicName,
                         TopicConfig.URSA_STORAGE_ENABLE_CONFIG, "true",
                         TopicConfig.RETENTION_MS_CONFIG, "60000",
                         TopicConfig.RETENTION_BYTES_CONFIG, "1048576"));
@@ -761,49 +758,49 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
     }
 
     /**
-     * Oxia metadata verification tests.
-     * Tests that catalog log metadata and stream config metadata are correctly stored in Oxia.
+     * Storage lifecycle verification tests.
+     * Tests Lakestream lifecycle semantics and cleanup of Kafka-owned producer state.
      */
     @Nested
-    @DisplayName("Oxia Metadata Tests")
-    class OxiaMetadataTests {
+    @DisplayName("Storage Lifecycle Tests")
+    class StorageLifecycleTests {
         private static final String TEST_PRODUCER_ZONE = "test-zone";
         private static final String TEST_PRODUCER_ZONE_WITH_PATH_SEPARATOR = "rack/0";
         private final Map<String, Uuid> topicIds = new ConcurrentHashMap<>();
 
         @Test
-        @DisplayName("Log metadata created under the neutral /streams catalog prefix")
-        void testLogMetadataCreatedUnderCatalogPrefix() throws Exception {
+        @DisplayName("Partition logs are accessible through the Lakestream catalog after I/O")
+        void testPartitionLogsAccessibleThroughLakestreamCatalog() throws Exception {
             String topicName = uniqueTopicName("log-metadata-topic");
 
             createDisklessTopic(cluster, topicName);
+            try (Admin admin = cluster.admin()) {
+                waitForTopicReady(admin, topicName, 1);
+            }
+            assertExternalStreamRegistered(topicName, 1);
             produceRecords(cluster.bootstrapServers(), topicName, 10);
             consumeAndVerifyRecords(cluster.bootstrapServers(), topicName, 10);
 
-            assertLogMetadataExistsInOxia(topicName);
-            log.info("Catalog log metadata test passed for topic {}", topicName);
+            assertPartitionLogsAccessible(topicName, 1);
+            log.info("Lakestream partition log test passed for topic {}", topicName);
         }
 
         @Test
-        @DisplayName("Partitioned topics metadata and related keys created and deleted correctly")
-        void testPartitionedTopicsMetadataCreatedAndDeleted() throws Exception {
+        @DisplayName("Partitioned stream lifecycle and producer state cleanup use owned APIs")
+        void testPartitionedStreamLifecycleAndProducerStateCleanup() throws Exception {
             String topicName = uniqueTopicName("partitioned-topics-metadata-topic");
             int numPartitions = 3;
 
             createDisklessTopic(cluster, topicName, numPartitions);
+            try (Admin admin = cluster.admin()) {
+                waitForTopicReady(admin, topicName, numPartitions);
+            }
             assertExternalStreamRegistered(topicName, numPartitions);
 
-            Map<Integer, Long> streamIds = new HashMap<>();
             for (int partition = 0; partition < numPartitions; partition++) {
                 produceRecords(cluster.bootstrapServers(), topicName, partition, 1);
-                assertLogMetadataExistsInOxia(topicName, partition);
             }
-            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
-                List<Long> logIds = catalogLogIds(catalog, topicName, numPartitions);
-                for (int partition = 0; partition < numPartitions; partition++) {
-                    streamIds.put(partition, logIds.get(partition));
-                }
-            }
+            assertPartitionLogsAccessible(topicName, numPartitions);
 
             Uuid topicId;
             try (Admin admin = cluster.admin()) {
@@ -822,53 +819,31 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
 
             assertExternalStreamUnregistered(topicName);
-            assertLogMetadataTombstonedInOxia(topicName, numPartitions);
             assertProducerStateSnapshotsDeletedFromOxia(topicId, numPartitions);
-            try (AsyncOxiaClient oxiaClient = createOxiaClient()) {
-                for (int partition = 0; partition < numPartitions; partition++) {
-                    assertLogStreamCleanedUpInOxia(
-                            oxiaClient,
-                            topicName,
-                            partition,
-                            streamIds.get(partition)
-                    );
-                }
-            }
-            log.info("Partitioned topics metadata test passed for topic {}", topicName);
+            log.info("Partitioned stream lifecycle test passed for topic {}", topicName);
         }
 
         @Test
         @Timeout(value = 600, unit = TimeUnit.SECONDS)
-        @DisplayName("Bulk diskless topic deletion cleans catalog log metadata and stream data")
-        void testBulkTopicDeletionCleansLogStreams() throws Exception {
+        @DisplayName("Bulk diskless topic deletion unregisters every Lakestream stream")
+        void testBulkTopicDeletionUnregistersStreams() throws Exception {
             int topicCount = 100;
             int partitionsPerTopic = 10;
             List<String> topicNames = createBulkDisklessTopics(topicCount, partitionsPerTopic);
 
             produceOneRecordPerPartition(cluster.bootstrapServers(), topicNames, partitionsPerTopic);
-
-            Map<TopicPartition, Long> streamIds;
-            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
-                streamIds = captureLogStreamIds(catalog, topicNames, partitionsPerTopic);
+            List<String> streamNames = new ArrayList<>(topicNames.size());
+            for (String topicName : topicNames) {
+                streamNames.add(catalogStreamName(topicName));
             }
 
             try (Admin admin = cluster.admin()) {
                 admin.deleteTopics(topicNames).all().get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
 
-            try (AsyncOxiaClient oxiaClient = createOxiaClient();
-                 IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
-                assertBulkTopicDeletionCleanedUp(
-                        oxiaClient, catalog, topicNames, partitionsPerTopic, streamIds, topicCount);
+            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
+                assertBulkStreamsUnregistered(catalog, streamNames, topicCount);
             }
-        }
-
-        private void assertLogMetadataExistsInOxia(String topicName) throws Exception {
-            assertLogMetadataExistsInOxia(topicName, 0);
-        }
-
-        private void assertLogMetadataExistsInOxia(String topicName, int partition) throws Exception {
-            assertOxiaKeyExists(logMetadataPath(topicName, partition), "LogMetadata");
         }
 
         private void assertExternalStreamRegistered(String topicName, int expectedPartitions)
@@ -901,9 +876,15 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private void assertLogMetadataTombstonedInOxia(String topicName, int partitions) throws Exception {
-            try (AsyncOxiaClient client = createOxiaClient()) {
-                assertLogMetadataTombstonedInOxia(client, topicName, partitions);
+        private void assertPartitionLogsAccessible(String topicName, int expectedPartitions) throws Exception {
+            try (IsolatedLakestreamCatalogProbe catalog = createCatalogProbe()) {
+                List<Long> logIds = catalog.partitionLogIds(
+                        KafkaLogNaming.NAMESPACE,
+                        catalogStreamName(topicName),
+                        10,
+                        TimeUnit.SECONDS);
+                assertEquals(expectedPartitions, logIds.size(),
+                        "Unexpected Lakestream partition log count for " + topicName);
             }
         }
 
@@ -968,12 +949,6 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             }
         }
 
-        private void assertOxiaKeyDeleted(String key, String description) throws Exception {
-            try (AsyncOxiaClient client = createOxiaClient()) {
-                assertOxiaKeyDeleted(client, key, description);
-            }
-        }
-
         private AsyncOxiaClient createOxiaClient() throws Exception {
             return OxiaClientBuilder.create(oxiaContainer.getServiceAddress())
                     .namespace(ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT)
@@ -1017,164 +992,35 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             return topicNames;
         }
 
-        private Map<TopicPartition, Long> captureLogStreamIds(
+        private void assertBulkStreamsUnregistered(
                 IsolatedLakestreamCatalogProbe catalog,
-                List<String> topicNames,
-                int partitions
-        ) throws Exception {
-            Map<TopicPartition, Long> streamIds = new HashMap<>();
-            for (String topicName : topicNames) {
-                List<Long> logIds = catalogLogIds(catalog, topicName, partitions);
-                for (int partition = 0; partition < partitions; partition++) {
-                    TopicPartition topicPartition = new TopicPartition(topicName, partition);
-                    streamIds.put(topicPartition, logIds.get(partition));
-                }
-            }
-            return streamIds;
-        }
-
-        private void assertBulkTopicDeletionCleanedUp(
-                AsyncOxiaClient client,
-                IsolatedLakestreamCatalogProbe catalog,
-                List<String> topicNames,
-                int partitionsPerTopic,
-                Map<TopicPartition, Long> streamIds,
+                List<String> streamNames,
                 int topicCount
         ) throws Exception {
             TestUtils.waitForCondition(() -> {
                 try {
-                    return areBulkTopicsDeleted(client, catalog, topicNames, partitionsPerTopic, streamIds);
+                    return areBulkStreamsUnregistered(catalog, streamNames);
                 } catch (Exception e) {
                     return false;
                 }
-            }, 120_000, 500, () -> "Timed out waiting for bulk log cleanup for " + topicCount + " topics");
+            }, 120_000, 500,
+                    () -> "Timed out waiting for bulk stream unregistration for " + topicCount + " topics");
         }
 
-        private boolean areBulkTopicsDeleted(
-                AsyncOxiaClient client,
+        private boolean areBulkStreamsUnregistered(
                 IsolatedLakestreamCatalogProbe catalog,
-                List<String> topicNames,
-                int partitionsPerTopic,
-                Map<TopicPartition, Long> streamIds
+                List<String> streamNames
         ) throws Exception {
-            for (String topicName : topicNames) {
+            for (String streamName : streamNames) {
                 if (catalog.streamExists(
                         KafkaLogNaming.NAMESPACE,
-                        catalogStreamName(topicName),
+                        streamName,
                         10,
                         TimeUnit.SECONDS)) {
                     return false;
                 }
-                for (int partition = 0; partition < partitionsPerTopic; partition++) {
-                    TopicPartition topicPartition = new TopicPartition(topicName, partition);
-                    if (!isLogMetadataTombstoned(client, topicName, partition)) {
-                        return false;
-                    }
-                    if (!isLogStreamCleanedUpInOxia(
-                            client,
-                            topicName,
-                            partition,
-                            streamIds.get(topicPartition))) {
-                        return false;
-                    }
-                }
             }
             return true;
-        }
-
-        private List<Long> catalogLogIds(
-                IsolatedLakestreamCatalogProbe catalog,
-                String topicName,
-                int expectedPartitions
-        ) throws Exception {
-            List<Long> logIds = catalog.partitionLogIds(
-                    KafkaLogNaming.NAMESPACE,
-                    catalogStreamName(topicName),
-                    10,
-                    TimeUnit.SECONDS);
-            assertEquals(expectedPartitions, logIds.size(),
-                    "Unexpected catalog log count for " + topicName);
-            return logIds;
-        }
-
-        private void assertLogMetadataTombstonedInOxia(
-                AsyncOxiaClient client,
-                String topicName,
-                int partitions
-        ) throws Exception {
-            for (int partition = 0; partition < partitions; partition++) {
-                int currentPartition = partition;
-                String metadataPath = logMetadataPath(topicName, currentPartition);
-                TestUtils.waitForCondition(() -> {
-                    try {
-                        return isLogMetadataTombstoned(client, topicName, currentPartition);
-                    } catch (Exception e) {
-                        return false;
-                    }
-                }, 30_000, 100,
-                        () -> "Timed out waiting for LogMetadata tombstone in Oxia: "
-                                + metadataPath);
-            }
-        }
-
-        private boolean isLogMetadataTombstoned(
-                AsyncOxiaClient client,
-                String topicName,
-                int partition
-        ) throws Exception {
-            GetResult result = client.get(logMetadataPath(topicName, partition))
-                    .get(10, TimeUnit.SECONDS);
-            return result != null
-                    && result.value() != null
-                    && Json.tryParseBytes(result.value())
-                            .asJsonObject()
-                            .apply("deleted")
-                            .node()
-                            .asBoolean(false);
-        }
-
-        private void assertLogStreamCleanedUpInOxia(
-                AsyncOxiaClient client,
-                String topicName,
-                int partition,
-                long streamId
-        ) throws Exception {
-            TestUtils.waitForCondition(() -> {
-                try {
-                    return isLogStreamCleanedUpInOxia(client, topicName, partition, streamId);
-                } catch (Exception e) {
-                    return false;
-                }
-            }, 30_000, 100,
-                    () -> "Timed out waiting for stream cleanup and mapping fence for "
-                            + topicName + "-" + partition);
-        }
-
-        private boolean isLogStreamCleanedUpInOxia(
-                AsyncOxiaClient client,
-                String topicName,
-                int partition,
-                long streamId
-        ) throws Exception {
-            List<String> streamIndexes = client.list(
-                    Key.smallestKey(streamId).toString(),
-                    Key.largestKey(streamId).toString()
-            ).get(10, TimeUnit.SECONDS);
-            if (!streamIndexes.isEmpty()) {
-                return false;
-            }
-
-            GetResult streamIdResult = client.get(
-                    StorageFormat.STREAM_ID_GENERATOR_PATH + "/" + logName(topicName, partition),
-                    Set.of(GetOption.PartitionKey(StorageFormat.STREAM_ID_GENERATOR_PATH))
-            ).get(10, TimeUnit.SECONDS);
-            if (streamIdResult == null || streamIdResult.value() == null) {
-                return false;
-            }
-            // Permanent deletion keeps this tombstone to fence stale keyed allocators.
-            var mapping = Json.tryParseBytes(streamIdResult.value()).asJsonObject();
-            return "TOMBSTONE".equals(mapping.apply("state").node().asText())
-                    && streamId == mapping.apply("streamId").node().asLong(-1L);
         }
 
         private void assertOxiaKeyExists(AsyncOxiaClient client, String key, String description) throws Exception {
@@ -1203,10 +1049,6 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             return result == null || result.value() == null;
         }
 
-        private String logMetadataPath(String topicName, int partition) throws Exception {
-            return "/streams/" + logName(topicName, partition);
-        }
-
         private String catalogStreamName(String topicName) throws Exception {
             TopicIdPartition topicIdPartition = new TopicIdPartition(
                     topicId(topicName),
@@ -1222,12 +1064,6 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             properties.setProperty("storagePath", baseDir.toString());
             properties.setProperty("oxiaStorageUrl", catalogUri);
             return IsolatedLakestreamCatalogProbe.open(cluster, catalogUri, properties);
-        }
-
-        private String logName(String topicName, int partition) throws Exception {
-            return KafkaLogNaming.logName(new TopicIdPartition(
-                    topicId(topicName),
-                    new TopicPartition(topicName, partition)));
         }
 
         private Uuid topicId(String topicName) throws Exception {

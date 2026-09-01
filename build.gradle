@@ -1090,14 +1090,11 @@ project(':server') {
     testImplementation 'io.github.oxia-db:oxia-testcontainers:0.7.4'
     testImplementation platform("io.lakestream:ursa-storage:$ursaStorageVersion")
     testImplementation 'io.github.oxia-db:oxia-client-api'
+    testRuntimeOnly 'io.github.oxia-db:oxia-client'
     testImplementation 'org.testcontainers:testcontainers:1.21.4'
     testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
     testImplementation 'org.testcontainers:localstack:1.21.4'
     testImplementation 'org.awaitility:awaitility:4.2.0'
-    testImplementation("io.lakestream:ursa-storage-core:$ursaStorageVersion") {
-      exclude group: 'io.confluent', module: 'kafka-schema-registry-client'
-      exclude group: 'org.apache.kafka', module: 'kafka-clients'
-    }
     testRuntimeOnly runtimeTestLibs
   }
 
@@ -1320,13 +1317,6 @@ project(':core') {
     testImplementation project(':test-common:test-common-runtime')
     testImplementation project(':test-common:test-common-internal-api')
     testImplementation project(':test-common:test-common-util')
-    testImplementation 'io.github.oxia-db:oxia-testcontainers:0.7.4'
-    testImplementation 'org.testcontainers:testcontainers:1.21.4'
-    testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
-    testImplementation 'org.awaitility:awaitility:4.2.0'
-    testImplementation platform("io.lakestream:ursa-storage:$ursaStorageVersion")
-    testImplementation 'io.github.oxia-db:oxia-client-api'
-    testImplementation 'io.github.oxia-db:oxia-client'
     testImplementation libs.bcpkix
     testImplementation libs.mockitoCore
     testImplementation(libs.apacheda) {

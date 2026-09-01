@@ -313,8 +313,8 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
         }
 
         @Test
-        @DisplayName("Restarted former owner only regains diskless state after it becomes owner again")
-        void testRestartedFormerOwnerHasExclusiveStateOnlyWhenItBecomesOwnerAgain() throws Exception {
+        @DisplayName("Restarted former owner regains diskless state only after owner I/O")
+        void testRestartedFormerOwnerHasExclusiveStateOnlyAfterOwnerIo() throws Exception {
             String topicName = uniqueTopicName("s3-owner-restart-exclusive-state-topic");
             TopicPartition topicPartition = new TopicPartition(topicName, 0);
             int numRecords = 15;
@@ -360,8 +360,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                 assertNotEquals(originalOwnerBrokerId, failoverOwnerBrokerId,
                         "Ownership should move away from the shut down broker");
 
-                waitForExclusivePartitionLogState(
-                        survivingBrokerIds, failoverOwnerBrokerId, topicIdPartition);
+                waitForNoPartitionLogState(survivingBrokerIds, topicIdPartition);
                 consumeAndVerifyRecords(brokerBootstrap(failoverOwnerBrokerId), topicName, 0, numRecords);
                 waitForExclusivePartitionLogState(survivingBrokerIds, failoverOwnerBrokerId, topicIdPartition);
                 waitForDisklessLogMetrics(topicName, 0, true);
@@ -374,7 +373,7 @@ public class UrsaStorageS3MultiBrokerE2ETest extends AbstractUrsaStorageS3MultiB
                     waitForPartitionLeadership(admin, topicName, 0, originalOwnerBrokerId);
                 }
 
-                waitForExclusivePartitionLogState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
+                waitForNoPartitionLogState(allBrokerIds, topicIdPartition);
                 consumeAndVerifyRecords(brokerBootstrap(originalOwnerBrokerId), topicName, 0, numRecords);
                 waitForExclusivePartitionLogState(allBrokerIds, originalOwnerBrokerId, topicIdPartition);
                 waitForDisklessLogMetrics(topicName, 0, true);

@@ -126,6 +126,8 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                         "Zone-b metadata should expose the expected broker rack");
             }
 
+            verifyPartitionLogStateForIoOwners(topicIdPartition, Set.of());
+
             String zoneABootstrap = brokerBootstrap(zoneAOwnerBrokerId);
 
             try (Producer<byte[], byte[]> producer =
@@ -140,8 +142,7 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                 producer.flush();
             }
 
-            verifyPartitionLogStateForZoneOwners(
-                    topicIdPartition, zoneAOwnerBrokerId, zoneBOwnerBrokerId);
+            verifyPartitionLogStateForIoOwners(topicIdPartition, Set.of(zoneBOwnerBrokerId));
 
             try (Consumer<byte[], byte[]> consumer = createMultiBrokerConsumer(
                     zoneABootstrap,
@@ -161,8 +162,7 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                 }
             }
 
-            verifyPartitionLogStateForZoneOwners(
-                    topicIdPartition, zoneAOwnerBrokerId, zoneBOwnerBrokerId);
+            verifyPartitionLogStateForIoOwners(topicIdPartition, Set.of(zoneBOwnerBrokerId));
         }
 
         @Test
@@ -184,6 +184,7 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                     zoneOwnerContext.zoneBOwnerBrokerId,
                     zoneAClientId,
                     zoneBClientId);
+            verifyPartitionLogStateForIoOwners(zoneOwnerContext.topicIdPartition, Set.of());
 
             Set<String> expectedPayloads = expectedConcurrentZonePayloads(producersPerZone, recordsPerProducer);
             ConcurrentZoneTrafficResult trafficResult = runConcurrentMultiZoneTraffic(
@@ -202,10 +203,9 @@ public class UrsaStorageS3MultiBrokerZoneAwareE2ETest extends AbstractUrsaStorag
                     "Zone-a consumer should observe every payload written by both zones");
             assertEquals(expectedPayloads, trafficResult.zoneBObservedPayloads,
                     "Zone-b consumer should observe every payload written by both zones");
-            verifyPartitionLogStateForZoneOwners(
+            verifyPartitionLogStateForIoOwners(
                     zoneOwnerContext.topicIdPartition,
-                    zoneOwnerContext.zoneAOwnerBrokerId,
-                    zoneOwnerContext.zoneBOwnerBrokerId);
+                    Set.of(zoneOwnerContext.zoneAOwnerBrokerId, zoneOwnerContext.zoneBOwnerBrokerId));
         }
     }
 }

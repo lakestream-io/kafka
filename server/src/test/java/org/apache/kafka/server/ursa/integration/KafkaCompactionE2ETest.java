@@ -322,6 +322,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 .withEnv("URSA_COMPACTED_FILE_SIZE_LIMIT", String.valueOf(10 * 1024))
                 .withEnv("URSA_TAIL_VISIBILITY_INTERVAL_SECONDS", "5")
                 .withEnv("URSA_REFRESH_LOG_INTERVAL_SECONDS", "5")
+                .withEnv("URSA_INTERNAL_COMPACTION_TASK_PUBLISHER_ENABLED", "true")
                 .withEnv("URSA_COMPACTED_THREAD_NUM", "2")
                 .withEnv("URSA_PUBLISH_THREAD_NUM", "2")
                 .withEnv("URSA_COMMIT_THREAD_NUM", "2")
@@ -369,6 +370,7 @@ public class KafkaCompactionE2ETest extends UrsaStorageE2ETestBase {
                 property compactedFileSizeLimit "$URSA_COMPACTED_FILE_SIZE_LIMIT"
                 property tailCompactDataVisibilityIntervalInSeconds "$URSA_TAIL_VISIBILITY_INTERVAL_SECONDS"
                 property refreshLocalTopicInternalInSeconds "$URSA_REFRESH_LOG_INTERVAL_SECONDS"
+                property internalCompactionTaskPublisherEnabled "$URSA_INTERNAL_COMPACTION_TASK_PUBLISHER_ENABLED"
                 property compactedThreadNum "$URSA_COMPACTED_THREAD_NUM"
                 property publishThreadNum "$URSA_PUBLISH_THREAD_NUM"
                 property commitThreadNum "$URSA_COMMIT_THREAD_NUM"

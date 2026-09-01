@@ -702,24 +702,23 @@ bash ./run-localstack-compaction-demo.sh
 - Standalone Ursa compactor Maven package (built from the `ursa-storage` repository)
 - LocalStack or real S3 for storage backend
 
-### Storage metadata compatibility
+### Lakestream identity compatibility
 
-Every partition log and materialization stream is scoped to the Kafka topic incarnation, not only
-the reusable topic name. For topic ID `<uuid>`, the canonical identities are:
+Every Lakestream stream and partition log is scoped to the Kafka topic incarnation, not only the
+reusable topic name. For topic ID `<uuid>`, the canonical identities are:
 
-- partition log and compaction task: `default/<topic>-topic-id-<uuid>-partition-N`
+- partition log: `default/<topic>-topic-id-<uuid>-partition-N`
 - Lakestream aggregate stream: `default/<topic>-topic-id-<uuid>`
-- catalog log metadata: `/streams/default/<topic>-topic-id-<uuid>-partition-N`
-- keyed stream-ID mapping: `/stream-id-generator/default/<topic>-topic-id-<uuid>-partition-N`
 
 Kafka also stores the stable logical topic name in the aggregate stream property
 `lakestream.kafka.topic.name`. Ursa materialization uses that value for Schema Registry subjects;
 it must not infer the logical topic from the UUID-qualified physical stream name.
 
 The Ursa compactor publishes diskless tasks from these incarnation-qualified Lakestream identities;
-there is no Kafka-side diskless publisher cache. If deletion cleanup fails, the old metadata can
-remain orphaned, but a recreated topic receives a distinct log, catalog stream, publication cursor,
-and object path and cannot attach to the orphan.
+there is no Kafka-side diskless publisher cache. The catalog's Oxia keys, stream-ID mappings,
+tombstones, task records, and object paths are private Ursa implementation details and are not part
+of Kafka's integration contract. If deletion cleanup fails, old storage state can remain orphaned,
+but a recreated topic receives a distinct Lakestream identity and cannot attach to the orphan.
 
 In-place rolling upgrades from earlier experimental name-only diskless-storage metadata layouts are
 not supported. Deploy this version with an empty Oxia namespace, or perform an offline metadata and

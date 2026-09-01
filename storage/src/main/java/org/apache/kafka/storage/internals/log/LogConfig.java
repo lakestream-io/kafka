@@ -187,9 +187,6 @@ public class LogConfig extends AbstractConfig {
             .define(ServerLogConfigs.URSA_STORAGE_TOPIC_DEFAULT_ENABLE_CONFIG, BOOLEAN,
                     ServerLogConfigs.URSA_STORAGE_TOPIC_DEFAULT_ENABLE_DEFAULT, HIGH,
                     ServerLogConfigs.URSA_STORAGE_TOPIC_DEFAULT_ENABLE_DOC)
-            .define(ServerLogConfigs.INTERCEPTOR_CLASS_NAME_CONFIG, STRING,
-                    ServerLogConfigs.INTERCEPTOR_CLASS_NAME_DEFAULT,
-                    new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.INTERCEPTOR_CLASS_NAME_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG, STRING,
                     ServerLogConfigs.URSA_STORAGE_CLASS_PATH_DEFAULT, LOW,
                     ServerLogConfigs.URSA_STORAGE_CLASS_PATH_DOC)

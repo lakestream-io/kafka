@@ -363,11 +363,27 @@ abstract class AbstractUrsaStorageS3MultiBrokerE2ETest extends UrsaStorageE2ETes
             int expectedOwnerBrokerId,
             TopicIdPartition topicIdPartition
     ) throws InterruptedException {
+        waitForPartitionLogStateOnBrokers(
+                brokerIds, Set.of(expectedOwnerBrokerId), topicIdPartition);
+    }
+
+    protected void waitForNoPartitionLogState(
+            List<Integer> brokerIds,
+            TopicIdPartition topicIdPartition
+    ) throws InterruptedException {
+        waitForPartitionLogStateOnBrokers(brokerIds, Set.of(), topicIdPartition);
+    }
+
+    private void waitForPartitionLogStateOnBrokers(
+            List<Integer> brokerIds,
+            Set<Integer> expectedStateBrokerIds,
+            TopicIdPartition topicIdPartition
+    ) throws InterruptedException {
         TestUtils.waitForCondition(
                 () -> {
                     try {
                         for (int brokerId : brokerIds) {
-                            boolean expected = brokerId == expectedOwnerBrokerId;
+                            boolean expected = expectedStateBrokerIds.contains(brokerId);
                             if (brokerHasPartitionLogState(brokerId, topicIdPartition) != expected) {
                                 return false;
                             }
@@ -378,7 +394,7 @@ abstract class AbstractUrsaStorageS3MultiBrokerE2ETest extends UrsaStorageE2ETes
                     }
                 },
                 30_000L,
-                "Expected only broker " + expectedOwnerBrokerId + " to retain partition log state for "
+                "Expected only brokers " + expectedStateBrokerIds + " to retain partition log state for "
                         + topicIdPartition + " across brokers " + brokerIds);
     }
 
@@ -736,25 +752,15 @@ abstract class AbstractUrsaStorageS3MultiBrokerE2ETest extends UrsaStorageE2ETes
         }
     }
 
-    protected void verifyPartitionLogStateForZoneOwners(
+    protected void verifyPartitionLogStateForIoOwners(
             TopicIdPartition topicIdPartition,
-            int zoneAOwnerBrokerId,
-            int zoneBOwnerBrokerId
+            Set<Integer> ioOwnerBrokerIds
     ) throws Exception {
-        int unzonedOwnerBrokerId = selectOwnerBroker(
-                topicIdPartition.topicId(),
-                topicIdPartition.partition(),
-                brokerNodesWithRacks());
-        Set<Integer> expectedOwnerBrokerIds = new HashSet<>();
-        expectedOwnerBrokerIds.add(zoneAOwnerBrokerId);
-        expectedOwnerBrokerIds.add(zoneBOwnerBrokerId);
-        expectedOwnerBrokerIds.add(unzonedOwnerBrokerId);
-
         for (int brokerId = 0; brokerId < NUM_BROKERS; brokerId++) {
             waitForBrokerPartitionLogState(
                     brokerId,
                     topicIdPartition,
-                    expectedOwnerBrokerIds.contains(brokerId));
+                    ioOwnerBrokerIds.contains(brokerId));
         }
     }
 }

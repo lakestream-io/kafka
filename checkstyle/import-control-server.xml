@@ -77,8 +77,6 @@
   <allow pkg="io.oxia.client.api" />
   <allow pkg="org.awaitility" />
   <allow pkg="io.opentelemetry.api" />
-  <allow pkg="io.lakestream.api" />
-  <allow pkg="io.lakestream.ursa.storage" />
   <allow class="org.apache.kafka.storage.diskless.handlers.KafkaLogNaming" />
   <allow class="org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys" />
 
