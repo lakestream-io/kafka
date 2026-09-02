@@ -53,6 +53,7 @@ import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
 import io.lakestream.api.LogOffset;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.GetResult;
 import io.oxia.client.api.PutResult;
@@ -75,6 +76,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -352,39 +354,6 @@ class ProducerStateManagerTest {
     }
 
     @Test
-    void testCleanupWithoutDeleteRemovesLateClaimAfterTopicDeletion() throws Exception {
-        TopicIdPartition tp = testTopicPartition();
-        String topicId = tp.topicId().toString();
-        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
-        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
-        byte[] snapshot = ProducerStateSerDes.emptySnapshot();
-        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
-        CompletableFuture<PutResult> claimGate = new CompletableFuture<>();
-        snapshotStore.queuePut(snapshotKey, claimGate);
-        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
-
-        CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
-                batch(1L, (short) 0, 0, 0, 1, 1000L)
-        ));
-        verify(snapshotStore.client(), timeout(5_000))
-                .put(eq(snapshotKey), any(byte[].class), anySet());
-
-        CompletableFuture<Void> cleanupFuture = manager.cleanup(false);
-        assertFalse(cleanupFuture.isDone(), "Cleanup must drain the in-flight recovery claim");
-
-        snapshotStore.storeValue(deletedTopicMarkerKey, new byte[] {1}, 1L);
-        snapshotStore.storeValue(snapshotKey, snapshot, 2L);
-        claimGate.complete(new PutResult(snapshotKey, InMemorySnapshotStore.version(2L)));
-        cleanupFuture.get();
-
-        assertFalse(snapshotStore.data().containsKey(snapshotKey));
-        assertTrue(snapshotStore.data().containsKey(deletedTopicMarkerKey));
-        ExecutionException prepareError = assertThrows(ExecutionException.class, prepareFuture::get);
-        assertInstanceOf(IllegalStateException.class, prepareError.getCause());
-        verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
-    }
-
-    @Test
     void testCleanupWithDeleteWaitsForRecoveryClaimAndDeletesOwnedSnapshot() throws Exception {
         TopicIdPartition tp = testTopicPartition();
         String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(
@@ -413,66 +382,6 @@ class ProducerStateManagerTest {
         ExecutionException prepareError = assertThrows(ExecutionException.class, prepareFuture::get);
         assertInstanceOf(IllegalStateException.class, prepareError.getCause());
         verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
-    }
-
-    @Test
-    void testSnapshotDeletesItselfWhenTopicDeletionRacesWithWrite() throws Exception {
-        TopicIdPartition tp = testTopicPartition();
-        String topicId = tp.topicId().toString();
-        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
-        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
-        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
-
-        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
-        try {
-            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
-                    batch(1L, (short) 0, 0, 0, 1, 1000L)
-            )).get());
-            manager.completeAppend(pendingAppend, 0L, 1000L);
-
-            snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.completedFuture(null));
-            snapshotStore.queueGet(
-                    deletedTopicMarkerKey, CompletableFuture.completedFuture(mock(GetResult.class)));
-            manager.takeSnapshot("test").get();
-
-            assertFalse(snapshotStore.data().containsKey(snapshotKey));
-            verify(snapshotStore.client(), never()).delete(snapshotKey);
-            verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
-        } finally {
-            manager.close();
-        }
-    }
-
-    @Test
-    void testSnapshotDeletesItselfWhenPostWriteMarkerCheckFails() throws Exception {
-        TopicIdPartition tp = testTopicPartition();
-        String topicId = tp.topicId().toString();
-        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
-        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
-        RuntimeException markerFailure = new RuntimeException("marker read failed");
-        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
-
-        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
-        try {
-            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
-                    batch(1L, (short) 0, 0, 0, 1, 1000L)
-            )).get());
-            manager.completeAppend(pendingAppend, 0L, 1000L);
-
-            snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.completedFuture(null));
-            snapshotStore.queueGet(
-                    deletedTopicMarkerKey, CompletableFuture.failedFuture(markerFailure));
-            ExecutionException error = assertThrows(
-                    ExecutionException.class, () -> manager.takeSnapshot("test").get());
-
-            assertSame(markerFailure, error.getCause());
-            assertFalse(snapshotStore.data().containsKey(snapshotKey));
-            verify(snapshotStore.client(), never()).delete(snapshotKey);
-            verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
-            manager.cleanup(true).get();
-        } finally {
-            manager.close();
-        }
     }
 
     @Test
@@ -515,6 +424,43 @@ class ProducerStateManagerTest {
             manager.close();
         }
     }
+
+    @Test
+    void testSnapshotIsNotWrittenWhenTopicIsFenced() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            manager.completeAppend(pendingAppend, 0L, 1000L);
+            // Only the empty recovery claim has been written so far.
+            assertTrue(ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).isEmpty());
+            clearInvocations(snapshotStore.client());
+            snapshotStore.putFence(tp.topicId());
+
+            manager.takeSnapshot("test").get();
+
+            assertTrue(ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).isEmpty());
+            verify(snapshotStore.client(), never()).put(
+                    startsWith(ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId)),
+                    any(byte[].class),
+                    anySet());
+
+            ExecutionException appendError = assertThrows(
+                    ExecutionException.class, () -> manager.prepareAppend(List.of(
+                            batch(1L, (short) 0, 1, 1, 1, 2000L)
+                    )).get());
+            assertInstanceOf(NotLeaderOrFollowerException.class, appendError.getCause());
+        } finally {
+            manager.close();
+        }
+    }
+
 
     @Test
     void testPeriodicSnapshotStartsOnlyAfterRecoveryClaimCompletes() throws Exception {
@@ -597,37 +543,6 @@ class ProducerStateManagerTest {
 
             periodicTaskCaptor.getValue().run();
             verify(snapshotStore.client()).get(deletedTopicMarkerKey);
-        } finally {
-            manager.cleanup(true).get();
-        }
-    }
-
-    @Test
-    void testDeletionFenceRacingWriterClaimPreventsSnapshotClaimAndReleasesWriter() throws Exception {
-        TopicIdPartition tp = testTopicPartition();
-        String topicId = tp.topicId().toString();
-        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
-        String writerClaimPrefix = ProducerStateSnapshotKeys.writerClaimPrefix(topicId);
-        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
-        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
-        CompletableFuture<GetResult> postClaimFenceRead = new CompletableFuture<>();
-        snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.completedFuture(null));
-        snapshotStore.queueGet(deletedTopicMarkerKey, postClaimFenceRead);
-        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
-
-        try {
-            CompletableFuture<ProducerStateManager.PrepareResult> prepare = manager.prepareAppend(List.of(
-                    batch(1L, (short) 0, 0, 0, 1, 1000L)));
-
-            assertFalse(prepare.isDone());
-            assertEquals(1, snapshotStore.keysWithPrefix(writerClaimPrefix).size());
-            assertFalse(snapshotStore.data().containsKey(snapshotKey));
-
-            postClaimFenceRead.complete(mock(GetResult.class));
-            ExecutionException failure = assertThrows(ExecutionException.class, prepare::get);
-            assertInstanceOf(IllegalStateException.class, failure.getCause());
-            assertTrue(snapshotStore.keysWithPrefix(writerClaimPrefix).isEmpty());
-            assertFalse(snapshotStore.data().containsKey(snapshotKey));
         } finally {
             manager.cleanup(true).get();
         }
@@ -758,35 +673,6 @@ class ProducerStateManagerTest {
     }
 
     @Test
-    void testClaimDeletesOnlyItsOwnVersionWhenTopicDeletionRaces() throws Exception {
-        TopicIdPartition tp = testTopicPartition();
-        String topicId = tp.topicId().toString();
-        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
-        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
-        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
-        CompletableFuture<GetResult> delayedSnapshotRead = new CompletableFuture<>();
-        snapshotStore.queueGet(snapshotKey, delayedSnapshotRead);
-
-        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
-        try {
-            CompletableFuture<ProducerStateManager.PrepareResult> prepareFuture = manager.prepareAppend(List.of(
-                    batch(1L, (short) 0, 0, 0, 1, 1000L)
-            ));
-            snapshotStore.data().put(deletedTopicMarkerKey, new byte[] {1});
-            delayedSnapshotRead.complete(null);
-
-            ExecutionException recoveryError = assertThrows(ExecutionException.class, prepareFuture::get);
-            assertInstanceOf(IllegalStateException.class, recoveryError.getCause());
-            assertFalse(snapshotStore.data().containsKey(snapshotKey));
-            assertTrue(snapshotStore.data().containsKey(deletedTopicMarkerKey));
-            verify(snapshotStore.client(), never()).delete(snapshotKey);
-            verify(snapshotStore.client()).delete(eq(snapshotKey), anySet());
-        } finally {
-            manager.close();
-        }
-    }
-
-    @Test
     void testReplayRebasesEveryBatchInRawMemoryRecords() throws Exception {
         TopicIdPartition tp = testTopicPartition();
         LogEntry replayEntry = newMultiBatchReplayEntry(10L);
@@ -905,24 +791,53 @@ class ProducerStateManagerTest {
     }
 
     @Test
-    void testReplayStopsWhenFirstEntryHasNoProducerAndNoSnapshot() throws Exception {
+    void testReplaySkipsMalformedEntryAndAdvances() throws Exception {
         TopicIdPartition tp = testTopicPartition();
-        LogEntry nonIdempotentReplayEntry = newReplayEntryWithoutProducer("legacy", 0L, 1);
-        LogEntry idempotentReplayEntry = newReplayEntry(1L, (short) 0, 0, "idempotent", 1L, 1);
-        Log replayLog = replayLog(List.of(nonIdempotentReplayEntry, idempotentReplayEntry), 1L, 1);
+        LogEntry firstEntry = newReplayEntry(1L, (short) 0, 0, "first", 0L, 1);
+        LogEntry malformedEntry = newMalformedReplayEntry(1L, 1);
+        LogEntry lastEntry = newReplayEntry(1L, (short) 0, 1, "last", 2L, 1);
+        Log replayLog = replayLog(List.of(firstEntry, malformedEntry, lastEntry), 2L, 1);
 
-        ProducerStateManager manager = newManager(tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
+        ProducerStateManager manager = newManager(
+                tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
         try {
             ProducerStateManager.PrepareResult result = manager.prepareAppend(List.of(
-                batch(1L, (short) 0, 0, 0, 1, 3000L)
+                    batch(1L, (short) 0, 2, 2, 1, 3000L)
             )).get();
+
             assertInstanceOf(ProducerStateManager.Ready.class, result);
-            verify(nonIdempotentReplayEntry).close();
-            verify(idempotentReplayEntry).close();
+            assertEquals(3L, manager.nextOffsetToRecoverForTesting());
+            verify(malformedEntry).close();
+            verify(lastEntry).close();
         } finally {
             manager.close();
         }
     }
+
+    @Test
+    void testReplayDoesNotStopAtLeadingNonIdempotentEntry() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        LogEntry nonIdempotentEntry = newReplayEntryWithoutProducer("legacy", 0L, 1);
+        LogEntry idempotentEntry = newReplayEntry(7L, (short) 0, 0, "idempotent", 1L, 1);
+        Log replayLog = replayLog(List.of(nonIdempotentEntry, idempotentEntry), 1L, 1);
+
+        ProducerStateManager manager = newManager(
+                tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
+        try {
+            // Sequence 1 follows the sequence 0 replayed from behind the non-idempotent entry.
+            ProducerStateManager.PrepareResult result = manager.prepareAppend(List.of(
+                    batch(7L, (short) 0, 1, 1, 1, 3000L)
+            )).get();
+
+            assertInstanceOf(ProducerStateManager.Ready.class, result);
+            assertEquals(2L, manager.nextOffsetToRecoverForTesting());
+            verify(nonIdempotentEntry).close();
+            verify(idempotentEntry).close();
+        } finally {
+            manager.close();
+        }
+    }
+
 
     @Test
     void testReplayFailureClosesEntireEntryBatch() throws Exception {
@@ -1282,6 +1197,25 @@ class ProducerStateManagerTest {
         return entry;
     }
 
+    /** A storage entry whose payload cannot be decoded as Kafka record batches. */
+    private static LogEntry newMalformedReplayEntry(long baseOffset, int numMessages) {
+        ByteBuf data = Unpooled.copiedBuffer("garbage-payload".getBytes(StandardCharsets.UTF_8));
+
+        LogEntry entry = mock(LogEntry.class);
+        AtomicBoolean closed = new AtomicBoolean();
+        when(entry.offset()).thenReturn(baseOffset);
+        when(entry.numberOfRecords()).thenReturn(numMessages);
+        when(entry.size()).thenReturn(data.readableBytes());
+        when(entry.payload()).thenReturn(data.asReadOnly());
+        doAnswer(invocation -> {
+            if (closed.compareAndSet(false, true)) {
+                data.release();
+            }
+            return null;
+        }).when(entry).close();
+        return entry;
+    }
+
     private static LogEntry newReplayEntryWithoutProducer(
             String value,
             long baseOffset,
@@ -1423,12 +1357,16 @@ class ProducerStateManagerTest {
             nextVersionId.accumulateAndGet(versionId, Math::max);
         }
 
-        Map<String, byte[]> data() {
-            return data;
+        /** Writes the durable deletion fence that permanently retires a topic incarnation. */
+        void putFence(Uuid topicId) {
+            storeValue(
+                    ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString()),
+                    new byte[] {1},
+                    nextVersionId.incrementAndGet());
         }
 
-        synchronized List<String> keysWithPrefix(String prefix) {
-            return data.keySet().stream().filter(key -> key.startsWith(prefix)).sorted().toList();
+        Map<String, byte[]> data() {
+            return data;
         }
 
         AsyncOxiaClient client() {
