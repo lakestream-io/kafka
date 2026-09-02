@@ -42,11 +42,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import io.lakestream.api.EntryHeader;
 import io.lakestream.api.Log;
 import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
-import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.exception.NoSuchStreamException;
@@ -462,17 +460,14 @@ class UrsaLakestreamReaderTest {
     }
 
     @Test
-    void testListOffsetsMaxTimestampScansEntryHeadersOnly() throws Exception {
+    void testListOffsetsMaxTimestampAnswersFromLastEntryHeader() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 2)));
         when(logInstance.getLastOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(12L, 3)));
-        when(logInstance.getEntryMetadataRange(10L, 15L)).thenReturn(
-                CompletableFuture.completedFuture(List.of(
-                        entryHeader(10L, 2, 3000L), entryHeader(12L, 3, 2000L))));
+                CompletableFuture.completedFuture(new LogOffset(12L, 3, 3000L)));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -483,23 +478,22 @@ class UrsaLakestreamReaderTest {
 
         assertNotNull(response);
         assertEquals(Errors.NONE, response.error());
-        assertEquals(10L, response.offset());
+        assertEquals(12L, response.offset());
         assertEquals(3000L, response.timestamp());
+        verify(logInstance, never()).getEntryMetadataRange(anyLong(), anyLong());
         verify(logInstance, never()).readEntry(anyLong());
         verify(logInstance, never()).openEphemeralCursor(anyString(), anyLong());
     }
 
     @Test
-    void testMaxTimestampScanFailureMapsToStorageError() throws Exception {
+    void testMaxTimestampRangeFailureMapsToStorageError() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 5)));
         when(logInstance.getLastOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(10L, 5)));
-        when(logInstance.getEntryMetadataRange(anyLong(), anyLong()))
-                .thenThrow(new RuntimeException("synchronous metadata range failure"));
+                CompletableFuture.failedFuture(new RuntimeException("last offset lookup failure")));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -534,10 +528,6 @@ class UrsaLakestreamReaderTest {
 
     private static LogOffset logOffset(long offset, int numberOfRecords) {
         return new LogOffset(offset, numberOfRecords, -1L);
-    }
-
-    private static LogEntryHeader entryHeader(long offset, int numberOfRecords, long timestamp) {
-        return new EntryHeader(offset, numberOfRecords, timestamp, 1, offset + numberOfRecords);
     }
 
     private static LogEntry createKafkaRecordsEntry(long baseOffset, long[]... timestampBatches) {

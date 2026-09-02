@@ -43,7 +43,6 @@ import java.util.function.Supplier;
 import io.lakestream.api.Log;
 import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
-import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogOffset;
 
 /**
@@ -55,15 +54,13 @@ import io.lakestream.api.LogOffset;
  * whichever read releases first back into the empty cache keeps its cursor while the other is closed.
  *
  * <p>ListOffsets never opens a cursor and decodes at most two entries. A timestamp lookup binary
- * searches entry headers and then reads the one entry that can hold the answer; MAX_TIMESTAMP reads
- * entry headers only.
+ * searches entry headers and then reads the one entry that can hold the answer; MAX_TIMESTAMP is
+ * answered from the last entry's header alone.
  */
 final class PartitionReader implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(PartitionReader.class);
 
-    /** Record offsets covered by one {@code getEntryMetadataRange} call during a MAX_TIMESTAMP scan. */
-    private static final int HEADER_SCAN_CHUNK = 1000;
     private static final long UNKNOWN_TIMESTAMP = -1L;
     private static final long NOT_FOUND_OFFSET = -1L;
 
@@ -126,7 +123,9 @@ final class PartitionReader implements AutoCloseable {
                 return CompletableFuture.completedFuture(notFound());
             }
             if (timestamp == ListOffsetsPartitionRequest.MAX_TIMESTAMP) {
-                return scanMaxTimestamp(range.start(), range.highWatermark(), UNKNOWN_TIMESTAMP, NOT_FOUND_OFFSET);
+                // Entries are appended in write-timestamp order, so the last one carries the maximum.
+                return CompletableFuture.completedFuture(
+                        success(range.lastEntryOffset(), range.lastEntryTimestamp()));
             }
             return firstAtOrAfter(range, timestamp);
         });
@@ -279,37 +278,6 @@ final class PartitionReader implements AutoCloseable {
         return new EntryProbe(match, nextOffset);
     }
 
-    /**
-     * Walks entry headers in chunks and keeps the largest write timestamp. Payloads are never touched,
-     * so MAX_TIMESTAMP reports the base offset of the entry that was written last, not the exact record.
-     */
-    private CompletableFuture<ListOffsetsPartitionResponse> scanMaxTimestamp(
-            long from,
-            long endOffsetExclusive,
-            long bestTimestamp,
-            long bestOffset) {
-        if (from >= endOffsetExclusive) {
-            return CompletableFuture.completedFuture(success(bestOffset, bestTimestamp));
-        }
-        long chunkEnd = Math.min(endOffsetExclusive, from + HEADER_SCAN_CHUNK);
-        return call(() -> logInstance.getEntryMetadataRange(from, chunkEnd), "Log.getEntryMetadataRange")
-                .thenCompose(headers -> {
-                    long timestamp = bestTimestamp;
-                    long offset = bestOffset;
-                    long next = chunkEnd;
-                    if (headers != null) {
-                        for (LogEntryHeader header : headers) {
-                            if (header.timestamp() > timestamp) {
-                                timestamp = header.timestamp();
-                                offset = header.offset();
-                            }
-                            next = Math.max(next, header.offset() + header.numberOfRecords());
-                        }
-                    }
-                    return scanMaxTimestamp(next, endOffsetExclusive, timestamp, offset);
-                });
-    }
-
     private CompletableFuture<Range> range() {
         return call(logInstance::getFirstOffset, "Log.getFirstOffset")
                 .thenCombine(call(logInstance::getLastOffset, "Log.getLastOffset"), Range::of);
@@ -395,13 +363,17 @@ final class PartitionReader implements AutoCloseable {
         }
     }
 
-    /** The readable offset window of the log: {@code [start, highWatermark)}. */
-    private record Range(long start, long highWatermark, long lastEntryOffset) {
+    /** The readable offset window of the log: {@code [start, highWatermark)}, plus the last entry's header. */
+    private record Range(long start, long highWatermark, long lastEntryOffset, long lastEntryTimestamp) {
 
         static Range of(LogOffset first, LogOffset last) {
             long highWatermark = highWatermarkOf(last);
             long start = first == null || first.offset() < 0 ? highWatermark : first.offset();
-            return new Range(start, highWatermark, last == null ? NOT_FOUND_OFFSET : last.offset());
+            return new Range(
+                    start,
+                    highWatermark,
+                    last == null ? NOT_FOUND_OFFSET : last.offset(),
+                    last == null ? UNKNOWN_TIMESTAMP : last.timestamp());
         }
 
         boolean isEmpty() {

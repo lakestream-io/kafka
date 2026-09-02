@@ -41,11 +41,9 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import io.lakestream.api.EntryHeader;
 import io.lakestream.api.Log;
 import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
-import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogOffset;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -139,21 +137,19 @@ class PartitionReaderTest {
     }
 
     @Test
-    void maxTimestampScansHeadersOnly() throws Exception {
+    void maxTimestampAnswersFromLastEntryHeader() throws Exception {
         Log log = mock(Log.class);
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(2L, 1, 300L)));
-        LogEntryHeader h0 = header(0L, 1, 100L);
-        LogEntryHeader h1 = header(1L, 1, 900L);
-        LogEntryHeader h2 = header(2L, 1, 300L);
-        when(log.getEntryMetadataRange(0L, 3L)).thenReturn(completedFuture(List.of(h0, h1, h2)));
 
         try (PartitionReader reader = new PartitionReader(TP, log, 10)) {
             ListOffsetsPartitionResponse response =
                     reader.listOffsets(listOffsetsRequest(ListOffsetsPartitionRequest.MAX_TIMESTAMP)).get();
             assertEquals(Errors.NONE, response.error());
-            assertEquals(1L, response.offset());
-            assertEquals(900L, response.timestamp());
+            assertEquals(2L, response.offset());
+            assertEquals(300L, response.timestamp());
+            // Entries are appended in write-timestamp order, so no index walk is needed.
+            verify(log, never()).getEntryMetadataRange(anyLong(), anyLong());
             verify(log, never()).readEntry(anyLong());
             verify(log, never()).openEphemeralCursor(anyString(), anyLong());
         }
@@ -324,26 +320,6 @@ class PartitionReaderTest {
     }
 
     @Test
-    void maxTimestampScanPagesThroughHeaderChunks() throws Exception {
-        Log log = mock(Log.class);
-        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
-        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(1500L, 1, 300L)));   // hwm = 1501
-        when(log.getEntryMetadataRange(0L, 1000L))
-                .thenReturn(completedFuture(List.of(header(0L, 1000, 400L))));
-        when(log.getEntryMetadataRange(1000L, 1501L))
-                .thenReturn(completedFuture(List.of(header(1000L, 501, 200L))));
-
-        try (PartitionReader reader = new PartitionReader(TP, log, 10)) {
-            ListOffsetsPartitionResponse response =
-                    reader.listOffsets(listOffsetsRequest(ListOffsetsPartitionRequest.MAX_TIMESTAMP)).get();
-            assertEquals(0L, response.offset());
-            assertEquals(400L, response.timestamp());
-            verify(log).getEntryMetadataRange(0L, 1000L);
-            verify(log).getEntryMetadataRange(1000L, 1501L);
-        }
-    }
-
-    @Test
     void highWatermarkIsTheOffsetPastTheLastRecord() throws Exception {
         Log log = mock(Log.class);
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(10L, 5, 1L)));
@@ -359,10 +335,6 @@ class PartitionReaderTest {
 
     private static ListOffsetsPartitionRequest listOffsetsRequest(long timestamp) {
         return new ListOffsetsPartitionRequest(TP, timestamp, Optional.empty());
-    }
-
-    private static LogEntryHeader header(long offset, int numberOfRecords, long timestamp) {
-        return new EntryHeader(offset, numberOfRecords, timestamp, 1, offset + numberOfRecords);
     }
 
     private static MemoryRecords records(String value) {
