@@ -39,14 +39,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.LongStream;
 
 import io.lakestream.api.Log;
-import io.lakestream.api.LogId;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.StreamCatalog;
-import io.lakestream.api.StreamLayout;
-import io.lakestream.api.StreamMetadata;
 import io.oxia.client.api.AsyncOxiaClient;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -57,6 +53,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -84,8 +81,7 @@ class UrsaStorageStateTest {
         }).when(log1).closeAsync();
 
         AtomicInteger openCount = new AtomicInteger();
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any())).thenAnswer(invocation ->
+        when(catalog.openLog(any(), anyInt())).thenAnswer(invocation ->
                 CompletableFuture.completedFuture(openCount.incrementAndGet() == 1 ? log1 : log2));
 
         try (UrsaStorageState state = newState(catalog)) {
@@ -95,12 +91,12 @@ class UrsaStorageStateTest {
             assertTrue(state.cleanupPartition(tp));
             verify(producerStateManager).cleanup(false);
             verify(log1, never()).fence();
-            verify(catalog).openLog(any(), any());
+            verify(catalog).openLog(any(), anyInt());
             assertTrue(closeLatch.await(5, TimeUnit.SECONDS));
             assertNull(state.partitionLog(tp));
 
             state.getOrCreatePartitionLog(tp);
-            verify(catalog, times(2)).openLog(any(), any());
+            verify(catalog, times(2)).openLog(any(), anyInt());
             assertNotNull(state.partitionLog(tp));
         }
     }
@@ -172,7 +168,7 @@ class UrsaStorageStateTest {
             TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
 
             assertFalse(state.cleanupPartition(tp));
-            verify(catalog, never()).openLog(any(), any());
+            verify(catalog, never()).openLog(any(), anyInt());
         }
     }
 
@@ -288,7 +284,7 @@ class UrsaStorageStateTest {
 
         assertThrows(IllegalStateException.class, () -> state.getOrCreatePartitionLog(tp));
         assertTrue(state.snapshotTrackedPartitions().isEmpty());
-        verify(catalog, never()).openLog(any(), any());
+        verify(catalog, never()).openLog(any(), anyInt());
     }
 
     @Test
@@ -299,8 +295,7 @@ class UrsaStorageStateTest {
         CountDownLatch closeStarted = new CountDownLatch(1);
         Log logInstance = mockLog(0L, 0L, 1, 10L, 10, 10L, 10);
         StreamCatalog catalog = mock(StreamCatalog.class);
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any())).thenAnswer(invocation -> {
+        when(catalog.openLog(any(), anyInt())).thenAnswer(invocation -> {
             openStarted.countDown();
             assertTrue(allowOpen.await(5, TimeUnit.SECONDS));
             return CompletableFuture.completedFuture(logInstance);
@@ -342,8 +337,7 @@ class UrsaStorageStateTest {
         CompletableFuture<Log> firstOpen = new CompletableFuture<>();
         Log secondLog = mockLog(10L, 10L, 1, 100L, 20, 100L, 20);
         AtomicInteger openCount = new AtomicInteger();
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any())).thenAnswer(invocation ->
+        when(catalog.openLog(any(), anyInt())).thenAnswer(invocation ->
                 openCount.getAndIncrement() == 0
                         ? firstOpen
                         : CompletableFuture.completedFuture(secondLog));
@@ -358,7 +352,7 @@ class UrsaStorageStateTest {
             UrsaPartitionLog second = state.getOrCreatePartitionLog(tp);
             assertNotNull(second);
             assertSame(second, state.partitionLog(tp));
-            verify(catalog, times(2)).openLog(any(), any());
+            verify(catalog, times(2)).openLog(any(), anyInt());
         }
     }
 
@@ -367,8 +361,7 @@ class UrsaStorageStateTest {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("immediate-retry-topic", 0));
         StreamCatalog catalog = mock(StreamCatalog.class);
         Log secondLog = mockLog(10L, 10L, 1, 100L, 20, 100L, 20);
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any()))
+        when(catalog.openLog(any(), anyInt()))
                 .thenReturn(CompletableFuture.failedFuture(new RuntimeException("open failed")))
                 .thenReturn(CompletableFuture.completedFuture(secondLog));
 
@@ -381,7 +374,7 @@ class UrsaStorageStateTest {
             assertNotNull(retried);
             assertFalse(retried.initializationFailed());
             assertSame(retried, state.partitionLog(tp));
-            verify(catalog, times(2)).openLog(any(), any());
+            verify(catalog, times(2)).openLog(any(), anyInt());
         }
     }
 
@@ -414,8 +407,7 @@ class UrsaStorageStateTest {
         Log logInstance = mock(Log.class);
         CompletableFuture<LogOffset> firstOffset = new CompletableFuture<>();
         CompletableFuture<LogOffset> lastOffset = new CompletableFuture<>();
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any()))
+        when(catalog.openLog(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(logInstance));
         when(logInstance.getFirstOffset()).thenReturn(firstOffset);
         when(logInstance.getLastOffset()).thenReturn(lastOffset);
@@ -470,7 +462,7 @@ class UrsaStorageStateTest {
 
             assertNotNull(partitionLog);
             assertSame(partitionLog, state.partitionLog(tp));
-            verify(catalog).openLog(any(), any());
+            verify(catalog).openLog(any(), anyInt());
         }
     }
 
@@ -490,8 +482,7 @@ class UrsaStorageStateTest {
 
         AtomicInteger openCount = new AtomicInteger();
         CompletableFuture<Log> firstOpenFuture = new CompletableFuture<>();
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any())).thenAnswer(invocation ->
+        when(catalog.openLog(any(), anyInt())).thenAnswer(invocation ->
                 openCount.getAndIncrement() == 0
                         ? firstOpenFuture
                         : CompletableFuture.completedFuture(secondLog));
@@ -512,7 +503,7 @@ class UrsaStorageStateTest {
 
             state.getOrCreatePartitionLog(tp);
 
-            verify(catalog, times(2)).openLog(any(), any());
+            verify(catalog, times(2)).openLog(any(), anyInt());
             assertEquals(20L, jmxGaugeLongValue(LogMetricNames.SIZE, tp.topicPartition()));
         }
     }
@@ -654,21 +645,9 @@ class UrsaStorageStateTest {
 
     private static StreamCatalog mockCatalogWithLog(Log logInstance) {
         StreamCatalog catalog = mock(StreamCatalog.class);
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any()))
+        when(catalog.openLog(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(logInstance));
         return catalog;
-    }
-
-    private static void stubCatalogLayout(StreamCatalog catalog) {
-        StreamMetadata metadata = mock(StreamMetadata.class);
-        StreamLayout layout = mock(StreamLayout.class);
-        when(catalog.loadStream(any())).thenReturn(CompletableFuture.completedFuture(metadata));
-        when(metadata.layout()).thenReturn(layout);
-        when(layout.logIds()).thenReturn(CompletableFuture.completedFuture(
-                LongStream.range(0, 100)
-                        .mapToObj(LogId::of)
-                        .toList()));
     }
 
     private static ProducerStateManager mockProducerStateManager() {

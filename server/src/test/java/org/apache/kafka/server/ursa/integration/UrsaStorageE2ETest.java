@@ -1176,10 +1176,13 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         catalogMethod.setAccessible(true);
         Object catalog = catalogMethod.invoke(holder);
 
-        var identifierMethod = holder.getClass().getDeclaredMethod(
-                "streamIdentifier", TopicIdPartition.class);
+        Class<?> streamIdentity = holder.getClass().getClassLoader()
+                .loadClass("org.apache.kafka.storage.diskless.handlers.KafkaStreamIdentity");
+        var identifierMethod = streamIdentity.getDeclaredMethod(
+                "streamIdentifier", String.class, Uuid.class);
         identifierMethod.setAccessible(true);
-        Object identifier = identifierMethod.invoke(null, topicIdPartition);
+        Object identifier = identifierMethod.invoke(
+                null, topicIdPartition.topic(), topicIdPartition.topicId());
 
         var loadStreamMethod = catalog.getClass().getMethod("loadStream", identifier.getClass());
         Object metadata = ((CompletableFuture<?>) loadStreamMethod.invoke(catalog, identifier))

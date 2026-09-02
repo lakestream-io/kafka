@@ -72,7 +72,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
             return CompletableFuture.failedFuture(
                     new IllegalArgumentException("partitions must be at least 1"));
         }
-        StreamIdentifier identifier = streamIdentifier(topicName, topicId);
+        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier(topicName, topicId);
         Map<String, String> propertySnapshot = KafkaStreamIdentity.streamProperties(
                 topicName, topicId, properties, sourceRevision);
         return loadOrCreate(identifier, partitions, propertySnapshot)
@@ -82,7 +82,8 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
 
     @Override
     public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
-        return catalog.dropStream(streamIdentifier(topicName, topicId), true).thenApply(ignored -> null);
+        return catalog.dropStream(KafkaStreamIdentity.streamIdentifier(topicName, topicId), true)
+                .thenApply(ignored -> null);
     }
 
     @Override
@@ -166,7 +167,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
         }
         if (Uuid.ZERO_UUID.equals(topicId)
                 || sourceRevision < 0
-                || !streamIdentifier(topicName, topicId).equals(identifier)) {
+                || !KafkaStreamIdentity.streamIdentifier(topicName, topicId).equals(identifier)) {
             return null;
         }
         return new ManagedTopic(topicName, topicId, sourceRevision);
@@ -181,13 +182,5 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     @Override
     public void close() throws Exception {
         catalog.close();
-    }
-
-    static StreamIdentifier streamIdentifier(String topicName, Uuid topicId) {
-        Objects.requireNonNull(topicName, "topicName must not be null");
-        Objects.requireNonNull(topicId, "topicId must not be null");
-        return StreamIdentifier.of(
-                KafkaStreamIdentity.NAMESPACE,
-                KafkaStreamIdentity.streamName(topicName, topicId));
     }
 }

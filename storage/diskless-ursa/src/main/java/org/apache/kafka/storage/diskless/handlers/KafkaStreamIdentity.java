@@ -22,6 +22,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
+import io.lakestream.api.StreamIdentifier;
+
 /** Ursa catalog identity and ownership metadata for Kafka diskless streams. */
 public final class KafkaStreamIdentity {
 
@@ -49,6 +51,11 @@ public final class KafkaStreamIdentity {
             throw new IllegalArgumentException("topicId must not be zero");
         }
         return topicName + "-topic-id-" + topicId;
+    }
+
+    /** Catalog identifier of the stream backing one Kafka topic incarnation. */
+    public static StreamIdentifier streamIdentifier(String topicName, Uuid topicId) {
+        return StreamIdentifier.of(NAMESPACE, streamName(topicName, topicId));
     }
 
     /** Adds Kafka's stable logical topic identity to the stream ownership metadata. */

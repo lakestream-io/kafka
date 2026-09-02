@@ -52,19 +52,19 @@ class UrsaDisklessTopicLifecycleTest {
     void testListsOnlyStreamsWithVerifiedKafkaOwnershipMetadata() throws Exception {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
-        StreamIdentifier owned = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
+        StreamIdentifier owned = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         StreamIdentifier missingManagedMarker = StreamIdentifier.of("default", "missing-managed-marker");
         StreamIdentifier missingTopicId = StreamIdentifier.of("default", "missing-topic-id");
         StreamIdentifier malformedTopicId = StreamIdentifier.of("default", "malformed-topic-id");
         StreamIdentifier mismatchedIdentifier = StreamIdentifier.of("default", "unrelated-stream");
         Uuid missingRevisionTopicId = Uuid.randomUuid();
-        StreamIdentifier missingRevision = UrsaDisklessTopicLifecycle.streamIdentifier(
+        StreamIdentifier missingRevision = KafkaStreamIdentity.streamIdentifier(
                 "missing-revision", missingRevisionTopicId);
         Uuid malformedRevisionTopicId = Uuid.randomUuid();
-        StreamIdentifier malformedRevision = UrsaDisklessTopicLifecycle.streamIdentifier(
+        StreamIdentifier malformedRevision = KafkaStreamIdentity.streamIdentifier(
                 "malformed-revision", malformedRevisionTopicId);
         Uuid negativeRevisionTopicId = Uuid.randomUuid();
-        StreamIdentifier negativeRevision = UrsaDisklessTopicLifecycle.streamIdentifier(
+        StreamIdentifier negativeRevision = KafkaStreamIdentity.streamIdentifier(
                 "negative-revision", negativeRevisionTopicId);
         when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE)).thenReturn(
                 CompletableFuture.completedFuture(List.of(
@@ -141,7 +141,7 @@ class UrsaDisklessTopicLifecycleTest {
     void testListManagedTopicsIncludesKafkaOwnedDeletingEntry() throws Exception {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
-        StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier(
+        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier(
                 "deleting-topic", topicId);
         when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE))
                 .thenReturn(CompletableFuture.completedFuture(List.of(entry(
@@ -164,7 +164,7 @@ class UrsaDisklessTopicLifecycleTest {
     void testCreatesMissingStreamAndRecordsKafkaRevision() throws Exception {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
-        StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
+        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         Map<String, String> properties = Map.of("retention.ms", "60000");
         Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, properties, 17L);
@@ -200,7 +200,7 @@ class UrsaDisklessTopicLifecycleTest {
     void testExistingStreamIsGrownBeforePropertiesAreReplaced() throws Exception {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
-        StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
+        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, Map.of(), 18L);
         StreamMetadata existing = metadataWithPartitions(1);
@@ -225,7 +225,7 @@ class UrsaDisklessTopicLifecycleTest {
     void testConcurrentCreateLoadsWinnerAndReconcilesIt() throws Exception {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
-        StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
+        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, Map.of(), 19L);
         StreamMetadata winner = metadataWithPartitions(3);
@@ -249,7 +249,7 @@ class UrsaDisklessTopicLifecycleTest {
     void testDeletePermanentlyDropsStream() throws Exception {
         StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
-        StreamIdentifier identifier = UrsaDisklessTopicLifecycle.streamIdentifier("orders", topicId);
+        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         when(catalog.dropStream(identifier, true))
                 .thenReturn(CompletableFuture.completedFuture(true));
 
@@ -262,9 +262,9 @@ class UrsaDisklessTopicLifecycleTest {
 
     @Test
     void testSameNameTopicIncarnationsUseDifferentStreamIdentifiers() {
-        StreamIdentifier first = UrsaDisklessTopicLifecycle.streamIdentifier(
+        StreamIdentifier first = KafkaStreamIdentity.streamIdentifier(
                 "orders", Uuid.fromString("65WMNfybQpCDVulYOxMCTw"));
-        StreamIdentifier second = UrsaDisklessTopicLifecycle.streamIdentifier(
+        StreamIdentifier second = KafkaStreamIdentity.streamIdentifier(
                 "orders", Uuid.fromString("VkZ5AkuESPGkMc2OxpKUjw"));
 
         assertNotEquals(first, second);

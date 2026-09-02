@@ -30,15 +30,11 @@ import org.mockito.InOrder;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.LongStream;
 
 import io.lakestream.api.Log;
-import io.lakestream.api.LogId;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
-import io.lakestream.api.StreamLayout;
-import io.lakestream.api.StreamMetadata;
 
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -236,17 +232,8 @@ class UrsaStorageStateRetentionTest {
             StreamCatalog catalog,
             TopicIdPartition tp,
             Log logInstance) {
-        StreamIdentifier identifier = LakestreamStorageHolder.streamIdentifier(tp);
-        LogId logId = LogId.of(tp.partition() + 1L);
-        StreamMetadata metadata = mock(StreamMetadata.class);
-        StreamLayout layout = mock(StreamLayout.class);
-        when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(metadata));
-        when(metadata.layout()).thenReturn(layout);
-        when(layout.logIds()).thenReturn(CompletableFuture.completedFuture(
-                LongStream.rangeClosed(1, tp.partition() + 1L)
-                        .mapToObj(LogId::of)
-                        .toList()));
-        when(catalog.openLog(identifier, logId))
+        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier(tp.topic(), tp.topicId());
+        when(catalog.openLog(identifier, tp.partition()))
                 .thenReturn(CompletableFuture.completedFuture(logInstance));
     }
 

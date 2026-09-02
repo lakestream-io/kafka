@@ -17,9 +17,9 @@
 package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.TopicIdPartition;
-import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
@@ -75,7 +75,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final ConcurrentHashMap<TopicIdPartition, UrsaPartitionLog> partitionLogs = new ConcurrentHashMap<>();
 
     private final LakestreamStorageHolder lakestreamStorageHolder;
-    private final StreamCatalog catalog;
     private final Supplier<AsyncOxiaClient> oxiaClientSupplier;
     private final ScheduledExecutorService producerStateScheduler;
     /** One timer for every periodic and delayed task: retention checks and long-poll timeouts. */
@@ -139,7 +138,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             throw new RuntimeException("Failed to initialize StreamCatalog", e);
         }
         this.lakestreamStorageHolder = holder;
-        this.catalog = holder.catalog();
         this.oxiaClientSupplier = holder::oxiaClient;
         this.retentionTask = startRetentionChecks();
     }
@@ -161,19 +159,10 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             StreamCatalog catalog,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier) {
-        this.time = Objects.requireNonNull(time, "time must not be null");
-        this.brokerId = brokerId;
-        this.config = Objects.requireNonNull(config, "config must not be null");
-        this.brokerTopicStats = Objects.requireNonNull(brokerTopicStats, "brokerTopicStats must not be null");
-        this.lakestreamStorageHolder = null;
-        this.catalog = Objects.requireNonNull(catalog, "catalog must not be null");
-        this.oxiaClientSupplier = () -> null;
-        this.producerStateScheduler = newDaemonScheduler("producer-state-manager-test");
-        this.disklessTimer = newDaemonScheduler("diskless-timer-test");
-        this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
-        this.topicConfigSupplier = topicConfigSupplier;
-        this.partitionCountSupplier = topic -> OptionalInt.empty();
-        this.retentionTask = startRetentionChecks();
+        this(time, brokerId, config, brokerTopicStats,
+                new LakestreamStorageHolder(
+                        Objects.requireNonNull(catalog, "catalog must not be null"), null),
+                logConfigDefaults, topicConfigSupplier);
     }
 
     UrsaStorageState(
@@ -190,7 +179,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.brokerTopicStats = Objects.requireNonNull(brokerTopicStats, "brokerTopicStats must not be null");
         this.lakestreamStorageHolder = Objects.requireNonNull(
                 lakestreamStorageHolder, "lakestreamStorageHolder must not be null");
-        this.catalog = lakestreamStorageHolder.catalog();
         this.oxiaClientSupplier = lakestreamStorageHolder::oxiaClient;
         this.producerStateScheduler = newDaemonScheduler("producer-state-manager-test");
         this.disklessTimer = newDaemonScheduler("diskless-timer-test");
@@ -276,11 +264,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         if (topicName == null || topicId == null) {
             return;
         }
-        TopicIdPartition topicIdentity = new TopicIdPartition(
-                topicId, new TopicPartition(topicName, 0));
-        if (lakestreamStorageHolder != null) {
-            lakestreamStorageHolder.markTopicDeleted(topicIdentity);
-        }
+        lakestreamStorageHolder.markTopicDeleted(topicId);
         // Publish the local lifecycle fence before doing any best-effort cleanup work. A request
         // racing this committed deletion must not be able to open a new leased Log while
         // retention callbacks are being scheduled.
@@ -291,6 +275,10 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
      * The partition log for {@code tp}, opening one if this broker does not hold it yet. The common
      * case - a partition that is already open - answers from the map without taking the lifecycle
      * lock, so a produce or fetch never queues behind an open or a close.
+     * <p>
+     * That lock-free fast path can hand back a retiring log in the window between {@link #close()}
+     * setting {@code closed} and clearing {@code partitionLogs}; its requests then fail with the
+     * retriable {@code NOT_LEADER_OR_FOLLOWER} that a closed partition log reports.
      */
     UrsaPartitionLog getOrCreatePartitionLog(TopicIdPartition tp) {
         UrsaPartitionLog existing = partitionLogs.get(tp);
@@ -300,6 +288,10 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         synchronized (lifecycleLock) {
             if (closed.get()) {
                 throw new IllegalStateException("Ursa storage state is closed");
+            }
+            if (lakestreamStorageHolder.isTopicDeleted(tp.topicId())) {
+                throw new NotLeaderOrFollowerException(
+                        "Topic " + tp.topic() + " (" + tp.topicId() + ") was deleted");
             }
             UrsaPartitionLog partitionLog = partitionLogs.compute(tp, (key, current) ->
                     current != null && !current.initializationFailed() ? current : newPartitionLog(key));
@@ -607,11 +599,17 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         scheduler.shutdownNow();
     }
 
+    /**
+     * Opens the partition with create-if-absent: the stream is created, or grown to the partition
+     * count the broker metadata reports, when the catalog does not have this partition yet.
+     */
     CompletableFuture<Log> openLog(TopicIdPartition tp) {
-        if (lakestreamStorageHolder != null) {
-            return lakestreamStorageHolder.openPartition(tp);
-        }
-        return LakestreamStorageHolder.openPartition(catalog, tp);
+        Map<String, String> topicConfig =
+                topicConfigSupplier == null ? null : topicConfigSupplier.apply(tp.topic());
+        return lakestreamStorageHolder.openPartition(
+                tp,
+                partitionCountSupplier.apply(tp.topic()).orElse(tp.partition() + 1),
+                topicConfig == null ? Map.of() : topicConfig);
     }
 
 }
