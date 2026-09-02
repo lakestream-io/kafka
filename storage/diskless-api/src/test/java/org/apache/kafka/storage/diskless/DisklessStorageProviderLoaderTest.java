@@ -38,6 +38,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -67,30 +68,26 @@ class DisklessStorageProviderLoaderTest {
         UrsaStorageConfig config = ursaConfig();
 
         DisklessStorageEngine engine = DisklessStorageEngineLoader.load(
-                null, 1, config, null, Map.of(), ignored -> Map.of());
+                null, 1, config, null, Map.of(), ignored -> Map.of(), ignored -> OptionalInt.empty());
         DisklessTopicLifecycle topicLifecycle = DisklessTopicLifecycleLoader.load(config);
-        DisklessProducerStateLifecycle producerStateLifecycle =
-                DisklessProducerStateLifecycleLoader.load(config);
 
-        assertEquals(3, RecordingProvider.CREATED_COMPONENTS.get());
+        assertEquals(2, RecordingProvider.CREATED_COMPONENTS.get());
         ClassLoader providerClassLoader = RecordingProvider.creationClassLoader;
         assertNotSame(Thread.currentThread().getContextClassLoader(), providerClassLoader);
 
         engine.write(Map.of(), "").get();
         assertTrue(topicLifecycle.listManagedTopics().get().isEmpty());
-        assertTrue(producerStateLifecycle.listManagedTopics().get().isEmpty());
 
         engine.close();
         topicLifecycle.close();
-        producerStateLifecycle.close();
-        assertEquals(3, RecordingProvider.CLOSED_COMPONENTS.get());
+        assertEquals(2, RecordingProvider.CLOSED_COMPONENTS.get());
 
         assertLeaseWasReleased(providerClassLoader);
     }
 
     @Test
     void testMissingProviderFailsAndReleasesClassLoaderLease() throws Exception {
-        URL[] urls = DisklessStorageEngineLoader.classPathUrls(tempDir.toString());
+        URL[] urls = DisklessStorageProviderLoader.classPathUrls(tempDir.toString());
         ClassLoader parent = DisklessStorageProviderLoader.class.getClassLoader();
         DisklessClassLoaderRegistry.Lease retainedLease = DisklessClassLoaderRegistry.acquire(urls, parent);
         ClassLoader failedLoader = retainedLease.classLoader();
@@ -107,17 +104,33 @@ class DisklessStorageProviderLoaderTest {
     @Test
     void testMultipleProvidersFailAndReleaseClassLoaderLease() throws Exception {
         writeProviders(RecordingProvider.class, SecondProvider.class);
-        URL[] urls = DisklessStorageEngineLoader.classPathUrls(tempDir.toString());
+        URL[] urls = DisklessStorageProviderLoader.classPathUrls(tempDir.toString());
         ClassLoader parent = DisklessStorageProviderLoader.class.getClassLoader();
         DisklessClassLoaderRegistry.Lease retainedLease = DisklessClassLoaderRegistry.acquire(urls, parent);
         ClassLoader failedLoader = retainedLease.classLoader();
 
         KafkaException failure = assertThrows(
                 KafkaException.class,
-                () -> DisklessProducerStateLifecycleLoader.load(ursaConfig()));
+                () -> DisklessTopicLifecycleLoader.load(ursaConfig()));
         assertTrue(failure.getMessage().contains("Multiple DisklessStorageProvider"));
         assertTrue(failure.getMessage().contains(RecordingProvider.class.getName()));
         assertTrue(failure.getMessage().contains(SecondProvider.class.getName()));
+        retainedLease.close();
+
+        assertLeaseWasReleased(failedLoader);
+    }
+
+    @Test
+    void testProviderErrorPropagatesAndReleasesClassLoaderLease() throws Exception {
+        writeProviders(FailingProvider.class);
+        URL[] urls = DisklessStorageProviderLoader.classPathUrls(tempDir.toString());
+        ClassLoader parent = DisklessStorageProviderLoader.class.getClassLoader();
+        DisklessClassLoaderRegistry.Lease retainedLease = DisklessClassLoaderRegistry.acquire(urls, parent);
+        ClassLoader failedLoader = retainedLease.classLoader();
+
+        assertThrows(
+                ExceptionInInitializerError.class,
+                () -> DisklessTopicLifecycleLoader.load(ursaConfig()));
         retainedLease.close();
 
         assertLeaseWasReleased(failedLoader);
@@ -137,7 +150,7 @@ class DisklessStorageProviderLoaderTest {
     }
 
     private void assertLeaseWasReleased(ClassLoader previousClassLoader) throws Exception {
-        URL[] urls = DisklessStorageEngineLoader.classPathUrls(tempDir.toString());
+        URL[] urls = DisklessStorageProviderLoader.classPathUrls(tempDir.toString());
         ClassLoader parent = DisklessStorageProviderLoader.class.getClassLoader();
         DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
         try {
@@ -164,12 +177,6 @@ class DisklessStorageProviderLoaderTest {
             return new NoOpTopicLifecycle();
         }
 
-        @Override
-        public DisklessProducerStateLifecycle createProducerStateLifecycle(UrsaStorageConfig config) {
-            recordCreation();
-            return new NoOpProducerStateLifecycle();
-        }
-
         private static void recordCreation() {
             ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
             if (creationClassLoader == null) {
@@ -191,10 +198,17 @@ class DisklessStorageProviderLoaderTest {
         public DisklessTopicLifecycle createTopicLifecycle(UrsaStorageConfig config) {
             return new NoOpTopicLifecycle();
         }
+    }
+
+    public static final class FailingProvider implements DisklessStorageProvider {
+        @Override
+        public DisklessStorageEngine createStorageEngine(StorageEngineContext context) {
+            throw new ExceptionInInitializerError("boom");
+        }
 
         @Override
-        public DisklessProducerStateLifecycle createProducerStateLifecycle(UrsaStorageConfig config) {
-            return new NoOpProducerStateLifecycle();
+        public DisklessTopicLifecycle createTopicLifecycle(UrsaStorageConfig config) {
+            throw new ExceptionInInitializerError("boom");
         }
     }
 
@@ -258,11 +272,11 @@ class DisklessStorageProviderLoaderTest {
         }
 
         @Override
-        public CompletableFuture<Void> reconcileTopic(
+        public CompletableFuture<Void> ensureTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
-                Map<String, String> properties,
+                Map<String, String> configs,
                 long sourceRevision) {
             return CompletableFuture.completedFuture(null);
         }
@@ -273,24 +287,7 @@ class DisklessStorageProviderLoaderTest {
         }
 
         @Override
-        public void close() {
-            RecordingProvider.CLOSED_COMPONENTS.incrementAndGet();
-        }
-    }
-
-    private static final class NoOpProducerStateLifecycle implements DisklessProducerStateLifecycle {
-        @Override
-        public CompletableFuture<Void> reconcileTopic(String topicName, Uuid topicId, long sourceRevision) {
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public CompletableFuture<List<ManagedProducerStateTopic>> listManagedTopics() {
-            return CompletableFuture.completedFuture(List.of());
-        }
-
-        @Override
-        public CompletableFuture<Void> deleteTopicSnapshots(Uuid topicId) {
+        public CompletableFuture<Void> sweepOrphans(Set<Uuid> liveTopicIds, long imageOffset) {
             return CompletableFuture.completedFuture(null);
         }
 
@@ -299,4 +296,5 @@ class DisklessStorageProviderLoaderTest {
             RecordingProvider.CLOSED_COMPONENTS.incrementAndGet();
         }
     }
+
 }

@@ -52,7 +52,7 @@ import org.apache.kafka.server.policy.{AlterConfigPolicy, CreateTopicPolicy}
 import org.apache.kafka.server.util.{Deadline, FutureUtils}
 import org.apache.kafka.server.NodeToControllerChannelManagerImpl
 import org.apache.kafka.server.RaftControllerNodeProvider
-import org.apache.kafka.storage.diskless.{DisklessProducerStateLifecycle, DisklessProducerStateLifecycleLoader, DisklessTopicLifecycle, DisklessTopicLifecycleLoader}
+import org.apache.kafka.storage.diskless.{DisklessTopicLifecycle, DisklessTopicLifecycleLoader}
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig
 
 import java.util
@@ -104,7 +104,7 @@ class ControllerServer(
   var controllerApis: ControllerApis = _
   var controllerApisHandlerPool: KafkaRequestHandlerPool = _
   var disklessTopicLifecycle: DisklessTopicLifecycle = _
-  var disklessProducerStateLifecycle: DisklessProducerStateLifecycle = _
+  private val disklessOrphanSweepIntervalMs = 600000L
   def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
   val metadataPublishers: util.List[MetadataPublisher] = new util.ArrayList[MetadataPublisher]()
   @volatile var metadataCache : KRaftMetadataCache = _
@@ -272,7 +272,6 @@ class ControllerServer(
         // lifecycle reconciler supervises provider initialization, timeouts, and retries so a
         // temporary Ursa or Oxia outage cannot prevent this controller from joining the quorum.
         disklessTopicLifecycle = DisklessTopicLifecycleLoader.loadLazily(ursaConfig)
-        disklessProducerStateLifecycle = DisklessProducerStateLifecycleLoader.loadLazily(ursaConfig)
       }
       controller = controllerBuilder.build()
 
@@ -348,8 +347,8 @@ class ControllerServer(
         metadataPublishers.add(new DisklessTopicLifecycleReconciler(
           config.nodeId,
           disklessTopicLifecycle,
-          disklessProducerStateLifecycle,
           (msg: String, cause: Throwable) => sharedServer.metadataPublishingFaultHandler.handleFault(msg, cause),
+          disklessOrphanSweepIntervalMs,
         ))
       }
 
@@ -500,8 +499,6 @@ class ControllerServer(
         Utils.swallow(this.logger.underlying, () => quotaManagers.shutdown())
       Utils.closeQuietly(controller, "controller")
       Utils.closeQuietly(quorumControllerMetrics, "quorum controller metrics")
-      Utils.closeQuietly(disklessProducerStateLifecycle, "diskless producer-state lifecycle")
-      disklessProducerStateLifecycle = null
       Utils.closeQuietly(disklessTopicLifecycle, "diskless topic lifecycle")
       disklessTopicLifecycle = null
       authorizerPlugin.foreach(Utils.closeQuietly(_, "authorizer plugin"))

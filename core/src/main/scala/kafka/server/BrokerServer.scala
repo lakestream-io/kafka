@@ -64,7 +64,7 @@ import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig
 
 import java.time.Duration
 import java.util
-import java.util.Optional
+import java.util.{Optional, OptionalInt}
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import java.util.concurrent.{CompletableFuture, ExecutionException, TimeUnit, TimeoutException}
 import scala.collection.Map
@@ -360,6 +360,10 @@ class BrokerServer(
           result
         },
         (topic: String) => metadataCache.getTopicId(topic),
+        (topic: String) => {
+          val numPartitions = metadataCache.numPartitions(topic)
+          if (numPartitions.isPresent) OptionalInt.of(numPartitions.get) else OptionalInt.empty()
+        },
         (listenerName: ListenerName) => metadataCache.getAliveBrokerNodes(listenerName),
         config.interBrokerListenerName
       )

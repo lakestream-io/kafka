@@ -1134,7 +1134,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             ursaStateOrEngine.getClass().getDeclaredMethod("getOrCreatePartitionLog", TopicIdPartition.class);
             return ursaStateOrEngine;
         } catch (NoSuchMethodException ignored) {
-            Object engine = ursaStateOrEngine;
+            Object engine = IsolatedUrsaCatalogInspector.leasedDelegateHolder(ursaStateOrEngine);
             try {
                 Field delegateField = engine.getClass().getDeclaredField("delegate");
                 delegateField.setAccessible(true);

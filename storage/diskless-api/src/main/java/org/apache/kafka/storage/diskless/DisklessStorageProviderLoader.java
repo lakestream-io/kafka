@@ -17,6 +17,7 @@
 package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.server.util.KafkaPluginClassPaths;
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
 
 import java.net.URL;
@@ -24,20 +25,30 @@ import java.util.List;
 import java.util.Objects;
 import java.util.ServiceLoader;
 
+/**
+ * Loads isolated diskless-storage components through the single {@link DisklessStorageProvider}
+ * published on the configured storage class path.
+ */
 final class DisklessStorageProviderLoader {
+
+    private static final String DEFAULT_DISKLESS_STORAGE_DIR = "ursa-storage";
 
     private DisklessStorageProviderLoader() {
     }
 
+    /**
+     * Creates one component through the discovered provider and returns it wrapped so that every
+     * call runs with the plugin class loader and {@code close()} releases the class-loader lease.
+     */
     static <T> T load(
             UrsaStorageConfig config,
             String componentName,
             ProviderFactory<T> factory,
-            LeasedComponentFactory<T> leasedComponentFactory) {
+            Class<T> type) {
         DisklessClassLoaderRegistry.Lease classLoaderLease = null;
         try {
             ClassLoader parent = DisklessStorageProviderLoader.class.getClassLoader();
-            URL[] urls = DisklessStorageEngineLoader.classPathUrls(config.getClassPath());
+            URL[] urls = classPathUrls(config.getClassPath());
             classLoaderLease = DisklessClassLoaderRegistry.acquire(urls, parent);
             DisklessClassLoaderRegistry.Lease acquiredLease = classLoaderLease;
             T delegate = DisklessClassLoaderContext.call(acquiredLease.classLoader(), () -> {
@@ -46,7 +57,7 @@ final class DisklessStorageProviderLoader {
                         factory.create(provider),
                         "DisklessStorageProvider returned a null " + componentName);
             });
-            return leasedComponentFactory.create(delegate, acquiredLease);
+            return DisklessClassLoaderContext.leased(type, delegate, acquiredLease);
         } catch (Throwable t) {
             if (classLoaderLease != null) {
                 DisklessClassLoaderRegistry.closeLeaseOnFailure(classLoaderLease, t);
@@ -59,6 +70,14 @@ final class DisklessStorageProviderLoader {
             }
             throw new KafkaException("Failed to load diskless " + componentName, t);
         }
+    }
+
+    static URL[] classPathUrls(String configuredClassPath) throws Exception {
+        String classPath = KafkaPluginClassPaths.configuredOrDefault(
+                configuredClassPath,
+                DEFAULT_DISKLESS_STORAGE_DIR,
+                DisklessStorageProviderLoader.class);
+        return KafkaPluginClassPaths.toUrls(classPath);
     }
 
     private static DisklessStorageProvider discoverProvider(ClassLoader classLoader) {
@@ -85,10 +104,5 @@ final class DisklessStorageProviderLoader {
     @FunctionalInterface
     interface ProviderFactory<T> {
         T create(DisklessStorageProvider provider) throws Exception;
-    }
-
-    @FunctionalInterface
-    interface LeasedComponentFactory<T> {
-        T create(T delegate, DisklessClassLoaderRegistry.Lease classLoaderLease);
     }
 }

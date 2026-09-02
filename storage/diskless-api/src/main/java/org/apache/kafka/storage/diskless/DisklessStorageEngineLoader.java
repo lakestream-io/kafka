@@ -16,20 +16,17 @@
  */
 package org.apache.kafka.storage.diskless;
 
-import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.utils.Time;
-import org.apache.kafka.server.util.KafkaPluginClassPaths;
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
-import java.lang.reflect.Constructor;
-import java.net.URL;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.function.Function;
 
+/** Loads the broker data-plane engine from the isolated diskless storage runtime. */
 public final class DisklessStorageEngineLoader {
 
-    private static final String DEFAULT_DISKLESS_STORAGE_DIR = "ursa-storage";
     private DisklessStorageEngineLoader() {
     }
 
@@ -39,7 +36,8 @@ public final class DisklessStorageEngineLoader {
             UrsaStorageConfig ursaConfig,
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
-            Function<String, Map<String, String>> topicConfigSupplier) {
+            Function<String, Map<String, String>> topicConfigSupplier,
+            Function<String, OptionalInt> partitionCountSupplier) {
         DisklessStorageProvider.StorageEngineContext context =
                 new DisklessStorageProvider.StorageEngineContext(
                         time,
@@ -47,71 +45,12 @@ public final class DisklessStorageEngineLoader {
                         ursaConfig,
                         brokerTopicStats,
                         logConfigDefaults,
-                        topicConfigSupplier);
+                        topicConfigSupplier,
+                        partitionCountSupplier);
         return DisklessStorageProviderLoader.load(
                 ursaConfig,
                 "storage engine",
                 provider -> provider.createStorageEngine(context),
-                LeasedDisklessStorageEngine::new);
-    }
-
-    static DisklessStorageEngine load(
-            Time time,
-            int brokerId,
-            UrsaStorageConfig ursaConfig,
-            BrokerTopicStats brokerTopicStats,
-            Map<String, Object> logConfigDefaults,
-            Function<String, Map<String, String>> topicConfigSupplier,
-            String engineClassName) {
-        try {
-            ClassLoader parent = DisklessStorageEngineLoader.class.getClassLoader();
-            URL[] urls = classPathUrls(ursaConfig.getClassPath());
-            DisklessClassLoaderRegistry.Lease classLoaderLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-            try {
-                Object engine = DisklessClassLoaderContext.call(classLoaderLease.classLoader(), () -> {
-                    Class<?> engineClass = Class.forName(engineClassName, true, classLoaderLease.classLoader());
-                    Constructor<?> constructor = engineClass.getConstructor(
-                            Time.class,
-                            int.class,
-                            UrsaStorageConfig.class,
-                            BrokerTopicStats.class,
-                            Map.class,
-                            Function.class
-                    );
-                    return constructor.newInstance(
-                            time,
-                            brokerId,
-                            ursaConfig,
-                            brokerTopicStats,
-                            logConfigDefaults,
-                            topicConfigSupplier
-                    );
-                });
-                return new LeasedDisklessStorageEngine((DisklessStorageEngine) engine, classLoaderLease);
-            } catch (Throwable t) {
-                DisklessClassLoaderRegistry.closeLeaseOnFailure(classLoaderLease, t);
-                throw rethrow(t);
-            }
-        } catch (Exception e) {
-            throw new KafkaException("Failed to load diskless storage engine", e);
-        }
-    }
-
-    static URL[] classPathUrls(String configuredClassPath) throws Exception {
-        String classPath = KafkaPluginClassPaths.configuredOrDefault(
-                configuredClassPath,
-                DEFAULT_DISKLESS_STORAGE_DIR,
-                DisklessStorageEngineLoader.class);
-        return KafkaPluginClassPaths.toUrls(classPath);
-    }
-
-    private static RuntimeException rethrow(Throwable t) throws Exception {
-        if (t instanceof Exception exception) {
-            throw exception;
-        }
-        if (t instanceof Error error) {
-            throw error;
-        }
-        return new KafkaException("Failed to load diskless storage engine", t);
+                DisklessStorageEngine.class);
     }
 }

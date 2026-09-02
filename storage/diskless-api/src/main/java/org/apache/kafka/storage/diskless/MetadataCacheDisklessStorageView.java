@@ -22,6 +22,7 @@ import org.apache.kafka.common.network.ListenerName;
 
 import java.util.Collections;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.function.Function;
 
 public class MetadataCacheDisklessStorageView implements DisklessStorageMetadataView {
@@ -29,22 +30,30 @@ public class MetadataCacheDisklessStorageView implements DisklessStorageMetadata
     private final Function<String, Map<String, String>> topicConfigSupplier;
     private final Function<ListenerName, Iterable<Node>> aliveBrokerNodesSupplier;
     private final Function<String, Uuid> topicIdSupplier;
+    private final Function<String, OptionalInt> partitionCountSupplier;
     private final boolean disklessStorageSystemEnabled;
 
     public MetadataCacheDisklessStorageView(
             Function<String, Map<String, String>> topicConfigSupplier,
             boolean disklessStorageSystemEnabled) {
-        this(topicConfigSupplier, ln -> Collections.emptyList(), t -> Uuid.ZERO_UUID, disklessStorageSystemEnabled);
+        this(
+                topicConfigSupplier,
+                ln -> Collections.emptyList(),
+                t -> Uuid.ZERO_UUID,
+                t -> OptionalInt.empty(),
+                disklessStorageSystemEnabled);
     }
 
     public MetadataCacheDisklessStorageView(
             Function<String, Map<String, String>> topicConfigSupplier,
             Function<ListenerName, Iterable<Node>> aliveBrokerNodesSupplier,
             Function<String, Uuid> topicIdSupplier,
+            Function<String, OptionalInt> partitionCountSupplier,
             boolean disklessStorageSystemEnabled) {
         this.topicConfigSupplier = topicConfigSupplier;
         this.aliveBrokerNodesSupplier = aliveBrokerNodesSupplier;
         this.topicIdSupplier = topicIdSupplier;
+        this.partitionCountSupplier = partitionCountSupplier;
         this.disklessStorageSystemEnabled = disklessStorageSystemEnabled;
     }
 
@@ -69,5 +78,11 @@ public class MetadataCacheDisklessStorageView implements DisklessStorageMetadata
     public Uuid getTopicId(String topicName) {
         Uuid id = topicIdSupplier.apply(topicName);
         return id != null ? id : Uuid.ZERO_UUID;
+    }
+
+    @Override
+    public OptionalInt partitionCount(String topic) {
+        OptionalInt partitionCount = partitionCountSupplier.apply(topic);
+        return partitionCount != null ? partitionCount : OptionalInt.empty();
     }
 }

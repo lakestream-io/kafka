@@ -16,8 +16,14 @@
  */
 package org.apache.kafka.storage.diskless;
 
+import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.requests.FetchRequest;
+import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.server.config.ServerLogConfigs;
+import org.apache.kafka.server.storage.log.FetchParams;
+import org.apache.kafka.server.storage.log.FetchPartitionData;
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -26,13 +32,15 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalInt;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -42,208 +50,153 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DisklessTopicLifecycleLoaderTest {
 
+    private static final String SERVICE_NAME = DisklessStorageProvider.class.getName();
+
     @TempDir
     Path tempDir;
 
     @BeforeEach
     void reset() {
         RecordingLifecycle.CLOSED.set(false);
-        RecordingLifecycle.reconciliation = null;
+        RecordingLifecycle.ensured = null;
+        RecordingLifecycle.deletedTopicId = null;
+        RecordingLifecycle.sweptOrphans = null;
         RecordingLifecycle.classLoader = null;
         RecordingLifecycle.inventoryClassLoader = null;
         RecordingLifecycle.invocationClassLoader = null;
         RecordingLifecycle.closeClassLoader = null;
-        RecordingProducerStateLifecycle.CLOSED.set(false);
-        RecordingProducerStateLifecycle.deletedTopicId = null;
-        RecordingProducerStateLifecycle.reconciliation = null;
-        RecordingProducerStateLifecycle.classLoader = null;
-        RecordingProducerStateLifecycle.inventoryClassLoader = null;
-        RecordingProducerStateLifecycle.invocationClassLoader = null;
-        RecordingProducerStateLifecycle.closeClassLoader = null;
         FailingCloseLifecycle.classLoader = null;
-        FailingCloseLifecycle.FAIL_ON_CLOSE.set(true);
     }
 
     @Test
     void testLoadsLifecycleFromIsolatedRuntimeAndReleasesLease() throws Exception {
-        UrsaStorageConfig config = ursaConfig(tempDir);
-        URL[] urls = DisklessTopicLifecycleLoader.classPathUrls(tempDir.toString());
-        ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
+        writeProvider(RecordingProvider.class);
+        UrsaStorageConfig config = ursaConfig();
         Uuid topicId = Uuid.randomUuid();
-        try (DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(
-                config, RecordingLifecycle.class.getName())) {
+
+        try (DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(config)) {
             assertTrue(lifecycle.listManagedTopics().get().isEmpty());
-            lifecycle.reconcileTopic("orders", topicId, 3, Map.of("owner", "kafka"), 11).get();
+            lifecycle.ensureTopic("orders", topicId, 3, Map.of("owner", "kafka"), 11).get();
+            lifecycle.deleteTopic("orders", topicId).get();
+            lifecycle.sweepOrphans(Set.of(topicId), 42).get();
         }
 
-        assertEquals("orders:" + topicId + ":3", RecordingLifecycle.reconciliation);
+        assertEquals("orders:" + topicId + ":3", RecordingLifecycle.ensured);
+        assertEquals(topicId, RecordingLifecycle.deletedTopicId);
+        assertEquals(Set.of(topicId) + ":42", RecordingLifecycle.sweptOrphans);
         assertTrue(RecordingLifecycle.CLOSED.get());
+
         ClassLoader observedLoader = RecordingLifecycle.classLoader;
+        assertNotSame(Thread.currentThread().getContextClassLoader(), observedLoader);
         assertSame(observedLoader, RecordingLifecycle.inventoryClassLoader);
         assertSame(observedLoader, RecordingLifecycle.invocationClassLoader);
         assertSame(observedLoader, RecordingLifecycle.closeClassLoader);
-        DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-        try {
-            assertNotSame(observedLoader, nextLease.classLoader());
-        } finally {
-            nextLease.close();
-        }
+        assertLeaseWasReleased(observedLoader);
     }
 
     @Test
-    void testLoadsProducerStateLifecycleThroughSeparateSemanticSpi() throws Exception {
-        UrsaStorageConfig config = ursaConfig(tempDir);
-        Uuid topicId = Uuid.randomUuid();
+    void testEngineAndLifecycleShareRuntimeUntilBothClose() throws Exception {
+        writeProvider(RecordingProvider.class);
+        UrsaStorageConfig config = ursaConfig();
 
-        try (DisklessProducerStateLifecycle store = DisklessProducerStateLifecycleLoader.load(
-                config, RecordingProducerStateLifecycle.class.getName())) {
-            store.reconcileTopic("orders", topicId, 17).get();
-            assertEquals(
-                    List.of(new DisklessProducerStateLifecycle.ManagedProducerStateTopic(
-                            "orders", topicId, 17)),
-                    store.listManagedTopics().get());
-            store.deleteTopicSnapshots(topicId).get();
-        }
-
-        assertEquals("orders:" + topicId + ":17", RecordingProducerStateLifecycle.reconciliation);
-        assertEquals(topicId, RecordingProducerStateLifecycle.deletedTopicId);
-        assertTrue(RecordingProducerStateLifecycle.CLOSED.get());
-        assertSame(RecordingProducerStateLifecycle.classLoader, RecordingProducerStateLifecycle.inventoryClassLoader);
-        assertSame(RecordingProducerStateLifecycle.classLoader, RecordingProducerStateLifecycle.invocationClassLoader);
-        assertSame(RecordingProducerStateLifecycle.classLoader, RecordingProducerStateLifecycle.closeClassLoader);
-    }
-
-    @Test
-    void testLifecycleLoaderReleasesLeaseWhenClassInitializationFails() throws Exception {
-        UrsaStorageConfig config = ursaConfig(tempDir);
-        URL[] urls = DisklessTopicLifecycleLoader.classPathUrls(tempDir.toString());
-        ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
-        DisklessClassLoaderRegistry.Lease retainedLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-        ClassLoader failedLoader = retainedLease.classLoader();
-
-        assertThrows(ExceptionInInitializerError.class, () -> DisklessTopicLifecycleLoader.load(
-                config, FailingLifecycle.class.getName()));
-        retainedLease.close();
-
-        DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-        try {
-            assertNotSame(failedLoader, nextLease.classLoader());
-        } finally {
-            nextLease.close();
-        }
-    }
-
-    @Test
-    void testLifecycleAndProducerStateLifecycleShareRuntimeUntilBothClose() throws Exception {
-        UrsaStorageConfig config = ursaConfig(tempDir);
-        URL[] urls = DisklessTopicLifecycleLoader.classPathUrls(tempDir.toString());
-        ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
-
-        DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(
-                config, RecordingLifecycle.class.getName());
-        DisklessProducerStateLifecycle store = DisklessProducerStateLifecycleLoader.load(
-                config, RecordingProducerStateLifecycle.class.getName());
+        DisklessStorageEngine engine = DisklessStorageEngineLoader.load(
+                null, 0, config, null, Map.of(), topic -> Map.of(), topic -> OptionalInt.empty());
+        DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(config);
         ClassLoader sharedLoader = RecordingLifecycle.classLoader;
-        assertSame(sharedLoader, RecordingProducerStateLifecycle.classLoader);
 
         lifecycle.close();
-        store.deleteTopicSnapshots(Uuid.randomUuid()).get();
-        store.close();
+        assertSame(sharedLoader, currentClassLoaderForClassPath());
 
-        DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-        try {
-            assertNotSame(sharedLoader, nextLease.classLoader());
-        } finally {
-            nextLease.close();
-        }
+        engine.close();
+        assertLeaseWasReleased(sharedLoader);
     }
 
     @Test
-    void testLifecycleCloseFailureRetainsLeaseUntilRetrySucceeds() throws Exception {
-        UrsaStorageConfig config = ursaConfig(tempDir);
-        URL[] urls = DisklessTopicLifecycleLoader.classPathUrls(tempDir.toString());
-        ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
-        DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(
-                config, FailingCloseLifecycle.class.getName());
+    void testLifecycleCloseFailureStillReleasesLease() throws Exception {
+        writeProvider(FailingCloseProvider.class);
+        DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(ursaConfig());
         ClassLoader failedLoader = FailingCloseLifecycle.classLoader;
 
         assertThrows(IOException.class, lifecycle::close);
 
-        DisklessClassLoaderRegistry.Lease nextLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-        try {
-            assertSame(failedLoader, nextLease.classLoader());
-        } finally {
-            nextLease.close();
-        }
-
-        FailingCloseLifecycle.FAIL_ON_CLOSE.set(false);
-        lifecycle.close();
-
-        DisklessClassLoaderRegistry.Lease afterSuccessfulClose =
-                DisklessClassLoaderRegistry.acquire(urls, parent);
-        try {
-            assertNotSame(failedLoader, afterSuccessfulClose.classLoader());
-        } finally {
-            afterSuccessfulClose.close();
-        }
+        assertLeaseWasReleased(failedLoader);
     }
 
     @Test
-    void testLazyLifecycleDoesNotLoadUntilUsedAndRetriesInitialization() throws Exception {
-        AtomicInteger loadAttempts = new AtomicInteger();
-        DisklessTopicLifecycle lifecycle = new LazyDisklessTopicLifecycle(() -> {
-            if (loadAttempts.incrementAndGet() == 1) {
-                throw new IllegalStateException("catalog unavailable");
-            }
-            return new RecordingLifecycle(null);
-        });
-
-        assertEquals(0, loadAttempts.get());
-        ExecutionException firstFailure = assertThrows(
-                ExecutionException.class,
-                () -> lifecycle.listManagedTopics().get());
-        assertTrue(firstFailure.getCause().getMessage().contains("catalog unavailable"));
-        assertTrue(lifecycle.listManagedTopics().get().isEmpty());
-        assertEquals(2, loadAttempts.get());
-        lifecycle.close();
-        assertTrue(RecordingLifecycle.CLOSED.get());
+    void testLoadLazilyDefersProviderDiscoveryUntilFirstOperation() throws Exception {
+        // No provider is published on the configured class path, so an eager load would fail here.
+        DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.loadLazily(ursaConfig());
+        try {
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> lifecycle.listManagedTopics().get());
+            assertTrue(failure.getCause().getMessage().contains("No DisklessStorageProvider"));
+        } finally {
+            lifecycle.close();
+        }
     }
 
-    @Test
-    void testLazyProducerStateLifecycleDoesNotLoadUntilUsedAndRetriesInitialization() throws Exception {
-        AtomicInteger loadAttempts = new AtomicInteger();
-        DisklessProducerStateLifecycle store = new LazyDisklessProducerStateLifecycle(() -> {
-            if (loadAttempts.incrementAndGet() == 1) {
-                throw new IllegalStateException("oxia unavailable");
-            }
-            return new RecordingProducerStateLifecycle(null);
-        });
-
-        assertEquals(0, loadAttempts.get());
-        ExecutionException firstFailure = assertThrows(
-                ExecutionException.class,
-                () -> store.listManagedTopics().get());
-        assertTrue(firstFailure.getCause().getMessage().contains("oxia unavailable"));
-        assertTrue(store.listManagedTopics().get().isEmpty());
-        assertEquals(2, loadAttempts.get());
-        store.close();
-        assertTrue(RecordingProducerStateLifecycle.CLOSED.get());
+    private void writeProvider(Class<?> provider) throws IOException {
+        Path serviceFile = tempDir.resolve("META-INF/services").resolve(SERVICE_NAME);
+        Files.createDirectories(serviceFile.getParent());
+        Files.writeString(serviceFile, provider.getName() + "\n");
     }
 
-    private static UrsaStorageConfig ursaConfig(Path classPath) throws Exception {
+    private UrsaStorageConfig ursaConfig() throws Exception {
         return UrsaStorageConfig.fromConfigs(Map.of(
-                ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG, classPath.toString()));
+                ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG, tempDir.toString()));
     }
 
-    public static final class RecordingLifecycle implements DisklessTopicLifecycle {
+    private ClassLoader currentClassLoaderForClassPath() throws Exception {
+        URL[] urls = DisklessStorageProviderLoader.classPathUrls(tempDir.toString());
+        ClassLoader parent = DisklessStorageProviderLoader.class.getClassLoader();
+        DisklessClassLoaderRegistry.Lease lease = DisklessClassLoaderRegistry.acquire(urls, parent);
+        try {
+            return lease.classLoader();
+        } finally {
+            lease.close();
+        }
+    }
+
+    private void assertLeaseWasReleased(ClassLoader previousClassLoader) throws Exception {
+        assertNotSame(previousClassLoader, currentClassLoaderForClassPath());
+    }
+
+    public static final class RecordingProvider implements DisklessStorageProvider {
+        @Override
+        public DisklessStorageEngine createStorageEngine(StorageEngineContext context) {
+            return new NoOpEngine();
+        }
+
+        @Override
+        public DisklessTopicLifecycle createTopicLifecycle(UrsaStorageConfig config) {
+            return new RecordingLifecycle();
+        }
+    }
+
+    public static final class FailingCloseProvider implements DisklessStorageProvider {
+        @Override
+        public DisklessStorageEngine createStorageEngine(StorageEngineContext context) {
+            return new NoOpEngine();
+        }
+
+        @Override
+        public DisklessTopicLifecycle createTopicLifecycle(UrsaStorageConfig config) {
+            return new FailingCloseLifecycle();
+        }
+    }
+
+    static final class RecordingLifecycle implements DisklessTopicLifecycle {
         static final AtomicBoolean CLOSED = new AtomicBoolean(false);
-        static volatile String reconciliation;
+        static volatile String ensured;
+        static volatile Uuid deletedTopicId;
+        static volatile String sweptOrphans;
         static volatile ClassLoader classLoader;
         static volatile ClassLoader inventoryClassLoader;
         static volatile ClassLoader invocationClassLoader;
         static volatile ClassLoader closeClassLoader;
 
-        public RecordingLifecycle(UrsaStorageConfig config) {
+        RecordingLifecycle() {
             classLoader = Thread.currentThread().getContextClassLoader();
         }
 
@@ -254,92 +207,40 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
-        public CompletableFuture<Void> reconcileTopic(
+        public CompletableFuture<Void> ensureTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
-                Map<String, String> properties,
+                Map<String, String> configs,
                 long sourceRevision) {
-            reconciliation = topicName + ":" + topicId + ":" + partitions;
+            ensured = topicName + ":" + topicId + ":" + partitions;
             invocationClassLoader = Thread.currentThread().getContextClassLoader();
             return CompletableFuture.completedFuture(null);
         }
 
         @Override
         public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public void close() {
-            closeClassLoader = Thread.currentThread().getContextClassLoader();
-            CLOSED.set(true);
-        }
-    }
-
-    public static final class RecordingProducerStateLifecycle implements DisklessProducerStateLifecycle {
-        static final AtomicBoolean CLOSED = new AtomicBoolean(false);
-        static volatile Uuid deletedTopicId;
-        static volatile String reconciliation;
-        static volatile ClassLoader classLoader;
-        static volatile ClassLoader inventoryClassLoader;
-        static volatile ClassLoader invocationClassLoader;
-        static volatile ClassLoader closeClassLoader;
-
-        public RecordingProducerStateLifecycle(UrsaStorageConfig config) {
-            classLoader = Thread.currentThread().getContextClassLoader();
-        }
-
-        @Override
-        public CompletableFuture<Void> reconcileTopic(
-                String topicName,
-                Uuid topicId,
-                long sourceRevision
-        ) {
-            reconciliation = topicName + ":" + topicId + ":" + sourceRevision;
-            invocationClassLoader = Thread.currentThread().getContextClassLoader();
-            return CompletableFuture.completedFuture(null);
-        }
-
-        @Override
-        public CompletableFuture<List<ManagedProducerStateTopic>> listManagedTopics() {
-            inventoryClassLoader = Thread.currentThread().getContextClassLoader();
-            if (reconciliation == null) {
-                return CompletableFuture.completedFuture(List.of());
-            }
-            String[] fields = reconciliation.split(":", 3);
-            return CompletableFuture.completedFuture(List.of(new ManagedProducerStateTopic(
-                    fields[0], Uuid.fromString(fields[1]), Long.parseLong(fields[2]))));
-        }
-
-        @Override
-        public CompletableFuture<Void> deleteTopicSnapshots(Uuid topicId) {
             deletedTopicId = topicId;
             return CompletableFuture.completedFuture(null);
         }
 
         @Override
+        public CompletableFuture<Void> sweepOrphans(Set<Uuid> liveTopicIds, long imageOffset) {
+            sweptOrphans = liveTopicIds + ":" + imageOffset;
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
         public void close() {
             closeClassLoader = Thread.currentThread().getContextClassLoader();
             CLOSED.set(true);
         }
     }
 
-    public static final class FailingLifecycle {
-        static {
-            fail();
-        }
-
-        private static void fail() {
-            throw new ExceptionInInitializerError("boom");
-        }
-    }
-
-    public static final class FailingCloseLifecycle implements DisklessTopicLifecycle {
-        static final AtomicBoolean FAIL_ON_CLOSE = new AtomicBoolean(true);
+    static final class FailingCloseLifecycle implements DisklessTopicLifecycle {
         static volatile ClassLoader classLoader;
 
-        public FailingCloseLifecycle(UrsaStorageConfig config) {
+        FailingCloseLifecycle() {
             classLoader = Thread.currentThread().getContextClassLoader();
         }
 
@@ -349,11 +250,11 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
-        public CompletableFuture<Void> reconcileTopic(
+        public CompletableFuture<Void> ensureTopic(
                 String topicName,
                 Uuid topicId,
                 int partitions,
-                Map<String, String> properties,
+                Map<String, String> configs,
                 long sourceRevision) {
             return CompletableFuture.completedFuture(null);
         }
@@ -364,10 +265,59 @@ class DisklessTopicLifecycleLoaderTest {
         }
 
         @Override
+        public CompletableFuture<Void> sweepOrphans(Set<Uuid> liveTopicIds, long imageOffset) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        @Override
         public void close() throws IOException {
-            if (FAIL_ON_CLOSE.get()) {
-                throw new IOException("close failed");
-            }
+            throw new IOException("close failed");
+        }
+    }
+
+    private static final class NoOpEngine implements DisklessStorageEngine {
+        @Override
+        public CompletableFuture<Map<TopicIdPartition, ProduceResponse.PartitionResponse>> write(
+                Map<TopicIdPartition, MemoryRecords> entriesPerPartition,
+                String zone) {
+            return CompletableFuture.completedFuture(Map.of());
+        }
+
+        @Override
+        public CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> fetch(
+                FetchParams params,
+                Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos) {
+            return CompletableFuture.completedFuture(Map.of());
+        }
+
+        @Override
+        public boolean cleanupPartition(TopicIdPartition tp, boolean deletePartition) {
+            return true;
+        }
+
+        @Override
+        public void applyTopicConfig(String topicName, Uuid topicId, Map<String, String> config) {
+        }
+
+        @Override
+        public void fenceDeletedTopic(String topicName, Uuid topicId) {
+        }
+
+        @Override
+        public Set<TopicIdPartition> snapshotTrackedPartitions() {
+            return Set.of();
+        }
+
+        @Override
+        public boolean cleanupNonOwnedProducerStates(
+                TopicIdPartition tp,
+                Set<String> retainedZones,
+                boolean deleteSnapshot) {
+            return true;
+        }
+
+        @Override
+        public void close() {
         }
     }
 }

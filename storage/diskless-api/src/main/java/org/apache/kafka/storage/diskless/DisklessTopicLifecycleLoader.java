@@ -16,18 +16,13 @@
  */
 package org.apache.kafka.storage.diskless;
 
-import org.apache.kafka.common.KafkaException;
-import org.apache.kafka.server.util.KafkaPluginClassPaths;
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
 
-import java.lang.reflect.Constructor;
-import java.net.URL;
 import java.util.Objects;
 
 /** Loads the diskless topic lifecycle implementation from the isolated storage runtime. */
 public final class DisklessTopicLifecycleLoader {
 
-    private static final String DEFAULT_DISKLESS_STORAGE_DIR = "ursa-storage";
     private DisklessTopicLifecycleLoader() {
     }
 
@@ -36,7 +31,7 @@ public final class DisklessTopicLifecycleLoader {
                 config,
                 "topic lifecycle",
                 provider -> provider.createTopicLifecycle(config),
-                LeasedDisklessTopicLifecycle::new);
+                DisklessTopicLifecycle.class);
     }
 
     /**
@@ -47,47 +42,5 @@ public final class DisklessTopicLifecycleLoader {
     public static DisklessTopicLifecycle loadLazily(UrsaStorageConfig config) {
         Objects.requireNonNull(config, "config must not be null");
         return new LazyDisklessTopicLifecycle(() -> load(config));
-    }
-
-    static DisklessTopicLifecycle load(UrsaStorageConfig config, String lifecycleClassName) {
-        try {
-            ClassLoader parent = DisklessTopicLifecycleLoader.class.getClassLoader();
-            URL[] urls = classPathUrls(config.getClassPath());
-            DisklessClassLoaderRegistry.Lease classLoaderLease = DisklessClassLoaderRegistry.acquire(urls, parent);
-            try {
-                DisklessTopicLifecycle lifecycle = DisklessClassLoaderContext.call(
-                        classLoaderLease.classLoader(),
-                        () -> {
-                            Class<?> lifecycleClass = Class.forName(
-                                    lifecycleClassName, true, classLoaderLease.classLoader());
-                            Constructor<?> constructor = lifecycleClass.getConstructor(UrsaStorageConfig.class);
-                            return (DisklessTopicLifecycle) constructor.newInstance(config);
-                        });
-                return new LeasedDisklessTopicLifecycle(lifecycle, classLoaderLease);
-            } catch (Throwable t) {
-                DisklessClassLoaderRegistry.closeLeaseOnFailure(classLoaderLease, t);
-                throw rethrow(t);
-            }
-        } catch (Exception e) {
-            throw new KafkaException("Failed to load diskless topic lifecycle", e);
-        }
-    }
-
-    static URL[] classPathUrls(String configuredClassPath) throws Exception {
-        String classPath = KafkaPluginClassPaths.configuredOrDefault(
-                configuredClassPath,
-                DEFAULT_DISKLESS_STORAGE_DIR,
-                DisklessTopicLifecycleLoader.class);
-        return KafkaPluginClassPaths.toUrls(classPath);
-    }
-
-    private static RuntimeException rethrow(Throwable t) throws Exception {
-        if (t instanceof Exception exception) {
-            throw exception;
-        }
-        if (t instanceof Error error) {
-            throw error;
-        }
-        return new KafkaException("Failed to load diskless topic lifecycle", t);
     }
 }

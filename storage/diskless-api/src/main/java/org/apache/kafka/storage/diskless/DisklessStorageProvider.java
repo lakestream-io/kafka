@@ -21,6 +21,7 @@ import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.function.Function;
 
 /**
@@ -38,9 +39,6 @@ public interface DisklessStorageProvider {
     /** Creates the controller-side topic lifecycle. */
     DisklessTopicLifecycle createTopicLifecycle(UrsaStorageConfig config) throws Exception;
 
-    /** Creates the controller-side producer-state lifecycle. */
-    DisklessProducerStateLifecycle createProducerStateLifecycle(UrsaStorageConfig config) throws Exception;
-
     /** Broker dependencies supplied to the isolated storage engine. */
     record StorageEngineContext(
             Time time,
@@ -48,6 +46,7 @@ public interface DisklessStorageProvider {
             UrsaStorageConfig config,
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
-            Function<String, Map<String, String>> topicConfigSupplier) {
+            Function<String, Map<String, String>> topicConfigSupplier,
+            Function<String, OptionalInt> partitionCountSupplier) {
     }
 }

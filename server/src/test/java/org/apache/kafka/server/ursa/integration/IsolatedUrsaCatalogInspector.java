@@ -22,6 +22,7 @@ import org.apache.kafka.common.test.KafkaClusterTestKit;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
@@ -440,11 +441,12 @@ final class IsolatedUrsaCatalogInspector implements AutoCloseable {
     }
 
     private static ClassLoader isolatedClassLoader(Object ursaEngine) throws Exception {
+        Object leaseHolder = leasedDelegateHolder(ursaEngine);
         Object pluginEngine = ursaEngine;
-        Field delegateField = findField(ursaEngine.getClass(), "delegate");
+        Field delegateField = findField(leaseHolder.getClass(), "delegate");
         if (delegateField != null) {
             delegateField.setAccessible(true);
-            pluginEngine = delegateField.get(ursaEngine);
+            pluginEngine = delegateField.get(leaseHolder);
         }
 
         ClassLoader candidate = pluginEngine.getClass().getClassLoader();
@@ -452,6 +454,16 @@ final class IsolatedUrsaCatalogInspector implements AutoCloseable {
             throw new IllegalStateException("Ursa engine is not loaded by an isolated class loader");
         }
         return candidate;
+    }
+
+    /**
+     * Returns the object holding the isolated delegate of a leased diskless component: the
+     * component itself when it is not proxied, and the proxy's invocation handler otherwise.
+     */
+    static Object leasedDelegateHolder(Object component) {
+        return Proxy.isProxyClass(component.getClass())
+                ? Proxy.getInvocationHandler(component)
+                : component;
     }
 
     private static Field findField(Class<?> type, String name) {

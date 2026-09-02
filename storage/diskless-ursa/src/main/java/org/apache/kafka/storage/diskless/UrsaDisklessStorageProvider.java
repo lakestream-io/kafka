@@ -31,16 +31,12 @@ public final class UrsaDisklessStorageProvider implements DisklessStorageProvide
                 context.config(),
                 context.brokerTopicStats(),
                 context.logConfigDefaults(),
-                context.topicConfigSupplier());
+                context.topicConfigSupplier(),
+                context.partitionCountSupplier());
     }
 
     @Override
     public DisklessTopicLifecycle createTopicLifecycle(UrsaStorageConfig config) throws Exception {
         return new UrsaDisklessTopicLifecycle(config);
-    }
-
-    @Override
-    public DisklessProducerStateLifecycle createProducerStateLifecycle(UrsaStorageConfig config) throws Exception {
-        return new OxiaDisklessProducerStateLifecycle(config);
     }
 }

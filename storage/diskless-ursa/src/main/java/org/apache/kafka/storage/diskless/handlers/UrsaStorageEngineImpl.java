@@ -31,6 +31,7 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
@@ -47,14 +48,16 @@ public class UrsaStorageEngineImpl implements DisklessStorageEngine {
             UrsaStorageConfig config,
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
-            Function<String, Map<String, String>> topicConfigSupplier) {
+            Function<String, Map<String, String>> topicConfigSupplier,
+            Function<String, OptionalInt> partitionCountSupplier) {
         this.state = new UrsaStorageState(
                 time,
                 brokerId,
                 config,
                 brokerTopicStats,
                 logConfigDefaults,
-                topicConfigSupplier
+                topicConfigSupplier,
+                partitionCountSupplier
         );
         this.writer = new UrsaLakestreamWriter(state);
         this.reader = new UrsaLakestreamReader(state);

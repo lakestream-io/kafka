@@ -89,6 +89,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
      * @param logConfigDefaults  default log configuration values
      * @param topicConfigSupplier function to get topic configuration
      * @param topicIdSupplier function to get topic ID
+     * @param partitionCountSupplier function to get the current partition count of a topic
      * @param aliveBrokerNodesSupplier function to get alive brokers for a listener
      * @param ownerSelectionListener listener used for canonical diskless owner selection
      */
@@ -100,6 +101,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier,
             Function<String, Uuid> topicIdSupplier,
+            Function<String, OptionalInt> partitionCountSupplier,
             Function<ListenerName, Iterable<Node>> aliveBrokerNodesSupplier,
             ListenerName ownerSelectionListener) {
 
@@ -117,6 +119,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
                 topicConfigSupplier,
                 aliveBrokerNodesSupplier,
                 topicIdSupplier,
+                partitionCountSupplier,
                 true
         );
         this.brokerId = brokerId;
@@ -129,7 +132,8 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
                 ursaConfig,
                 brokerTopicStats,
                 logConfigDefaults,
-                topicConfigSupplier
+                topicConfigSupplier,
+                partitionCountSupplier
         );
 
         log.info("Diskless support initialized with Lakestream, oxia URLs: {} {}",

@@ -35,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -83,6 +84,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final ScheduledFuture<?> retentionTask;
     private final Map<String, Object> logConfigDefaults;
     private final Function<String, Map<String, String>> topicConfigSupplier;
+    private final Function<String, OptionalInt> partitionCountSupplier;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object lifecycleLock = new Object();
     private final Object shutdownLock = new Object();
@@ -105,7 +107,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             BrokerTopicStats brokerTopicStats) {
         this(time, brokerId, config, brokerTopicStats,
             (Map<String, Object>) null,
-            (Function<String, Map<String, String>>) null);
+            (Function<String, Map<String, String>>) null,
+            topic -> OptionalInt.empty());
     }
 
     public UrsaStorageState(
@@ -114,13 +117,17 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             UrsaStorageConfig config,
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
-            Function<String, Map<String, String>> topicConfigSupplier) {
+            Function<String, Map<String, String>> topicConfigSupplier,
+            Function<String, OptionalInt> partitionCountSupplier) {
         this.time = time;
         this.brokerId = brokerId;
         this.config = config;
         this.brokerTopicStats = brokerTopicStats;
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
+        this.partitionCountSupplier = partitionCountSupplier != null
+                ? partitionCountSupplier
+                : topic -> OptionalInt.empty();
         this.producerStateScheduler = new ScheduledThreadPoolExecutor(1, runnable -> {
             Thread thread = new Thread(runnable, "producer-state-manager");
             thread.setDaemon(true);
@@ -171,6 +178,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close-test");
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
+        this.partitionCountSupplier = topic -> OptionalInt.empty();
         this.retentionTask = startRetentionChecks();
     }
 
@@ -195,6 +203,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close-test");
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
+        this.partitionCountSupplier = topic -> OptionalInt.empty();
         this.retentionTask = startRetentionChecks();
     }
 
@@ -212,6 +221,11 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
 
     public BrokerTopicStats brokerTopicStats() {
         return brokerTopicStats;
+    }
+
+    /** Current partition count of the topic as seen by the broker metadata cache, when known. */
+    public Function<String, OptionalInt> partitionCountSupplier() {
+        return partitionCountSupplier;
     }
 
     public void applyTopicConfig(String topicName, Uuid topicId, Map<String, String> topicConfig) {

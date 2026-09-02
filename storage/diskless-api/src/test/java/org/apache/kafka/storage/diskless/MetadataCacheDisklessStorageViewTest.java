@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -121,9 +122,26 @@ class MetadataCacheDisklessStorageViewTest {
                 topic -> Map.of(),
                 listener -> Collections.emptyList(),
                 topic -> null,
+                topic -> null,
                 true
         );
 
         assertEquals(Uuid.ZERO_UUID, view.getTopicId("test-topic"));
+        assertEquals(OptionalInt.empty(), view.partitionCount("test-topic"));
+    }
+
+    @Test
+    void testPartitionCountComesFromTheSupplier() {
+        MetadataCacheDisklessStorageView view = new MetadataCacheDisklessStorageView(
+                topic -> Map.of(),
+                listener -> Collections.emptyList(),
+                topic -> Uuid.ZERO_UUID,
+                topic -> "orders".equals(topic) ? OptionalInt.of(7) : OptionalInt.empty(),
+                true
+        );
+
+        assertEquals(OptionalInt.of(7), view.partitionCount("orders"));
+        assertEquals(OptionalInt.empty(), view.partitionCount("other"));
+        assertEquals(OptionalInt.empty(), DisklessStorageMetadataView.DISABLED.partitionCount("orders"));
     }
 }

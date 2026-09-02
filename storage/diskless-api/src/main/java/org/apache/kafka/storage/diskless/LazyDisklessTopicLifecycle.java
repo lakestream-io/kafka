@@ -18,43 +18,125 @@ package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.Uuid;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
-/** Lazy controller-side facade for the isolated topic lifecycle provider. */
+/**
+ * Lazy controller-side facade for the isolated topic lifecycle provider.
+ *
+ * <p>The provider is loaded off the metadata publisher thread on the first operation and memoized
+ * afterwards. A failed load is not memoized, so the controller reconciler retries it with its next
+ * operation.
+ */
 final class LazyDisklessTopicLifecycle implements DisklessTopicLifecycle {
 
-    private final LazyDisklessResource<DisklessTopicLifecycle> resource;
+    private static final Logger log = LoggerFactory.getLogger(LazyDisklessTopicLifecycle.class);
+
+    private final Supplier<DisklessTopicLifecycle> loader;
+    private final Object lock = new Object();
+    private CompletableFuture<DisklessTopicLifecycle> loading;
+    private boolean closed;
 
     LazyDisklessTopicLifecycle(Supplier<DisklessTopicLifecycle> loader) {
-        this.resource = new LazyDisklessResource<>("diskless topic lifecycle", loader);
+        this.loader = Objects.requireNonNull(loader, "loader must not be null");
     }
 
     @Override
-    public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
-        return resource.call(DisklessTopicLifecycle::listManagedTopics);
-    }
-
-    @Override
-    public CompletableFuture<Void> reconcileTopic(
+    public CompletableFuture<Void> ensureTopic(
             String topicName,
             Uuid topicId,
             int partitions,
-            Map<String, String> properties,
+            Map<String, String> configs,
             long sourceRevision) {
-        return resource.call(lifecycle -> lifecycle.reconcileTopic(
-                topicName, topicId, partitions, properties, sourceRevision));
+        return call(lifecycle -> lifecycle.ensureTopic(topicName, topicId, partitions, configs, sourceRevision));
     }
 
     @Override
     public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
-        return resource.call(lifecycle -> lifecycle.deleteTopic(topicName, topicId));
+        return call(lifecycle -> lifecycle.deleteTopic(topicName, topicId));
+    }
+
+    @Override
+    public CompletableFuture<List<ManagedTopic>> listManagedTopics() {
+        return call(DisklessTopicLifecycle::listManagedTopics);
+    }
+
+    @Override
+    public CompletableFuture<Void> sweepOrphans(Set<Uuid> liveTopicIds, long imageOffset) {
+        return call(lifecycle -> lifecycle.sweepOrphans(liveTopicIds, imageOffset));
+    }
+
+    private <R> CompletableFuture<R> call(Function<DisklessTopicLifecycle, CompletableFuture<R>> operation) {
+        CompletableFuture<DisklessTopicLifecycle> current;
+        synchronized (lock) {
+            if (closed) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("diskless topic lifecycle is closed"));
+            }
+            if (loading == null) {
+                CompletableFuture<DisklessTopicLifecycle> started = CompletableFuture.supplyAsync(
+                        loader, task -> {
+                            Thread thread = new Thread(task, "diskless-topic-lifecycle-loader");
+                            thread.setDaemon(true);
+                            thread.start();
+                        });
+                loading = started;
+                started.whenComplete((loaded, error) -> onLoaded(started, loaded, error));
+            }
+            current = loading;
+        }
+        return current.thenCompose(operation);
+    }
+
+    private void onLoaded(
+            CompletableFuture<DisklessTopicLifecycle> started,
+            DisklessTopicLifecycle loaded,
+            Throwable error) {
+        boolean closeLoaded;
+        synchronized (lock) {
+            if (error != null) {
+                if (loading == started) {
+                    // A failed load is not memoized: the next operation retries it.
+                    loading = null;
+                }
+                return;
+            }
+            closeLoaded = closed;
+        }
+        if (closeLoaded) {
+            closeQuietly(loaded);
+        }
     }
 
     @Override
     public void close() throws Exception {
-        resource.close();
+        CompletableFuture<DisklessTopicLifecycle> current;
+        synchronized (lock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            current = loading;
+        }
+        if (current != null && current.isDone() && !current.isCompletedExceptionally()) {
+            current.join().close();
+        }
+        // An in-flight load closes its result in onLoaded.
+    }
+
+    private static void closeQuietly(DisklessTopicLifecycle lifecycle) {
+        try {
+            lifecycle.close();
+        } catch (Exception e) {
+            log.warn("Failed to close lazily loaded diskless topic lifecycle", e);
+        }
     }
 }

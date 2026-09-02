@@ -22,6 +22,7 @@ import org.apache.kafka.common.network.ListenerName;
 
 import java.util.Collections;
 import java.util.Map;
+import java.util.OptionalInt;
 
 public interface DisklessStorageMetadataView {
 
@@ -32,6 +33,9 @@ public interface DisklessStorageMetadataView {
     Iterable<Node> getAliveBrokerNodes(ListenerName listenerName);
 
     Uuid getTopicId(String topicName);
+
+    /** Returns the current partition count for the topic, or empty when it is unknown. */
+    OptionalInt partitionCount(String topic);
 
     DisklessStorageMetadataView DISABLED = new DisklessStorageMetadataView() {
         @Override
@@ -52,6 +56,11 @@ public interface DisklessStorageMetadataView {
         @Override
         public Uuid getTopicId(String topicName) {
             return Uuid.ZERO_UUID;
+        }
+
+        @Override
+        public OptionalInt partitionCount(String topic) {
+            return OptionalInt.empty();
         }
     };
 }

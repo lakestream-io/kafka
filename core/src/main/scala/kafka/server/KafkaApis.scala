@@ -78,7 +78,7 @@ import java.util
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap}
 import java.util.stream.Collectors
-import java.util.{Collections, Optional}
+import java.util.{Collections, Optional, OptionalInt}
 import scala.annotation.nowarn
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.{Map, Seq, Set, mutable}
@@ -133,6 +133,10 @@ class KafkaApis(val requestChannel: RequestChannel,
         },
         (listenerName: ListenerName) => metadataCache.getAliveBrokerNodes(listenerName),
         (topic: String) => metadataCache.getTopicId(topic),
+        (topic: String) => {
+          val numPartitions = metadataCache.numPartitions(topic)
+          if (numPartitions.isPresent) OptionalInt.of(numPartitions.get) else OptionalInt.empty()
+        },
         true
       ))
     } else {

@@ -182,7 +182,7 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(created));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
-            lifecycle.reconcileTopic("orders", topicId, 3, properties, 17).get();
+            lifecycle.ensureTopic("orders", topicId, 3, properties, 17).get();
         }
 
         verify(catalog).createStream(
@@ -212,7 +212,7 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(expanded));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
-            lifecycle.reconcileTopic("orders", topicId, 3, Map.of(), 18).get();
+            lifecycle.ensureTopic("orders", topicId, 3, Map.of(), 18).get();
         }
 
         verify(catalog).increasePartitions(identifier, 3);
@@ -239,7 +239,7 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(winner));
 
         try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
-            lifecycle.reconcileTopic("orders", topicId, 3, Map.of(), 19).get();
+            lifecycle.ensureTopic("orders", topicId, 3, Map.of(), 19).get();
         }
 
         verify(catalog).replaceStreamProperties(identifier, streamProperties, 19);

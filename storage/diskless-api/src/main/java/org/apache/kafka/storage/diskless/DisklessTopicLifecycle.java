@@ -21,6 +21,7 @@ import org.apache.kafka.common.Uuid;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -28,7 +29,8 @@ import java.util.concurrent.CompletableFuture;
  * storage implementation.
  *
  * <p>The implementation owns its catalog schema and metadata-store layout. Kafka supplies only
- * topic identity, partition count, and topic properties.
+ * topic identity, partition count, and topic configuration. Every operation is idempotent: the
+ * active controller retries it until it succeeds or its desired state changes.
  */
 public interface DisklessTopicLifecycle extends AutoCloseable {
 
@@ -56,31 +58,14 @@ public interface DisklessTopicLifecycle extends AutoCloseable {
     }
 
     /**
-     * Lists non-terminal Kafka topic incarnations managed by this storage implementation.
+     * Ensures one logical diskless topic exists at the supplied KRaft metadata revision.
      *
-     * <p>The active Kafka controller uses this semantic inventory to reconcile storage objects
-     * left behind by a controller restart. The inventory must include objects still being created
-     * or deleted so an abandoned lifecycle claim cannot remain hidden. Implementations must filter
-     * using durable ownership metadata and must not infer ownership from a storage-specific name
-     * alone. Each entry must also carry the KRaft source revision from the reconciliation that made
-     * it visible. The controller only deletes an absent entry after its image has reached that
-     * revision, which prevents a newly elected but lagging controller from deleting newer state.
+     * <p>The implementation creates the topic when it is absent, grows its partition layout when
+     * needed, and exactly replaces its configuration. The source revision lets the storage catalog
+     * reject a delayed update from an older metadata image.
      */
-    CompletableFuture<List<ManagedTopic>> listManagedTopics();
-
-    /**
-     * Reconcile a logical diskless topic at the supplied KRaft metadata revision.
-     *
-     * <p>The implementation creates the stream when it is absent, grows its partition layout when
-     * needed, and exactly replaces its properties. The source revision lets the storage catalog
-     * reject a delayed property update from an older metadata image.
-     */
-    CompletableFuture<Void> reconcileTopic(
-            String topicName,
-            Uuid topicId,
-            int partitions,
-            Map<String, String> properties,
-            long sourceRevision);
+    CompletableFuture<Void> ensureTopic(String topicName, Uuid topicId, int partitions,
+                                        Map<String, String> configs, long sourceRevision);
 
     /**
      * Permanently deletes the logical topic after its Kafka metadata has been deleted.
@@ -90,4 +75,26 @@ public interface DisklessTopicLifecycle extends AutoCloseable {
      * completes. A topic recreated with the same name receives a different ID.
      */
     CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId);
+
+    /**
+     * Lists non-terminal Kafka topic incarnations managed by this storage implementation.
+     *
+     * <p>The active Kafka controller uses this semantic inventory to reconcile storage objects
+     * left behind by a controller restart. The inventory must include objects still being created
+     * or deleted so an abandoned lifecycle claim cannot remain hidden. Implementations must filter
+     * using durable ownership metadata and must not infer ownership from a storage-specific name
+     * alone. Each entry must also carry the KRaft source revision from the reconciliation that made
+     * it visible, so a newly elected but lagging controller cannot delete newer state.
+     */
+    CompletableFuture<List<ManagedTopic>> listManagedTopics();
+
+    /**
+     * Deletes managed topics that are no longer live in the controller's metadata image.
+     *
+     * <p>{@code liveTopicIds} is the set of diskless topic IDs present in the image at
+     * {@code imageOffset}. An implementation must only delete an entry whose source revision is at
+     * or below {@code imageOffset}, so state created from a newer image than the caller has seen
+     * survives.
+     */
+    CompletableFuture<Void> sweepOrphans(Set<Uuid> liveTopicIds, long imageOffset);
 }

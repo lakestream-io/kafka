@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
@@ -61,7 +62,7 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     }
 
     @Override
-    public CompletableFuture<Void> reconcileTopic(
+    public CompletableFuture<Void> ensureTopic(
             String topicName,
             Uuid topicId,
             int partitions,
@@ -82,6 +83,12 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     @Override
     public CompletableFuture<Void> deleteTopic(String topicName, Uuid topicId) {
         return catalog.dropStream(streamIdentifier(topicName, topicId), true).thenApply(ignored -> null);
+    }
+
+    @Override
+    public CompletableFuture<Void> sweepOrphans(Set<Uuid> liveTopicIds, long imageOffset) {
+        // TODO: delete managed streams that are absent from the controller image at imageOffset.
+        return CompletableFuture.completedFuture(null);
     }
 
     private CompletableFuture<StreamMetadata> loadOrCreate(
