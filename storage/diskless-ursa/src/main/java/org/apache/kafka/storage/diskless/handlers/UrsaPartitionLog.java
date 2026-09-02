@@ -21,21 +21,18 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.internal.MemoryRecords;
-import org.apache.kafka.common.record.internal.Record;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
 import org.apache.kafka.server.storage.log.FetchPartitionData;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionRequest;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
-import org.apache.kafka.storage.diskless.LogEntryUtils;
 import org.apache.kafka.storage.diskless.handlers.RecordAnalyzer.RecordAnalysisResult;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -53,10 +50,7 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 
 import io.lakestream.api.Log;
-import io.lakestream.api.LogCursor;
-import io.lakestream.api.LogEntry;
 import io.lakestream.api.LogEntryHeader;
-import io.lakestream.api.LogOffset;
 import io.lakestream.api.exception.LogFencedException;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.netty.buffer.ByteBuf;
@@ -65,10 +59,7 @@ import io.oxia.client.api.AsyncOxiaClient;
 final class UrsaPartitionLog {
 
     private static final Logger log = LoggerFactory.getLogger(UrsaPartitionLog.class);
-    private static final long UNKNOWN_TIMESTAMP = -1L;
     private static final int MAX_ENTRIES_PER_FETCH = 10;
-    private static final int FETCH_CURSOR_POOL_SIZE = 4;
-    private static final long CURSOR_CLOSE_RETRY_DELAY_MS = 100L;
 
     private final TopicIdPartition topicIdPartition;
     private final UrsaStorageState state;
@@ -86,11 +77,7 @@ final class UrsaPartitionLog {
     private final AtomicReference<CompletableFuture<Log>> inFlightRetention = new AtomicReference<>();
     private final Set<OwnedWritePayload> ownedWritePayloads = ConcurrentHashMap.newKeySet();
     private CompletableFuture<Long> activeTrimFuture;
-    private volatile LogCursorPool fetchCursorPool;
-    private LogCursorPool closingFetchCursorPool;
-    private final CompletableFuture<Void> cursorLifecycleDrain = new CompletableFuture<>();
-    private int activeCursorLifecycles;
-    private boolean cursorLifecyclesSealed;
+    private volatile PartitionReader reader;
     private volatile boolean closed;
     private CompletableFuture<Void> logCloseAttempt;
     private final CompletableFuture<Void> logCloseDrain = new CompletableFuture<>();
@@ -270,91 +257,24 @@ final class UrsaPartitionLog {
     }
 
     CompletableFuture<FetchPartitionData> fetch(FetchRequest.PartitionData partitionData) {
-        long fetchOffset = partitionData.fetchOffset;
-        int maxBytes = partitionData.maxBytes;
-
-        log.debug("Fetching from partition {} at offset {} with maxBytes {}",
-                topicIdPartition, fetchOffset, maxBytes);
-
-        return initialized().thenCompose(logInstance -> getFetchOffsetRange(logInstance)
-                        .thenCompose(offsetRange -> {
-                            if (fetchOffset < offsetRange.logStartOffset()
-                                    || fetchOffset > offsetRange.highWatermark()) {
-                                log.debug("fetchOffset {} outside range [{}, {}] for partition {}",
-                                        fetchOffset,
-                                        offsetRange.logStartOffset(),
-                                        offsetRange.highWatermark(),
-                                        topicIdPartition);
-                                return CompletableFuture.completedFuture(new FetchPartitionData(
-                                        Errors.OFFSET_OUT_OF_RANGE,
-                                        offsetRange.highWatermark(),
-                                        offsetRange.logStartOffset(),
-                                        MemoryRecords.EMPTY,
-                                        Optional.empty(),
-                                        OptionalLong.empty(),
-                                        Optional.empty(),
-                                        OptionalInt.empty(),
-                                        false
-                                ));
-                            }
-
-                            if (fetchOffset == offsetRange.highWatermark()) {
-                                log.debug("fetchOffset {} == hwm {}, returning empty for partition {}",
-                                        fetchOffset, offsetRange.highWatermark(), topicIdPartition);
-                                return CompletableFuture.completedFuture(new FetchPartitionData(
-                                        Errors.NONE,
-                                        offsetRange.highWatermark(),
-                                        offsetRange.logStartOffset(),
-                                        MemoryRecords.EMPTY,
-                                        Optional.empty(),
-                                        OptionalLong.empty(),
-                                        Optional.empty(),
-                                        OptionalInt.empty(),
-                                        false
-                                ));
-                            }
-
-                            return readRecords(
-                                    fetchOffset,
-                                    offsetRange.highWatermark(),
-                                    MAX_ENTRIES_PER_FETCH,
-                                    maxBytes)
-                                    .thenApply(records -> new FetchPartitionData(
-                                            Errors.NONE,
-                                            offsetRange.highWatermark(),
-                                            offsetRange.logStartOffset(),
-                                            records,
-                                            Optional.empty(),
-                                            OptionalLong.empty(),
-                                            Optional.empty(),
-                                            OptionalInt.empty(),
-                                            false
-                                    ));
-                        }))
+        return initialized()
+                .thenCompose(logInstance -> activeReader().fetch(partitionData))
                 .exceptionally(error -> createFetchErrorResponse(mapException(error)));
     }
 
     CompletableFuture<ListOffsetsPartitionResponse> listOffsets(ListOffsetsPartitionRequest request) {
-        long timestamp = request.timestamp();
-        log.debug("ListOffsets for partition {} with timestamp {}", topicIdPartition, timestamp);
+        return initialized()
+                .thenCompose(logInstance -> activeReader().listOffsets(request))
+                .exceptionally(error -> ListOffsetsPartitionResponse.error(topicIdPartition, mapException(error)));
+    }
 
-        if (timestamp == ListOffsetsPartitionRequest.LATEST_TIERED_TIMESTAMP) {
-            return CompletableFuture.completedFuture(ListOffsetsPartitionResponse.success(topicIdPartition, -1L, -1L));
+    /** The reader installed once the log opened; it is dropped as soon as this partition log closes. */
+    private PartitionReader activeReader() {
+        PartitionReader currentReader = reader;
+        if (currentReader == null) {
+            throw ownershipLostException();
         }
-
-        return initialized().thenCompose(logInstance -> {
-            if (timestamp == ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP
-                    || timestamp == ListOffsetsPartitionRequest.EARLIEST_LOCAL_TIMESTAMP) {
-                return handleEarliestTimestamp(logInstance);
-            }
-            if (timestamp == ListOffsetsPartitionRequest.LATEST_TIMESTAMP) {
-                return handleLatestTimestamp(logInstance);
-            }
-            if (timestamp == ListOffsetsPartitionRequest.MAX_TIMESTAMP) {
-                return handleMaxTimestamp(logInstance);
-            }
-            return handleTimestampSearch(logInstance, timestamp);
-        }).exceptionally(error -> ListOffsetsPartitionResponse.error(topicIdPartition, mapException(error)));
+        return currentReader;
     }
 
     CompletableFuture<PartitionResponse> appendIdempotentRecords(
@@ -585,477 +505,6 @@ final class UrsaPartitionLog {
         return result;
     }
 
-    private CompletableFuture<Long> getHighWatermark(Log logInstance) {
-        return logInstance.getLastOffset().thenApply(lastOffset -> {
-            if (isInvalidOffset(lastOffset)) {
-                return 0L;
-            }
-            return lastOffset.offset() + lastOffset.numberOfRecords();
-        });
-    }
-
-    private CompletableFuture<FetchOffsetRange> getFetchOffsetRange(Log logInstance) {
-        return getEarliestOffset(logInstance).thenCombine(
-                getHighWatermark(logInstance),
-                (logStartOffset, highWatermark) -> new FetchOffsetRange(logStartOffset, highWatermark));
-    }
-
-    private CompletableFuture<Long> getEarliestOffset(Log logInstance) {
-        return logInstance.getFirstOffset().thenApply(firstOffset ->
-                isInvalidOffset(firstOffset) ? 0L : firstOffset.offset());
-    }
-
-    private boolean isInvalidOffset(LogOffset offset) {
-        return offset == null || offset.offset() < 0;
-    }
-
-    private MemoryRecords readableKafkaRecords(LogEntry entry) {
-        return KafkaRecordsPayload.readableRecords(
-                entry.payload(), entry.offset(), entry.numberOfRecords());
-    }
-
-    private long[] findFirstTimestampGe(LogEntry entry, long targetTimestamp) {
-        MemoryRecords records = readableKafkaRecords(entry);
-        for (RecordBatch batch : records.batches()) {
-            for (Record record : batch) {
-                if (record.timestamp() >= targetTimestamp) {
-                    return new long[]{record.timestamp(), record.offset()};
-                }
-            }
-        }
-        return null;
-    }
-
-    private TimestampAndOffset findMaxTimestamp(LogEntry entry) {
-        TimestampAndOffset best = null;
-        MemoryRecords records = readableKafkaRecords(entry);
-        for (RecordBatch batch : records.batches()) {
-            for (Record record : batch) {
-                if (record.timestamp() == RecordBatch.NO_TIMESTAMP) {
-                    continue;
-                }
-                if (best == null || record.timestamp() > best.timestamp()) {
-                    best = new TimestampAndOffset(record.timestamp(), record.offset());
-                }
-            }
-        }
-        return best;
-    }
-
-    private CompletableFuture<MemoryRecords> readRecords(
-            long fetchOffset,
-            long maxOffsetExclusive,
-            int maxEntries,
-            int maxBytes) {
-        LogCursorPool pool = fetchCursorPool;
-        if (pool == null) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("Fetch cursor pool is not initialized for " + topicIdPartition));
-        }
-
-        CompletableFuture<MemoryRecords> result = new CompletableFuture<>();
-        CompletableFuture<LogCursorPool.Lease> acquireFuture = pool.acquire(fetchOffset);
-        acquireFuture.whenComplete((lease, acquireError) -> {
-            if (acquireError != null) {
-                completeFromSource(result, acquireFuture, null, acquireError);
-                return;
-            }
-            if (result.isDone()) {
-                lease.close();
-                return;
-            }
-
-            CompletableFuture<List<LogEntry>> readFuture;
-            try {
-                readFuture = lease.cursor().readEntries(
-                        maxEntries, maxBytes, null, maxOffsetExclusive);
-                if (readFuture == null) {
-                    throw new IllegalStateException("LogCursor.readEntries returned null future");
-                }
-            } catch (Throwable readError) {
-                lease.close();
-                result.completeExceptionally(readError);
-                return;
-            }
-
-            readFuture.whenComplete((entries, readError) -> {
-                MemoryRecords records = null;
-                Throwable completionError = readError;
-                try {
-                    if (completionError == null && !result.isDone()) {
-                        records = convertLogEntriesToMemoryRecords(entries);
-                    }
-                } catch (Throwable conversionError) {
-                    completionError = conversionError;
-                } finally {
-                    completionError = closeLogEntries(entries, completionError);
-                    lease.close();
-                }
-
-                if (completionError != null) {
-                    completeFromSource(result, readFuture, null, completionError);
-                } else {
-                    result.complete(records);
-                }
-            });
-        });
-        return result;
-    }
-
-    private MemoryRecords convertLogEntriesToMemoryRecords(List<LogEntry> entries) {
-        if (entries.isEmpty()) {
-            return MemoryRecords.EMPTY;
-        }
-
-        List<ByteBuffer> decodedEntries = new ArrayList<>(entries.size());
-        int totalSize = 0;
-        for (LogEntry entry : entries) {
-            ByteBuffer kafkaRecords = readableKafkaRecords(entry).buffer();
-            totalSize = Math.addExact(totalSize, kafkaRecords.remaining());
-            decodedEntries.add(kafkaRecords);
-        }
-
-        if (totalSize == 0) {
-            return MemoryRecords.EMPTY;
-        }
-
-        ByteBuffer combined = ByteBuffer.allocate(totalSize);
-        for (ByteBuffer kafkaRecords : decodedEntries) {
-            combined.put(kafkaRecords);
-        }
-        combined.flip();
-        return MemoryRecords.readableRecords(combined);
-    }
-
-    private CompletableFuture<ListOffsetsPartitionResponse> handleEarliestTimestamp(Log logInstance) {
-        return getEarliestOffset(logInstance).thenApply(offset -> {
-            log.debug("EARLIEST for partition {}: offset={}", topicIdPartition, offset);
-            return ListOffsetsPartitionResponse.success(topicIdPartition, offset, UNKNOWN_TIMESTAMP);
-        });
-    }
-
-    private CompletableFuture<ListOffsetsPartitionResponse> handleLatestTimestamp(Log logInstance) {
-        return getHighWatermark(logInstance).thenApply(highWatermark -> {
-            log.debug("LATEST for partition {}: hwm={}", topicIdPartition, highWatermark);
-            return ListOffsetsPartitionResponse.success(topicIdPartition, highWatermark, UNKNOWN_TIMESTAMP);
-        });
-    }
-
-    private CompletableFuture<ListOffsetsPartitionResponse> handleMaxTimestamp(Log logInstance) {
-        return logInstance.getFirstOffset().thenCompose(firstOffset -> {
-            if (isInvalidOffset(firstOffset)) {
-                return listOffsetsNotFound();
-            }
-
-            return getHighWatermark(logInstance)
-                    .thenCompose(highWatermark -> scanForMaxTimestamp(
-                            logInstance, firstOffset.offset(), highWatermark))
-                    .thenApply(result -> result == null
-                            ? ListOffsetsPartitionResponse.success(topicIdPartition, -1L, -1L)
-                            : ListOffsetsPartitionResponse.success(
-                                    topicIdPartition, result.offset(), result.timestamp()));
-        });
-    }
-
-    private CompletableFuture<ListOffsetsPartitionResponse> handleTimestampSearch(
-            Log logInstance,
-            long targetTimestamp) {
-        return logInstance.getFirstOffset().thenCompose(firstOffset -> {
-            if (isInvalidOffset(firstOffset)) {
-                return listOffsetsNotFound();
-            }
-
-            return getHighWatermark(logInstance)
-                    .thenCompose(highWatermark -> scanForFirstTimestampAtOrAfter(
-                            logInstance, firstOffset.offset(), highWatermark, targetTimestamp))
-                    .thenApply(result -> result == null
-                            ? ListOffsetsPartitionResponse.success(topicIdPartition, -1L, -1L)
-                            : ListOffsetsPartitionResponse.success(topicIdPartition, result[1], result[0]));
-        });
-    }
-
-    private CompletableFuture<long[]> scanForFirstTimestampAtOrAfter(
-            Log logInstance,
-            long startOffset,
-            long maxOffset,
-            long targetTimestamp) {
-        if (!startCursorLifecycle()) {
-            return CompletableFuture.failedFuture(ownershipLostException());
-        }
-        CompletableFuture<LogCursor> cursorFuture;
-        try {
-            cursorFuture = logInstance.openEphemeralCursor(
-                    "kafka-scan-for-timestamp-" + System.nanoTime(), startOffset);
-            if (cursorFuture == null) {
-                throw new IllegalStateException("Log.openEphemeralCursor returned null future");
-            }
-        } catch (Throwable openError) {
-            completeCursorLifecycle();
-            return CompletableFuture.failedFuture(openError);
-        }
-        return runWithClosingCursor(
-                cursorFuture,
-                cursor -> scanCursorForFirstTimestampAtOrAfter(cursor, maxOffset, targetTimestamp),
-                "timestamp-scan");
-    }
-
-    private CompletableFuture<long[]> scanCursorForFirstTimestampAtOrAfter(
-            LogCursor cursor,
-            long maxOffset,
-            long targetTimestamp) {
-        CompletableFuture<List<LogEntry>> readFuture;
-        try {
-            readFuture = cursor.readEntries(MAX_ENTRIES_PER_FETCH, Long.MAX_VALUE, null, maxOffset);
-            if (readFuture == null) {
-                throw new IllegalStateException("LogCursor.readEntries returned null future");
-            }
-        } catch (Throwable readError) {
-            return CompletableFuture.failedFuture(readError);
-        }
-        return consumeLogEntries(readFuture, entries -> {
-            if (entries.isEmpty()) {
-                return new ScanBatchResult<long[]>(true, null);
-            }
-
-            for (LogEntry entry : entries) {
-                long[] found = findFirstTimestampGe(entry, targetTimestamp);
-                if (found != null) {
-                    return new ScanBatchResult<>(true, found);
-                }
-            }
-
-            return new ScanBatchResult<long[]>(false, null);
-        }).thenCompose(batchResult -> batchResult.done()
-                ? CompletableFuture.completedFuture(batchResult.value())
-                : scanCursorForFirstTimestampAtOrAfter(cursor, maxOffset, targetTimestamp));
-    }
-
-    private CompletableFuture<TimestampAndOffset> scanForMaxTimestamp(
-            Log logInstance,
-            long startOffset,
-            long maxOffset) {
-        if (!startCursorLifecycle()) {
-            return CompletableFuture.failedFuture(ownershipLostException());
-        }
-        CompletableFuture<LogCursor> cursorFuture;
-        try {
-            cursorFuture = logInstance.openEphemeralCursor(
-                    "kafka-scan-for-max-timestamp-" + System.nanoTime(), startOffset);
-            if (cursorFuture == null) {
-                throw new IllegalStateException("Log.openEphemeralCursor returned null future");
-            }
-        } catch (Throwable openError) {
-            completeCursorLifecycle();
-            return CompletableFuture.failedFuture(openError);
-        }
-        return runWithClosingCursor(
-                cursorFuture,
-                cursor -> scanCursorForMaxTimestamp(cursor, maxOffset, null),
-                "max-timestamp-scan");
-    }
-
-    private CompletableFuture<TimestampAndOffset> scanCursorForMaxTimestamp(
-            LogCursor cursor,
-            long maxOffset,
-            TimestampAndOffset bestSoFar) {
-        CompletableFuture<List<LogEntry>> readFuture;
-        try {
-            readFuture = cursor.readEntries(MAX_ENTRIES_PER_FETCH, Long.MAX_VALUE, null, maxOffset);
-            if (readFuture == null) {
-                throw new IllegalStateException("LogCursor.readEntries returned null future");
-            }
-        } catch (Throwable readError) {
-            return CompletableFuture.failedFuture(readError);
-        }
-        return consumeLogEntries(readFuture, entries -> {
-            if (entries.isEmpty()) {
-                return new ScanBatchResult<>(true, bestSoFar);
-            }
-
-            TimestampAndOffset best = bestSoFar;
-            for (LogEntry entry : entries) {
-                TimestampAndOffset candidate = findMaxTimestamp(entry);
-                if (candidate != null && (best == null || candidate.timestamp() > best.timestamp())) {
-                    best = candidate;
-                }
-            }
-
-            return new ScanBatchResult<>(false, best);
-        }).thenCompose(batchResult -> batchResult.done()
-                ? CompletableFuture.completedFuture(batchResult.value())
-                : scanCursorForMaxTimestamp(cursor, maxOffset, batchResult.value()));
-    }
-
-    private <T> CompletableFuture<T> runWithClosingCursor(
-            CompletableFuture<LogCursor> cursorFuture,
-            Function<LogCursor, CompletableFuture<T>> operation,
-            String purpose) {
-        CompletableFuture<T> result = new CompletableFuture<>();
-        cursorFuture.whenComplete((cursor, openError) -> {
-            if (openError != null) {
-                completeCursorLifecycle();
-                completeFromSource(result, cursorFuture, null, openError);
-                return;
-            }
-            if (cursor == null) {
-                completeCursorLifecycle();
-                result.completeExceptionally(
-                        new IllegalStateException("Log.openEphemeralCursor returned null cursor"));
-                return;
-            }
-            CompletableFuture<Void> closeDrain = new CompletableFuture<>();
-            closeDrain.whenComplete((ignored, closeError) -> completeCursorLifecycle());
-            if (closed) {
-                startCursorClose(cursor, closeDrain, purpose, false);
-                closeDrain.whenComplete((ignored, closeError) ->
-                        result.completeExceptionally(ownershipLostException()));
-                return;
-            }
-            if (result.isDone()) {
-                startCursorClose(cursor, closeDrain, purpose, false);
-                return;
-            }
-
-            CompletableFuture<T> operationFuture;
-            try {
-                operationFuture = operation.apply(cursor);
-                if (operationFuture == null) {
-                    throw new IllegalStateException("Cursor operation returned null future");
-                }
-            } catch (Throwable operationError) {
-                startCursorClose(cursor, closeDrain, purpose, false);
-                closeDrain.whenComplete((ignored, closeError) -> result.completeExceptionally(operationError));
-                return;
-            }
-            operationFuture.whenComplete((value, operationError) -> {
-                startCursorClose(cursor, closeDrain, purpose, false);
-                closeDrain.whenComplete((ignored, closeError) ->
-                        completeFromSource(result, operationFuture, value, operationError));
-            });
-        });
-        return result;
-    }
-
-    private synchronized boolean startCursorLifecycle() {
-        if (closed || cursorLifecyclesSealed) {
-            return false;
-        }
-        activeCursorLifecycles++;
-        return true;
-    }
-
-    private void completeCursorLifecycle() {
-        boolean drained;
-        synchronized (this) {
-            activeCursorLifecycles--;
-            drained = cursorLifecyclesSealed && activeCursorLifecycles == 0;
-        }
-        if (drained) {
-            cursorLifecycleDrain.complete(null);
-        }
-    }
-
-    private CompletableFuture<Void> sealCursorLifecycles() {
-        boolean drained;
-        synchronized (this) {
-            cursorLifecyclesSealed = true;
-            drained = activeCursorLifecycles == 0;
-        }
-        if (drained) {
-            cursorLifecycleDrain.complete(null);
-        }
-        return cursorLifecycleDrain;
-    }
-
-    private void startCursorClose(
-            LogCursor cursor,
-            CompletableFuture<Void> closeDrain,
-            String purpose,
-            boolean delayed) {
-        if (closeDrain.isDone()) {
-            return;
-        }
-        Runnable closeTask = () -> {
-            try {
-                cursor.close();
-                closeDrain.complete(null);
-            } catch (Throwable closeError) {
-                log.warn("Failed to close {} cursor for partition {}; retaining it for retry",
-                        purpose, topicIdPartition, closeError);
-                startCursorClose(cursor, closeDrain, purpose, true);
-            }
-        };
-        try {
-            ScheduledExecutorService closeScheduler = state.retiredResourceCloseScheduler();
-            if (closeScheduler != null && delayed) {
-                closeScheduler.schedule(
-                        closeTask, CURSOR_CLOSE_RETRY_DELAY_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
-            } else if (closeScheduler != null) {
-                closeScheduler.execute(closeTask);
-            } else if (delayed) {
-                CompletableFuture.delayedExecutor(
-                        CURSOR_CLOSE_RETRY_DELAY_MS,
-                        java.util.concurrent.TimeUnit.MILLISECONDS).execute(closeTask);
-            } else {
-                CompletableFuture.runAsync(closeTask);
-            }
-        } catch (RuntimeException scheduleError) {
-            log.warn("Failed to schedule {} cursor close for partition {}; retaining it for retry",
-                    purpose, topicIdPartition, scheduleError);
-            CompletableFuture.delayedExecutor(
-                    CURSOR_CLOSE_RETRY_DELAY_MS,
-                    java.util.concurrent.TimeUnit.MILLISECONDS).execute(closeTask);
-        }
-    }
-
-    private <T> CompletableFuture<T> consumeLogEntries(
-            CompletableFuture<List<LogEntry>> readFuture,
-            Function<List<LogEntry>, T> consumer) {
-        CompletableFuture<T> result = new CompletableFuture<>();
-        readFuture.whenComplete((entries, readError) -> {
-            T value = null;
-            Throwable completionError = readError;
-            try {
-                if (completionError == null && !result.isDone()) {
-                    value = consumer.apply(entries);
-                }
-            } catch (Throwable consumerError) {
-                completionError = consumerError;
-            } finally {
-                completionError = closeLogEntries(entries, completionError);
-            }
-
-            if (completionError != null) {
-                completeFromSource(result, readFuture, null, completionError);
-            } else {
-                result.complete(value);
-            }
-        });
-        return result;
-    }
-
-    private Throwable closeLogEntries(List<LogEntry> entries, Throwable precedingError) {
-        return LogEntryUtils.closeAll(entries, precedingError);
-    }
-
-    private static <T> void completeFromSource(
-            CompletableFuture<T> result,
-            CompletableFuture<?> source,
-            T value,
-            Throwable error) {
-        if (error == null) {
-            result.complete(value);
-        } else if (source.isCancelled()) {
-            result.cancel(false);
-        } else {
-            result.completeExceptionally(error);
-        }
-    }
-
-    private CompletableFuture<ListOffsetsPartitionResponse> listOffsetsNotFound() {
-        return CompletableFuture.completedFuture(ListOffsetsPartitionResponse.success(topicIdPartition, -1L, -1L));
-    }
-
     private Errors mapException(Throwable error) {
         Throwable cause = unwrapCompletionException(error);
         if (hasCause(cause, NotLeaderOrFollowerException.class)
@@ -1184,12 +633,12 @@ final class UrsaPartitionLog {
     }
 
     void cleanupReadState() {
-        retireCursorPools();
+        closeReader();
     }
 
     boolean cleanupGlobalState() {
         boolean cleaned = logMetrics.remove(topicIdPartition);
-        return retireCursorPools() || cleaned;
+        return closeReader() || cleaned;
     }
 
     private synchronized boolean cleanupProducerState(String zone, boolean deletePartition) {
@@ -1381,32 +830,25 @@ final class UrsaPartitionLog {
             if (activePartitionLog != null && activePartitionLog != this) {
                 throw new NotLeaderOrFollowerException("Partition log already replaced");
             }
-            if (fetchCursorPool == null) {
-                ScheduledExecutorService closeScheduler = state.retiredResourceCloseScheduler();
-                fetchCursorPool = closeScheduler == null
-                        ? new LogCursorPool(
-                                logInstance,
-                                fetchCursorNamePrefix(topicIdPartition),
-                                FETCH_CURSOR_POOL_SIZE)
-                        : new LogCursorPool(
-                                logInstance,
-                                fetchCursorNamePrefix(topicIdPartition),
-                                FETCH_CURSOR_POOL_SIZE,
-                                closeScheduler);
+            if (reader == null) {
+                PartitionReader openedReader =
+                        new PartitionReader(topicIdPartition, logInstance, MAX_ENTRIES_PER_FETCH);
                 try {
                     logMetrics.register(topicIdPartition, logInstance);
                 } catch (Throwable metricRegistrationError) {
                     logMetrics.remove(topicIdPartition);
-                    fetchCursorPool.close();
-                    fetchCursorPool = null;
+                    openedReader.close();
                     throw metricRegistrationError;
                 }
+                reader = openedReader;
             }
             initialized.complete(logInstance);
         }
     }
 
     synchronized CompletableFuture<Void> retryCloseLog() {
+        // The cursor must be gone before the log handle it reads through is closed.
+        closeReader();
         if (logClosed) {
             logCloseDrain.complete(null);
             return CompletableFuture.completedFuture(null);
@@ -1424,8 +866,7 @@ final class UrsaPartitionLog {
                     }
                     return null;
                 });
-        CompletableFuture<Void> cursorDrain = closeCursorPools();
-        CompletableFuture<Void> attempt = CompletableFuture.allOf(trimDrain, cursorDrain)
+        CompletableFuture<Void> attempt = trimDrain
                 .thenCompose(ignored -> logFuture
                 .handle((logInstance, openError) -> {
                     if (openError != null || logInstance == null) {
@@ -1460,28 +901,18 @@ final class UrsaPartitionLog {
         }
     }
 
-    private boolean retireCursorPools() {
-        LogCursorPool fetchPool;
+    /** Drops the reader and closes its cached cursor. Idempotent; returns true for the first close. */
+    private boolean closeReader() {
+        PartitionReader retiredReader;
         synchronized (this) {
-            fetchPool = fetchCursorPool;
-            fetchCursorPool = null;
-            if (closingFetchCursorPool == null) {
-                closingFetchCursorPool = fetchPool;
-            }
+            retiredReader = reader;
+            reader = null;
         }
-        if (fetchPool != null) {
-            fetchPool.close();
+        if (retiredReader == null) {
+            return false;
         }
-        return fetchPool != null;
-    }
-
-    private synchronized CompletableFuture<Void> closeCursorPools() {
-        List<CompletableFuture<Void>> closes = new ArrayList<>(2);
-        if (closingFetchCursorPool != null) {
-            closes.add(closingFetchCursorPool.closeAsync());
-        }
-        closes.add(sealCursorLifecycles());
-        return CompletableFuture.allOf(closes.toArray(new CompletableFuture<?>[0]));
+        retiredReader.close();
+        return true;
     }
 
     private static List<ProducerStateManager.AppendBatch> buildAppendBatches(MemoryRecords records) {
@@ -1501,10 +932,6 @@ final class UrsaPartitionLog {
             ));
         }
         return appendBatches;
-    }
-
-    private static String fetchCursorNamePrefix(TopicIdPartition tp) {
-        return "kafka-fetch-" + tp.topic() + "-partition-" + tp.partition() + "-cursor";
     }
 
     private enum WritePayloadState {
@@ -1577,12 +1004,4 @@ final class UrsaPartitionLog {
         }
     }
 
-    private record FetchOffsetRange(long logStartOffset, long highWatermark) {
-    }
-
-    private record ScanBatchResult<T>(boolean done, T value) {
-    }
-
-    private record TimestampAndOffset(long timestamp, long offset) {
-    }
 }

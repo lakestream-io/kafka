@@ -383,10 +383,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         });
     }
 
-    ScheduledExecutorService retiredResourceCloseScheduler() {
-        return retiredLogCloseScheduler;
-    }
-
     CompletableFuture<Void> runRetiredResourceClose(RetiredResourceClose closeOperation) {
         try {
             return CompletableFuture.runAsync(() -> {

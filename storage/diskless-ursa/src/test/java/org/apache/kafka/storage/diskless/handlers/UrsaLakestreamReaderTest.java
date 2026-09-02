@@ -33,25 +33,20 @@ import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
 
 import org.junit.jupiter.api.Test;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
+import io.lakestream.api.EntryHeader;
 import io.lakestream.api.Log;
 import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
+import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.exception.NoSuchStreamException;
@@ -59,9 +54,9 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -70,7 +65,6 @@ import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -87,6 +81,8 @@ class UrsaLakestreamReaderTest {
         Log logInstance = mock(Log.class);
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(5L, 1)));
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(10L, 5)));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -238,50 +234,29 @@ class UrsaLakestreamReaderTest {
     }
 
     @Test
-    void testCancelledFetchClosesLateEntriesBeforeReusingCursorLease() throws Exception {
+    void testCancelledFetchStillClosesLateEntries() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        CompletableFuture<List<LogEntry>> readFuture = new CompletableFuture<>();
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(0L, 1)));
         when(logInstance.getLastOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(100L, 1)));
-
-        List<CompletableFuture<List<LogEntry>>> readFutures = new ArrayList<>();
-        when(logInstance.openEphemeralCursor(anyString(), anyLong())).thenAnswer(invocation -> {
-            LogCursor cursor = mock(LogCursor.class);
-            when(cursor.readOffset()).thenReturn(-1L);
-            when(cursor.seek(anyLong())).thenReturn(CompletableFuture.completedFuture(null));
-            when(cursor.readEntries(anyInt(), anyLong(), isNull(), anyLong())).thenAnswer(readInvocation -> {
-                CompletableFuture<List<LogEntry>> readFuture = new CompletableFuture<>();
-                readFutures.add(readFuture);
-                return readFuture;
-            });
-            return CompletableFuture.completedFuture(cursor);
-        });
+        when(logInstance.openEphemeralCursor(anyString(), eq(0L)))
+                .thenReturn(CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(101L))).thenReturn(readFuture);
         UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
 
         try {
-            List<CompletableFuture<FetchPartitionData>> fetchFutures = new ArrayList<>();
-            for (long fetchOffset = 0; fetchOffset < 5; fetchOffset++) {
-                fetchFutures.add(partitionLog.fetch(fetchPartitionData(fetchOffset)));
-            }
-
-            assertEquals(4, readFutures.size());
-            assertTrue(fetchFutures.get(0).cancel(false));
+            CompletableFuture<FetchPartitionData> fetchFuture = partitionLog.fetch(fetchPartitionData(0L));
+            assertTrue(fetchFuture.cancel(false));
 
             LogEntry lateEntry = createKafkaRecordsEntry(0L, new long[]{1000L});
-            readFutures.get(0).complete(List.of(lateEntry));
+            readFuture.complete(List.of(lateEntry));
 
             verify(lateEntry, timeout(5_000)).close();
-            assertEquals(5, readFutures.size());
-
-            for (int i = 1; i < readFutures.size(); i++) {
-                readFutures.get(i).complete(List.of());
-            }
-            CompletableFuture.allOf(fetchFutures.subList(1, fetchFutures.size())
-                    .toArray(new CompletableFuture<?>[0])).get(5, TimeUnit.SECONDS);
-            verify(logInstance, times(4)).openEphemeralCursor(anyString(), anyLong());
         } finally {
             partitionLog.close();
         }
@@ -355,12 +330,11 @@ class UrsaLakestreamReaderTest {
     }
 
     @Test
-    void testSynchronousCursorReadFailureReleasesFetchPoolSlotForReuse() throws Exception {
+    void testSynchronousCursorReadFailureReleasesTheCursorForReuse() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
         LogCursor cursor = mock(LogCursor.class);
-        RuntimeException readFailure = new RuntimeException("synchronous read failure");
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(0L, 1)));
         when(logInstance.getLastOffset()).thenReturn(
@@ -369,7 +343,7 @@ class UrsaLakestreamReaderTest {
                 .thenReturn(CompletableFuture.completedFuture(cursor));
         when(cursor.readOffset()).thenReturn(0L);
         when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(11L)))
-                .thenThrow(readFailure)
+                .thenThrow(new RuntimeException("synchronous read failure"))
                 .thenReturn(CompletableFuture.completedFuture(List.of()));
         attachReaderPartitionLog(state, tp, logInstance);
 
@@ -377,111 +351,14 @@ class UrsaLakestreamReaderTest {
 
         FetchPartitionData failedResponse = reader.fetch(
                 createFetchParams(), Map.of(tp, fetchPartitionData(0L))).get().get(tp);
-        FetchPartitionData retryResponse = null;
-        for (int i = 0; i < 4; i++) {
-            retryResponse = reader.fetch(
-                    createFetchParams(), Map.of(tp, fetchPartitionData(0L))).get().get(tp);
-        }
+        FetchPartitionData retryResponse = reader.fetch(
+                createFetchParams(), Map.of(tp, fetchPartitionData(0L))).get().get(tp);
 
         assertEquals(Errors.KAFKA_STORAGE_ERROR, failedResponse.error);
-        assertNotNull(retryResponse);
         assertEquals(Errors.NONE, retryResponse.error);
-        verify(logInstance, times(4)).openEphemeralCursor(anyString(), eq(0L));
-        verify(cursor, times(5)).readEntries(anyInt(), anyLong(), isNull(), eq(11L));
-    }
-
-    @Test
-    void testFetchReusesLogCursorsFromBoundedPoolWithQueueing() throws Exception {
-        TopicIdPartition tp = createTestPartition();
-        UrsaStorageState state = mock(UrsaStorageState.class);
-        Log logInstance = mock(Log.class);
-        when(logInstance.getFirstOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(0L, 1)));
-        when(logInstance.getLastOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(100L, 1)));
-
-        AtomicInteger seekCalls = new AtomicInteger();
-        AtomicReference<Long> lastSeekOffset = new AtomicReference<>();
-        ConcurrentHashMap<String, LogCursor> cursorByName = new ConcurrentHashMap<>();
-        HashSet<String> cursorNames = new HashSet<>();
-        CountDownLatch startedFourReads = new CountDownLatch(4);
-        CountDownLatch startedFiveReads = new CountDownLatch(5);
-        ArrayDeque<ReadCompletion> readCompletions = new ArrayDeque<>();
-
-        when(logInstance.openEphemeralCursor(anyString(), anyLong())).thenAnswer(invocation -> {
-            String cursorName = invocation.getArgument(0);
-            synchronized (cursorNames) {
-                cursorNames.add(cursorName);
-            }
-            return CompletableFuture.completedFuture(cursorByName.computeIfAbsent(cursorName, ignored -> {
-                LogCursor cursor = mock(LogCursor.class);
-                when(cursor.readOffset()).thenReturn(-1L);
-                when(cursor.seek(anyLong())).thenAnswer(seekInvocation -> {
-                    long offset = seekInvocation.getArgument(0);
-                    lastSeekOffset.set(offset);
-                    seekCalls.incrementAndGet();
-                    return CompletableFuture.completedFuture(null);
-                });
-                when(cursor.readEntries(anyInt(), anyLong(), isNull(), anyLong())).thenAnswer(readInvocation -> {
-                    CompletableFuture<List<LogEntry>> readFuture = new CompletableFuture<>();
-                    synchronized (readCompletions) {
-                        readCompletions.add(new ReadCompletion(() -> readFuture.complete(List.of())));
-                    }
-                    startedFourReads.countDown();
-                    startedFiveReads.countDown();
-                    return readFuture;
-                });
-                return cursor;
-            }));
-        });
-        attachReaderPartitionLog(state, tp, logInstance);
-
-        UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
-        long[] fetchOffsets = new long[]{0L, 1L, 2L, 3L, 7L};
-        List<CompletableFuture<Map<TopicIdPartition, FetchPartitionData>>> futures = new ArrayList<>();
-        for (long fetchOffset : fetchOffsets) {
-            futures.add(reader.fetch(
-                    createFetchParams(), Map.of(tp, fetchPartitionData(fetchOffset))));
-        }
-
-        assertTrue(startedFourReads.await(5, TimeUnit.SECONDS));
-        verify(logInstance, times(4)).openEphemeralCursor(anyString(), anyLong());
-
-        ReadCompletion firstRead;
-        synchronized (readCompletions) {
-            firstRead = readCompletions.poll();
-        }
-        assertNotNull(firstRead);
-        firstRead.complete.run();
-        assertTrue(startedFiveReads.await(5, TimeUnit.SECONDS));
-
-        String expectedPrefix = "kafka-fetch-" + tp.topic()
-                + "-partition-" + tp.partition() + "-cursor-";
-        synchronized (cursorNames) {
-            assertEquals(4, cursorNames.size());
-            for (String name : cursorNames) {
-                assertTrue(name.startsWith(expectedPrefix));
-            }
-        }
-        assertEquals(1, seekCalls.get());
-        assertEquals(7L, lastSeekOffset.get());
-
-        while (true) {
-            ReadCompletion completion;
-            synchronized (readCompletions) {
-                completion = readCompletions.poll();
-            }
-            if (completion == null) {
-                break;
-            }
-            completion.complete.run();
-        }
-
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).get(5, TimeUnit.SECONDS);
-        verify(logInstance, times(4)).openEphemeralCursor(anyString(), anyLong());
-        for (LogCursor cursor : cursorByName.values()) {
-            verify(cursor, never()).close();
-        }
+        verify(logInstance, times(1)).openEphemeralCursor(anyString(), eq(0L));
+        verify(cursor, times(2)).readEntries(anyInt(), anyLong(), isNull(), eq(11L));
+        verify(cursor, never()).seek(anyLong());
     }
 
     @Test
@@ -489,17 +366,14 @@ class UrsaLakestreamReaderTest {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
-        LogCursor scanCursor = mock(LogCursor.class);
         when(logInstance.getFirstOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(10L, 5)));
+                CompletableFuture.completedFuture(logOffset(10L, 3)));
         when(logInstance.getLastOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(10L, 5)));
-        when(logInstance.openEphemeralCursor(anyString(), eq(10L)))
-                .thenReturn(CompletableFuture.completedFuture(scanCursor));
+                CompletableFuture.completedFuture(logOffset(10L, 3)));
+        when(logInstance.binarySearchOffset(eq(10L), eq(10L), any()))
+                .thenReturn(CompletableFuture.completedFuture(10L));
         LogEntry entry = createKafkaRecordsEntry(10L, new long[]{1000L, 1200L, 1500L});
-        LogEntry trailingEntry = createKafkaRecordsEntry(13L, new long[]{1800L, 2000L});
-        when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(15L)))
-                .thenReturn(CompletableFuture.completedFuture(List.of(entry, trailingEntry)));
+        when(logInstance.readEntry(10L)).thenReturn(CompletableFuture.completedFuture(entry));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -512,25 +386,22 @@ class UrsaLakestreamReaderTest {
         assertEquals(12L, response.offset());
         assertEquals(1500L, response.timestamp());
         verify(entry).close();
-        verify(trailingEntry).close();
-        verify(scanCursor).close();
+        verify(logInstance, never()).openEphemeralCursor(anyString(), anyLong());
     }
 
     @Test
-    void testCancelledTimestampSearchClosesLateEntriesAndCursor() throws Exception {
+    void testCancelledTimestampSearchStillClosesTheLateEntry() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
-        LogCursor scanCursor = mock(LogCursor.class);
-        CompletableFuture<List<LogEntry>> readFuture = new CompletableFuture<>();
+        CompletableFuture<LogEntry> entryFuture = new CompletableFuture<>();
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 1)));
         when(logInstance.getLastOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 1)));
-        when(logInstance.openEphemeralCursor(anyString(), eq(10L)))
-                .thenReturn(CompletableFuture.completedFuture(scanCursor));
-        when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(11L)))
-                .thenReturn(readFuture);
+        when(logInstance.binarySearchOffset(eq(10L), eq(10L), any()))
+                .thenReturn(CompletableFuture.completedFuture(10L));
+        when(logInstance.readEntry(10L)).thenReturn(entryFuture);
         UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
 
         CompletableFuture<ListOffsetsPartitionResponse> responseFuture = partitionLog.listOffsets(
@@ -538,61 +409,47 @@ class UrsaLakestreamReaderTest {
         assertTrue(responseFuture.cancel(false));
 
         LogEntry lateEntry = createKafkaRecordsEntry(10L, new long[]{1000L});
-        readFuture.complete(List.of(lateEntry));
+        entryFuture.complete(lateEntry);
 
         verify(lateEntry, timeout(5_000)).close();
-        verify(scanCursor, timeout(5_000)).close();
     }
 
     @Test
-    void testPartitionCloseDrainsTimestampCursorOpenAlreadyInFlight() throws Exception {
+    void testPartitionCloseClosesTheFetchCursorAndLog() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
-        LogCursor scanCursor = mock(LogCursor.class);
-        CompletableFuture<LogCursor> cursorOpen = new CompletableFuture<>();
+        LogCursor cursor = mock(LogCursor.class);
         when(logInstance.getFirstOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(10L, 1)));
+                CompletableFuture.completedFuture(logOffset(0L, 1)));
         when(logInstance.getLastOffset()).thenReturn(
-                CompletableFuture.completedFuture(logOffset(10L, 1)));
-        when(logInstance.openEphemeralCursor(anyString(), eq(10L))).thenReturn(cursorOpen);
-        when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(11L)))
+                CompletableFuture.completedFuture(logOffset(0L, 1)));
+        when(logInstance.openEphemeralCursor(anyString(), eq(0L)))
+                .thenReturn(CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(1L)))
                 .thenReturn(CompletableFuture.completedFuture(List.of()));
         UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
 
-        CompletableFuture<ListOffsetsPartitionResponse> responseFuture = partitionLog.listOffsets(
-                new ListOffsetsPartitionRequest(tp, 1000L, Optional.empty()));
-        CompletableFuture<Void> closeFuture = partitionLog.close(false);
+        partitionLog.fetch(fetchPartitionData(0L)).get(5, TimeUnit.SECONDS);
+        verify(cursor, never()).close();
 
-        assertFalse(closeFuture.isDone());
-        verify(logInstance, never()).close();
+        partitionLog.close(false).get(5, TimeUnit.SECONDS);
 
-        cursorOpen.complete(scanCursor);
-        responseFuture.get(5, TimeUnit.SECONDS);
-        closeFuture.get(5, TimeUnit.SECONDS);
-
-        verify(scanCursor).close();
+        verify(cursor).close();
         verify(logInstance).close();
     }
 
     @Test
-    void testTimestampScanClosesCursorWhenReadThrowsSynchronously() throws Exception {
+    void testTimestampSearchIndexFailureMapsToStorageError() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
-        LogCursor scanCursor = mock(LogCursor.class);
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 5)));
         when(logInstance.getLastOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 5)));
-        when(logInstance.openEphemeralCursor(anyString(), eq(10L)))
-                .thenReturn(CompletableFuture.completedFuture(scanCursor));
-        when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(15L)))
-                .thenThrow(new RuntimeException("synchronous timestamp read failure"));
-        doThrow(new IOException("transient cursor close failure"))
-                .doNothing()
-                .when(scanCursor)
-                .close();
+        when(logInstance.binarySearchOffset(eq(10L), eq(10L), any()))
+                .thenThrow(new RuntimeException("synchronous index lookup failure"));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -601,30 +458,21 @@ class UrsaLakestreamReaderTest {
         ListOffsetsPartitionResponse response = reader.listOffsets(Map.of(tp, request)).get().get(tp);
 
         assertEquals(Errors.KAFKA_STORAGE_ERROR, response.error());
-        verify(scanCursor, times(2)).close();
+        verify(logInstance, never()).readEntry(anyLong());
     }
 
     @Test
-    void testListOffsetsMaxTimestampScansKafkaRecordsAndKeepsEarliestMaximum() throws Exception {
+    void testListOffsetsMaxTimestampScansEntryHeadersOnly() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
-        LogCursor scanCursor = mock(LogCursor.class);
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 2)));
         when(logInstance.getLastOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(12L, 3)));
-        when(logInstance.openEphemeralCursor(anyString(), eq(10L)))
-                .thenReturn(CompletableFuture.completedFuture(scanCursor));
-        LogEntry firstEntry = createKafkaRecordsEntry(10L, new long[]{1000L, 3000L});
-        LogEntry secondEntry = createKafkaRecordsEntry(12L, new long[]{3500L, 3500L, 2000L});
-        CompletableFuture<List<LogEntry>> entriesFuture =
-                CompletableFuture.completedFuture(List.of(firstEntry, secondEntry));
-        CompletableFuture<List<LogEntry>> endOfLogFuture =
-                CompletableFuture.completedFuture(List.of());
-        when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(15L)))
-                .thenReturn(entriesFuture)
-                .thenReturn(endOfLogFuture);
+        when(logInstance.getEntryMetadataRange(10L, 15L)).thenReturn(
+                CompletableFuture.completedFuture(List.of(
+                        entryHeader(10L, 2, 3000L), entryHeader(12L, 3, 2000L))));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -635,27 +483,23 @@ class UrsaLakestreamReaderTest {
 
         assertNotNull(response);
         assertEquals(Errors.NONE, response.error());
-        assertEquals(12L, response.offset());
-        assertEquals(3500L, response.timestamp());
-        verify(firstEntry).close();
-        verify(secondEntry).close();
-        verify(scanCursor).close();
+        assertEquals(10L, response.offset());
+        assertEquals(3000L, response.timestamp());
+        verify(logInstance, never()).readEntry(anyLong());
+        verify(logInstance, never()).openEphemeralCursor(anyString(), anyLong());
     }
 
     @Test
-    void testMaxTimestampScanClosesCursorWhenReadThrowsSynchronously() throws Exception {
+    void testMaxTimestampScanFailureMapsToStorageError() throws Exception {
         TopicIdPartition tp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
         Log logInstance = mock(Log.class);
-        LogCursor scanCursor = mock(LogCursor.class);
         when(logInstance.getFirstOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 5)));
         when(logInstance.getLastOffset()).thenReturn(
                 CompletableFuture.completedFuture(logOffset(10L, 5)));
-        when(logInstance.openEphemeralCursor(anyString(), eq(10L)))
-                .thenReturn(CompletableFuture.completedFuture(scanCursor));
-        when(scanCursor.readEntries(anyInt(), eq(Long.MAX_VALUE), isNull(), eq(15L)))
-                .thenThrow(new RuntimeException("synchronous max-timestamp read failure"));
+        when(logInstance.getEntryMetadataRange(anyLong(), anyLong()))
+                .thenThrow(new RuntimeException("synchronous metadata range failure"));
         attachReaderPartitionLog(state, tp, logInstance);
 
         UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
@@ -665,7 +509,6 @@ class UrsaLakestreamReaderTest {
         ListOffsetsPartitionResponse response = reader.listOffsets(Map.of(tp, request)).get().get(tp);
 
         assertEquals(Errors.KAFKA_STORAGE_ERROR, response.error());
-        verify(scanCursor).close();
     }
 
     private static FetchParams createFetchParams() {
@@ -691,6 +534,10 @@ class UrsaLakestreamReaderTest {
 
     private static LogOffset logOffset(long offset, int numberOfRecords) {
         return new LogOffset(offset, numberOfRecords, -1L);
+    }
+
+    private static LogEntryHeader entryHeader(long offset, int numberOfRecords, long timestamp) {
+        return new EntryHeader(offset, numberOfRecords, timestamp, 1, offset + numberOfRecords);
     }
 
     private static LogEntry createKafkaRecordsEntry(long baseOffset, long[]... timestampBatches) {
@@ -745,14 +592,6 @@ class UrsaLakestreamReaderTest {
                 null);
         when(state.getOrCreatePartitionLog(tp)).thenReturn(partitionLog);
         return partitionLog;
-    }
-
-    private static final class ReadCompletion {
-        private final Runnable complete;
-
-        private ReadCompletion(Runnable complete) {
-            this.complete = complete;
-        }
     }
 
     private static final class ObjectNotFoundException extends RuntimeException {
