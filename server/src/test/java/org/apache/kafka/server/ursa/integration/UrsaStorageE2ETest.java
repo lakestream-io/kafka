@@ -41,10 +41,15 @@ import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.ClassOrderer;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestClassOrder;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -93,6 +98,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Timeout(value = 180, unit = TimeUnit.SECONDS)
 @Tag("integration")
+// Every nested class shares one cluster, so the order they run in is part of the contract: the
+// storage-lifecycle group churns a thousand partitions and leaves the brokers releasing write
+// leases long after its own assertions pass, which stalls the next group's stream creation.
+@TestClassOrder(ClassOrderer.OrderAnnotation.class)
 public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
     @TempDir
     static Path baseDir;
@@ -161,6 +170,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
      * Basic produce/consume tests.
      */
     @Nested
+    @Order(1)
     @DisplayName("Basic Produce/Consume Tests")
     class BasicProduceConsumeTests {
 
@@ -299,6 +309,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
      * Offset seek and consume tests.
      */
     @Nested
+    @Order(2)
     @DisplayName("Offset Seek Tests")
     class OffsetSeekTests {
 
@@ -329,6 +340,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
      * Broker restart and data persistence tests.
      */
     @Nested
+    @Order(3)
     @DisplayName("Persistence Tests")
     class PersistenceTests {
 
@@ -429,6 +441,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
      * ListOffsets API tests.
      */
     @Nested
+    @Order(4)
     @DisplayName("ListOffsets API Tests")
     class ListOffsetsTests {
 
@@ -557,6 +570,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
      * Retention tests.
      */
     @Nested
+    @Order(5)
     @DisplayName("Retention Behavior Tests")
     class RetentionBehaviorTests {
 
@@ -620,6 +634,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
      * Topic configuration mutation tests.
      */
     @Nested
+    @Order(6)
     @DisplayName("Topic Config Mutation Tests")
     class TopicConfigMutationTests {
 
@@ -777,13 +792,16 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
      * Tests Lakestream lifecycle semantics and cleanup of Kafka-owned producer state.
      */
     @Nested
+    @Order(7)
     @DisplayName("Storage Lifecycle Tests")
+    @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
     class StorageLifecycleTests {
         private static final String TEST_PRODUCER_ZONE = "test-zone";
         private static final String TEST_PRODUCER_ZONE_WITH_PATH_SEPARATOR = "rack/0";
         private final Map<String, Uuid> topicIds = new ConcurrentHashMap<>();
 
         @Test
+        @Order(1)
         @DisplayName("Committed partition layout is visible through the Lakestream catalog after I/O")
         void testCommittedPartitionLayoutVisibleThroughLakestreamCatalog() throws Exception {
             String topicName = uniqueTopicName("log-metadata-topic");
@@ -801,6 +819,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         }
 
         @Test
+        @Order(2)
         @DisplayName("Partitioned stream lifecycle and producer state cleanup use owned APIs")
         void testPartitionedStreamLifecycleAndProducerStateCleanup() throws Exception {
             String topicName = uniqueTopicName("partitioned-topics-metadata-topic");
@@ -839,7 +858,9 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         }
 
         @Test
-        @Timeout(value = 600, unit = TimeUnit.SECONDS)
+        // Runs last: it is the churn every other test here has to survive.
+        @Order(3)
+        @Timeout(value = 900, unit = TimeUnit.SECONDS)
         @DisplayName("Bulk diskless topic deletion permanently deletes every Lakestream stream")
         void testBulkTopicDeletionUnregistersStreams() throws Exception {
             int topicCount = 100;
@@ -1018,6 +1039,15 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
             return topicNames;
         }
 
+        /**
+         * Waits for the whole bulk delete, which is paced by how fast write leases are released.
+         * Dropping 100 topics of 10 partitions asks Ursa to close a thousand leased logs at once,
+         * far past the width of its close executor, so the rejected closes retry on a backoff that
+         * grows to ten seconds and the stream deletes behind them wait a lease-drain timeout each.
+         * The full sweep measured a little over three minutes here, so the wait is generous: a
+         * shorter one leaves the deletes running underneath whichever test comes next, which is
+         * what poisoned this suite when the wait was two minutes.
+         */
         private void assertBulkStreamsUnregistered(
                 IsolatedUrsaCatalogInspector catalog,
                 List<String> streamNames,
@@ -1029,7 +1059,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                 } catch (Exception e) {
                     return false;
                 }
-            }, 120_000, 500,
+            }, 300_000, 500,
                     () -> "Timed out waiting for bulk stream deletion for " + topicCount + " topics");
         }
 
