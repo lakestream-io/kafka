@@ -153,7 +153,9 @@ final class LakestreamStorageHolder implements Closeable {
             int attemptsLeft) {
         return openLog(id, tp.partition()).handle((openedLog, error) -> {
             if (error == null) {
-                return CompletableFuture.completedFuture(openedLog);
+                return openedLog == null
+                        ? CompletableFuture.<Log>failedFuture(openedNull(id))
+                        : CompletableFuture.completedFuture(openedLog);
             }
             Throwable cause = DisklessFutures.unwrap(error);
             // A tombstoned identifier can never be created again, so it is never provisioned.
@@ -173,13 +175,23 @@ final class LakestreamStorageHolder implements Closeable {
         }).thenCompose(future -> future);
     }
 
-    /** Never throws on the calling thread: an open that fails synchronously fails the future. */
+    /**
+     * Never throws on the calling thread, which opens a partition while holding the broker's
+     * partition lifecycle lock: an open that fails synchronously, or that breaks the catalog
+     * contract by answering with null, fails the returned future instead.
+     */
     private CompletableFuture<Log> openLog(StreamIdentifier id, int partitionIndex) {
+        CompletableFuture<Log> open;
         try {
-            return catalog.openLog(id, partitionIndex);
+            open = catalog.openLog(id, partitionIndex);
         } catch (Throwable error) {
             return CompletableFuture.failedFuture(error);
         }
+        return open == null ? CompletableFuture.failedFuture(openedNull(id)) : open;
+    }
+
+    private static IllegalStateException openedNull(StreamIdentifier id) {
+        return new IllegalStateException("StreamCatalog.openLog returned null for " + id.fullName());
     }
 
     private CompletableFuture<?> createStream(

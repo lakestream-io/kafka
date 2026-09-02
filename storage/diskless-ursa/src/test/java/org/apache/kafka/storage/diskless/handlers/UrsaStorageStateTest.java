@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.metrics.KafkaMetricsGroup;
@@ -285,6 +286,21 @@ class UrsaStorageStateTest {
         assertThrows(IllegalStateException.class, () -> state.getOrCreatePartitionLog(tp));
         assertTrue(state.snapshotTrackedPartitions().isEmpty());
         verify(catalog, never()).openLog(any(), anyInt());
+    }
+
+    @Test
+    void testGetOrCreatePartitionLogIsRejectedForALocallyFencedDeletedTopic() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(
+                Uuid.randomUuid(), new TopicPartition("fenced-deleted-topic", 0));
+        StreamCatalog catalog = mock(StreamCatalog.class);
+
+        try (UrsaStorageState state = newState(catalog)) {
+            state.fenceDeletedTopic(tp.topic(), tp.topicId());
+
+            assertThrows(NotLeaderOrFollowerException.class, () -> state.getOrCreatePartitionLog(tp));
+            verify(catalog, never()).openLog(any(), anyInt());
+            assertTrue(state.snapshotTrackedPartitions().isEmpty());
+        }
     }
 
     @Test
