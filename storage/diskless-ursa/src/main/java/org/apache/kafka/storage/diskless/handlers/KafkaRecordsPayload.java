@@ -104,17 +104,27 @@ public final class KafkaRecordsPayload {
      * copying each entry's payload exactly once and rebasing its batches to that entry's offset.
      */
     public static MemoryRecords assemble(List<LogEntry> entries) {
+        if (entries == null || entries.isEmpty()) {
+            return MemoryRecords.EMPTY;
+        }
+        // Each entry's payload is resolved once: LogEntry.payload() is not required to be cheap or
+        // to hand back the same buffer on every call.
+        ByteBuf[] payloads = new ByteBuf[entries.size()];
         int total = 0;
+        int index = 0;
         for (LogEntry entry : entries) {
-            total = Math.addExact(total, entry.payload().readableBytes());
+            ByteBuf payload = entry.payload();
+            payloads[index++] = payload;
+            total = Math.addExact(total, payload.readableBytes());
         }
         if (total == 0) {
             return MemoryRecords.EMPTY;
         }
 
         ByteBuffer combined = ByteBuffer.allocate(total);
+        index = 0;
         for (LogEntry entry : entries) {
-            ByteBuf payload = entry.payload();
+            ByteBuf payload = payloads[index++];
             int start = combined.position();
             int size = payload.readableBytes();
 

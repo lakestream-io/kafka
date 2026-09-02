@@ -87,6 +87,39 @@ class KafkaRecordsPayloadTest {
     }
 
     @Test
+    void readableRecordsRebasesEveryBatchWithoutTakingOwnership() {
+        MemoryRecords firstBatch = records(Compression.gzip().build(), "one", "two");
+        MemoryRecords secondBatch = records("three");
+        byte[] rawRecords = concatenate(firstBatch, secondBatch);
+        // A non-zero reader index: the payload the storage layer hands back is a view into a
+        // larger buffer, so nothing here may assume it starts at index 0.
+        ByteBuf payload = Unpooled.buffer(rawRecords.length + 3);
+        payload.writeZero(3).writeBytes(rawRecords).readerIndex(3);
+
+        try {
+            int readerIndex = payload.readerIndex();
+            int refCount = payload.refCnt();
+            MemoryRecords rebased = KafkaRecordsPayload.readableRecords(payload, 41L, 3);
+
+            List<Long> batchBaseOffsets = new ArrayList<>();
+            List<Long> recordOffsets = new ArrayList<>();
+            for (RecordBatch batch : rebased.batches()) {
+                batchBaseOffsets.add(batch.baseOffset());
+                for (Record record : batch) {
+                    recordOffsets.add(record.offset());
+                }
+            }
+            assertEquals(List.of(41L, 43L), batchBaseOffsets);
+            assertEquals(List.of(41L, 42L, 43L), recordOffsets);
+            assertEquals(readerIndex, payload.readerIndex());
+            assertEquals(refCount, payload.refCnt());
+            assertArrayEquals(rawRecords, ByteBufUtil.getBytes(payload, readerIndex, rawRecords.length));
+        } finally {
+            payload.release();
+        }
+    }
+
+    @Test
     void readableRecordsAcceptsReadOnlyPayloads() {
         MemoryRecords first = MemoryRecords.withRecords(
                 Compression.NONE, new SimpleRecord("a".getBytes()), new SimpleRecord("b".getBytes()));
@@ -283,6 +316,18 @@ class KafkaRecordsPayloadTest {
         }
         builder.overrideLastOffset(lastOffset);
         return builder.build();
+    }
+
+    private static byte[] concatenate(MemoryRecords... recordSets) {
+        int size = 0;
+        for (MemoryRecords records : recordSets) {
+            size = Math.addExact(size, records.buffer().remaining());
+        }
+        ByteBuffer combined = ByteBuffer.allocate(size);
+        for (MemoryRecords records : recordSets) {
+            combined.put(records.buffer().duplicate());
+        }
+        return combined.array();
     }
 
     private static byte[] toByteArray(ByteBuffer buffer) {

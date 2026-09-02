@@ -29,11 +29,13 @@ import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
+import org.apache.kafka.storage.diskless.idempotent.ProducerStateManager;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
@@ -54,8 +56,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class PartitionWriterTest {
@@ -211,6 +215,29 @@ class PartitionWriterTest {
         assertEquals(0, writer.ownedWritePayloadCount());
     }
 
+    @Test
+    void anAppendThatNeverReachesStorageAbortsTheProducerState() throws Exception {
+        ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
+        when(producerStateManager.prepareAppend(anyList()))
+                .thenReturn(completedFuture(new ProducerStateManager.Ready(null)));
+        IOException openFailure = new IOException("log unavailable");
+        PartitionWriter writer = new PartitionWriter(
+                TP,
+                () -> CompletableFuture.failedFuture(openFailure),
+                zone -> producerStateManager,
+                () -> TimestampType.CREATE_TIME,
+                new MockTime(0L, 1000L, 0L),
+                timer);
+
+        CompletableFuture<PartitionResponse> write = writer.write(idempotentRecords(), NO_ZONE);
+
+        assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS));
+        // The prepared append is registered in producer state before storage is touched, so a
+        // failure on the way to storage must unwind it rather than leaving it pending.
+        verify(producerStateManager).abortAppend(null, openFailure);
+        assertEquals(0, writer.ownedWritePayloadCount());
+    }
+
     private PartitionWriter writer(Log log, TimestampType timestampType) {
         return writer(log, timestampType, new MockTime(0L, 1000L, 0L));
     }
@@ -229,6 +256,15 @@ class PartitionWriterTest {
 
     private static MemoryRecords records(SimpleRecord... records) {
         return MemoryRecords.withRecords(Compression.NONE, records);
+    }
+
+    private static MemoryRecords idempotentRecords() {
+        return MemoryRecords.withIdempotentRecords(
+                Compression.NONE,
+                12345L,
+                (short) 0,
+                0,
+                new SimpleRecord("a".getBytes(StandardCharsets.UTF_8)));
     }
 
     private static MemoryRecords copyOf(ByteBuf payload) {

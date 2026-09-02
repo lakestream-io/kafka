@@ -316,9 +316,8 @@ final class PartitionWriter {
     }
 
     /**
-     * Opens the log, hands the payload to storage exactly once, and reports the entry back through
-     * {@code listener}. Every exit releases the payload and completes {@code submissionFuture}, which
-     * is what lets the next queued write start.
+     * Opens the log and starts one append on it. Every exit releases the payload and completes
+     * {@code submissionFuture}, which is what lets the next queued write start.
      */
     private CompletableFuture<PartitionResponse> append(
             PreparedWrite preparedWrite,
@@ -328,73 +327,93 @@ final class PartitionWriter {
         CompletableFuture<PartitionResponse> result = new CompletableFuture<>();
 
         logSupplier.get().whenComplete((logInstance, logError) -> {
-            Throwable startError = logError;
-            if (startError == null && closed) {
-                startError = ownershipLostException();
+            Throwable startError;
+            try {
+                startError = startAppend(preparedWrite, submissionFuture, result, listener, logInstance, logError);
+            } catch (Throwable unexpected) {
+                startError = unexpected;
             }
             if (startError != null) {
+                // The payload never reached storage. Unwinding lives here, in one place, so that
+                // no exit from startAppend can leave a registered listener, an unreleased payload
+                // or a blocked sequencer behind. Releasing a payload that close() already
+                // reclaimed is a no-op.
                 listener.abort(startError);
                 payload.release();
                 submissionFuture.complete(null);
                 result.completeExceptionally(startError);
-                return;
             }
-
-            if (!payload.beginAppend()) {
-                // close() reclaimed this payload while the log was still opening.
-                NotLeaderOrFollowerException ownershipError = ownershipLostException();
-                listener.abort(ownershipError);
-                submissionFuture.complete(null);
-                result.completeExceptionally(ownershipError);
-                return;
-            }
-            ByteBuf data = payload.buffer();
-
-            CompletableFuture<LogEntryHeader> appendFuture;
-            try {
-                log.debug("Appending {} records ({} bytes) to log {} for partition {}, analysisResult: {}",
-                        preparedWrite.analysisResult().recordCount(), data.readableBytes(), logInstance.id(),
-                        topicIdPartition, preparedWrite.analysisResult());
-                appendFuture = logInstance.append(preparedWrite.analysisResult().recordCount(), data);
-                if (appendFuture == null) {
-                    throw new IllegalStateException("Log.append returned null future");
-                }
-            } catch (Throwable appendInitError) {
-                payload.release();
-                listener.abort(appendInitError);
-                submissionFuture.complete(null);
-                result.completeExceptionally(appendInitError);
-                return;
-            }
-
-            submissionFuture.complete(null);
-            appendFuture.whenComplete((entryHeader, appendError) -> {
-                try {
-                    if (appendError != null) {
-                        listener.abort(appendError);
-                        result.completeExceptionally(appendError);
-                        return;
-                    }
-                    if (entryHeader == null) {
-                        IllegalStateException missingHeader =
-                                new IllegalStateException("Log.append returned a null entry header");
-                        listener.abort(missingHeader);
-                        result.completeExceptionally(missingHeader);
-                        return;
-                    }
-                    // The records are durable now, so a long-polling fetch can see them.
-                    notifyAppended();
-                    result.complete(listener.completed(entryHeader, preparedWrite.appendTimestamp()));
-                } catch (Throwable completeError) {
-                    listener.abort(completeError);
-                    result.completeExceptionally(completeError);
-                } finally {
-                    payload.release();
-                }
-            });
         });
 
         return result;
+    }
+
+    /**
+     * Hands the payload to storage exactly once and reports the entry back through
+     * {@code listener}. Completing {@code submissionFuture} is what lets the next queued write
+     * start, so it happens as soon as the append is under way.
+     *
+     * @return {@code null} once storage owns the payload, otherwise the failure that stopped it
+     */
+    private Throwable startAppend(
+            PreparedWrite preparedWrite,
+            CompletableFuture<Void> submissionFuture,
+            CompletableFuture<PartitionResponse> result,
+            AppendListener listener,
+            Log logInstance,
+            Throwable logError) {
+        if (logError != null) {
+            return logError;
+        }
+        if (closed) {
+            return ownershipLostException();
+        }
+        OwnedWritePayload payload = preparedWrite.payload();
+        if (!payload.beginAppend()) {
+            // close() reclaimed this payload while the log was still opening.
+            return ownershipLostException();
+        }
+        ByteBuf data = payload.buffer();
+
+        CompletableFuture<LogEntryHeader> appendFuture;
+        try {
+            log.debug("Appending {} records ({} bytes) to log {} for partition {}, analysisResult: {}",
+                    preparedWrite.analysisResult().recordCount(), data.readableBytes(), logInstance.id(),
+                    topicIdPartition, preparedWrite.analysisResult());
+            appendFuture = logInstance.append(preparedWrite.analysisResult().recordCount(), data);
+            if (appendFuture == null) {
+                throw new IllegalStateException("Log.append returned null future");
+            }
+        } catch (Throwable appendInitError) {
+            return appendInitError;
+        }
+
+        submissionFuture.complete(null);
+        appendFuture.whenComplete((entryHeader, appendError) -> {
+            try {
+                if (appendError != null) {
+                    listener.abort(appendError);
+                    result.completeExceptionally(appendError);
+                    return;
+                }
+                if (entryHeader == null) {
+                    IllegalStateException missingHeader =
+                            new IllegalStateException("Log.append returned a null entry header");
+                    listener.abort(missingHeader);
+                    result.completeExceptionally(missingHeader);
+                    return;
+                }
+                // The records are durable now, so a long-polling fetch can see them.
+                notifyAppended();
+                result.complete(listener.completed(entryHeader, preparedWrite.appendTimestamp()));
+            } catch (Throwable completeError) {
+                listener.abort(completeError);
+                result.completeExceptionally(completeError);
+            } finally {
+                payload.release();
+            }
+        });
+        return null;
     }
 
     private AppendListener nonIdempotentListener() {
