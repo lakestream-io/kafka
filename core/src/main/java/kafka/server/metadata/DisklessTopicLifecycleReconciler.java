@@ -293,8 +293,9 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
 
     /**
      * Stops tracking a topic that is no longer diskless, so that turning the config back on
-     * reconciles it from scratch. Its storage is retired by the periodic sweep rather than by
-     * {@code deleteTopic}, which may only be used once the topic has left Kafka metadata for good.
+     * reconciles it from scratch. Its storage is left alone: {@code deleteTopic} may only be used
+     * once the topic has left Kafka metadata for good, and the sweep protects every topic the image
+     * still holds. Both retire it once the topic itself is deleted.
      */
     private void forget(Uuid id) {
         synchronized (this) {
