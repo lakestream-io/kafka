@@ -215,6 +215,44 @@ class DisklessTopicLifecycleReconcilerTest {
         TestUtils.waitForCondition(stuck::isCancelled, "the timed-out attempt should have been cancelled");
     }
 
+    @Test
+    void aNewDesiredStateDuringBackoffDoesNotWaitForIt() throws Exception {
+        when(lifecycle.ensureTopic(any(), any(), anyInt(), anyMap(), anyLong()))
+            .thenReturn(failedFuture(new IOException("oxia down")))
+            .thenReturn(completedFuture(null));
+        // A backoff far longer than this test's own waits, so only cancelling it can explain the
+        // second attempt arriving.
+        reconciler = newReconciler(SWEEP_INTERVAL_MS, MAX_CONCURRENT_OPERATIONS, OPERATION_TIMEOUT_MS,
+            120_000L, 120_000L);
+        activateWithEmptyImage();
+
+        MetadataImage created = image(5L, disklessTopic("a", A, 1));
+        reconciler.onMetadataUpdate(delta(created), created, manifest());
+        verify(lifecycle, timeout(5000)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), eq(5L));
+        // The fault is reported after the retry is scheduled, so the backoff is pending from here.
+        verify(faultHandler, timeout(5000)).accept(contains("ensure diskless topic a"), any(IOException.class));
+
+        MetadataImage grown = image(6L, disklessTopic("a", A, 3));
+        reconciler.onMetadataUpdate(delta(grown), grown, manifest());
+
+        verify(lifecycle, timeout(5000)).ensureTopic(eq("a"), eq(A), eq(3), anyMap(), eq(6L));
+    }
+
+    @Test
+    void timedOutSweepIsRetriedAndOriginalFutureIsCancelled() throws Exception {
+        CompletableFuture<Void> stuck = new CompletableFuture<>();
+        when(lifecycle.sweepOrphans(anySet(), anyLong()))
+            .thenReturn(stuck)
+            .thenReturn(completedFuture(null));
+        reconciler = newReconciler(50L, MAX_CONCURRENT_OPERATIONS, 50L);
+        activateWithEmptyImage();
+
+        verify(faultHandler, timeout(5000))
+            .accept(contains("sweep orphaned diskless topic storage"), any(TimeoutException.class));
+        TestUtils.waitForCondition(stuck::isCancelled, "the timed-out sweep should have been cancelled");
+        verify(lifecycle, timeout(5000).atLeast(2)).sweepOrphans(anySet(), anyLong());
+    }
+
     private void activateWithEmptyImage() {
         MetadataImage empty = image(0L);
         reconciler.onMetadataUpdate(delta(empty), empty, manifest());
@@ -227,6 +265,13 @@ class DisklessTopicLifecycleReconcilerTest {
 
     private DisklessTopicLifecycleReconciler newReconciler(long sweepIntervalMs, int maxConcurrentOperations,
                                                            long operationTimeoutMs) {
+        return newReconciler(sweepIntervalMs, maxConcurrentOperations, operationTimeoutMs,
+            INITIAL_RETRY_MS, MAX_RETRY_MS);
+    }
+
+    private DisklessTopicLifecycleReconciler newReconciler(long sweepIntervalMs, int maxConcurrentOperations,
+                                                           long operationTimeoutMs, long initialRetryMs,
+                                                           long maxRetryMs) {
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "diskless-lifecycle-reconciler-test");
             thread.setDaemon(true);
@@ -235,7 +280,7 @@ class DisklessTopicLifecycleReconcilerTest {
         executors.add(executor);
         DisklessTopicLifecycleReconciler created = new DisklessTopicLifecycleReconciler(
             NODE_ID, lifecycle, faultHandler, sweepIntervalMs,
-            INITIAL_RETRY_MS, MAX_RETRY_MS, operationTimeoutMs, maxConcurrentOperations, executor);
+            initialRetryMs, maxRetryMs, operationTimeoutMs, maxConcurrentOperations, executor);
         reconcilers.add(created);
         return created;
     }

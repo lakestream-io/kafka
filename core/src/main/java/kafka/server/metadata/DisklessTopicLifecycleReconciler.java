@@ -41,7 +41,6 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -256,27 +255,21 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
      */
     private void reconcileFullImage(MetadataImage image) {
         long sourceRevision = image.highestOffsetAndEpoch().offset();
-        Set<Uuid> live = new HashSet<>();
         for (TopicImage topic : image.topics().topicsById().values()) {
             Map<String, String> configs = topicConfigs(image, topic.name());
             if (DisklessTopics.isDiskless(topic.name(), configs)) {
-                live.add(topic.id());
                 remember(new Desired(topic.name(), topic.id(), true, topic.partitions().size(),
                     configs, sourceRevision));
             }
         }
-        List<Desired> vanished;
         synchronized (this) {
             fullReconcilePending = false;
-            vanished = desired.values().stream()
-                .filter(d -> d.present() && !live.contains(d.id()))
-                .toList();
         }
-        for (Desired gone : vanished) {
-            remember(new Desired(gone.name(), gone.id(), false, 0, Map.of(), sourceRevision));
-        }
-        // Sweep against the image we just reconciled rather than whatever arrives next, so the
-        // offset handed to the storage layer can never be newer than the state it was derived from.
+        // Nothing needs retiring here: onControllerChange cleared the desired state before asking
+        // for this reconcile, so everything still desired was just remembered from this image.
+        // Storage for topics that vanished while this node was not the active controller is retired
+        // by the sweep below -- against the image just reconciled rather than whatever arrives next,
+        // so the offset handed to the storage layer is never newer than the state it came from.
         startSweep(image);
     }
 
@@ -332,10 +325,20 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
             this.id = id;
         }
 
-        /** Queues this runner for a permit unless it already holds one. Called with the monitor held. */
+        /**
+         * Queues this runner for a permit unless it already holds one. Called with the monitor held.
+         *
+         * <p>Every caller has just changed this topic's desired state, so a backoff still waiting to
+         * retry the previous one no longer applies and is cancelled: the new state runs now. Repeated
+         * failures of the same desired state go through {@link #retry} instead and keep backing off.
+         */
         void wake() {
-            if (running || queued || retry != null) {
+            if (running || queued) {
                 return;
+            }
+            if (retry != null) {
+                retry.cancel(false);
+                retry = null;
             }
             queued = true;
             waitingForPermit.add(this);
@@ -420,6 +423,11 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
     /** Re-queues a runner whose backoff elapsed. Always runs on {@link #executor}. */
     private void retry(Runner runner) {
         synchronized (this) {
+            if (runner.queued || runner.running) {
+                // wake() cancelled this backoff for a newer desired state and re-queued the runner
+                // while this task was already past the point of cancellation.
+                return;
+            }
             runner.retry = null;
             if (!active || closed || runner.generationSeen != generation || runners.get(runner.id) != runner) {
                 return;
