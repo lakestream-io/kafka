@@ -53,6 +53,7 @@ import static java.util.concurrent.CompletableFuture.completedFuture;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -236,6 +237,41 @@ class PartitionWriterTest {
         // failure on the way to storage must unwind it rather than leaving it pending.
         verify(producerStateManager).abortAppend(null, openFailure);
         assertEquals(0, writer.ownedWritePayloadCount());
+    }
+
+    @Test
+    void anAppendThatFailsOnHandoffAbortsTheProducerStateAndFreesTheSequencer() throws Exception {
+        ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
+        when(producerStateManager.prepareAppend(anyList()))
+                .thenReturn(completedFuture(new ProducerStateManager.Ready(null)));
+        Log log = mock(Log.class);
+        IllegalStateException handoffFailure = new IllegalStateException("append rejected");
+        when(log.append(eq(1), any()))
+                .thenThrow(handoffFailure)
+                .thenReturn(completedFuture(header(0L, 1, 1000L)));
+        PartitionWriter writer = new PartitionWriter(
+                TP,
+                () -> completedFuture(log),
+                zone -> producerStateManager,
+                () -> TimestampType.CREATE_TIME,
+                new MockTime(0L, 1000L, 0L),
+                timer);
+
+        CompletableFuture<PartitionResponse> failed = writer.write(idempotentRecords(), NO_ZONE);
+
+        ExecutionException thrown = assertThrows(ExecutionException.class, () -> failed.get(5, TimeUnit.SECONDS));
+        assertSame(handoffFailure, thrown.getCause());
+        // The log opened, so the prepared append is already registered when the handoff throws.
+        // Leaving it pending would reject every later sequence number for this producer.
+        verify(producerStateManager).abortAppend(null, handoffFailure);
+        assertEquals(0, writer.ownedWritePayloadCount());
+
+        // The submission future has to complete on this path too, otherwise the sequencer never
+        // starts the next queued write and the partition stalls behind one failed append.
+        PartitionResponse next = writer
+                .write(records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))), NO_ZONE)
+                .get(5, TimeUnit.SECONDS);
+        assertEquals(Errors.NONE, next.error);
     }
 
     private PartitionWriter writer(Log log, TimestampType timestampType) {
