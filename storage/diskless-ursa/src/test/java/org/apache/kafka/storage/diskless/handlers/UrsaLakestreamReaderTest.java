@@ -720,7 +720,7 @@ class UrsaLakestreamReaderTest {
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(numberOfRecords);
         when(entry.size()).thenReturn(payload.readableBytes());
-        when(entry.payload()).thenReturn(payload.asReadOnly());
+        when(entry.payload()).thenReturn(payload);
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
                 payload.release();

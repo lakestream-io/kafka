@@ -953,27 +953,6 @@ class ProducerStateManagerTest {
     }
 
     @Test
-    void testCorruptReplayEntryFailsRecoveryAndClosesEntireEntryBatch() throws Exception {
-        TopicIdPartition tp = testTopicPartition();
-        LogEntry corruptEntry = newCorruptReplayEntry(0L);
-        LogEntry unvisitedEntry = newReplayEntry(1L, (short) 0, 0, "unvisited", 1L, 1);
-        Log replayLog = replayLog(List.of(corruptEntry, unvisitedEntry), 1L, 1);
-
-        ProducerStateManager manager = newManager(
-                tp, () -> null, () -> CompletableFuture.completedFuture(replayLog));
-        try {
-            assertThrows(ExecutionException.class, () -> manager.prepareAppend(List.of(
-                    batch(1L, (short) 0, 1, 1, 1, 3000L)
-            )).get());
-            verify(corruptEntry).close();
-            verify(unvisitedEntry).close();
-            verify(unvisitedEntry, never()).payload();
-        } finally {
-            manager.close();
-        }
-    }
-
-    @Test
     void testLateReplayReadAfterManagerCloseClosesEntriesAndCursor() throws Exception {
         TopicIdPartition tp = testTopicPartition();
         Log logInstance = mock(Log.class);
@@ -1259,28 +1238,7 @@ class ProducerStateManagerTest {
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(numMessages);
         when(entry.size()).thenReturn(data.readableBytes());
-        when(entry.payload()).thenReturn(data.asReadOnly());
-        doAnswer(invocation -> {
-            if (closed.compareAndSet(false, true)) {
-                data.release();
-            }
-            return null;
-        }).when(entry).close();
-        return entry;
-    }
-
-    private static LogEntry newCorruptReplayEntry(long baseOffset) {
-        ByteBuf data = KafkaRecordsPayload.copyForAppend(MemoryRecords.withRecords(
-                Compression.NONE,
-                new SimpleRecord("corrupt".getBytes(StandardCharsets.UTF_8))));
-        data.setByte(data.writerIndex() - 1, data.getByte(data.writerIndex() - 1) ^ 1);
-
-        LogEntry entry = mock(LogEntry.class);
-        AtomicBoolean closed = new AtomicBoolean();
-        when(entry.offset()).thenReturn(baseOffset);
-        when(entry.numberOfRecords()).thenReturn(1);
-        when(entry.size()).thenReturn(data.readableBytes());
-        when(entry.payload()).thenReturn(data.asReadOnly());
+        when(entry.payload()).thenReturn(data);
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
                 data.release();
@@ -1314,7 +1272,7 @@ class ProducerStateManagerTest {
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(3);
         when(entry.size()).thenReturn(data.readableBytes());
-        when(entry.payload()).thenReturn(data.asReadOnly());
+        when(entry.payload()).thenReturn(data);
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
                 data.release();
@@ -1339,7 +1297,7 @@ class ProducerStateManagerTest {
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(numMessages);
         when(entry.size()).thenReturn(data.readableBytes());
-        when(entry.payload()).thenReturn(data.asReadOnly());
+        when(entry.payload()).thenReturn(data);
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
                 data.release();

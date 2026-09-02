@@ -18,6 +18,7 @@ package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.DefaultRecordBatch;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.MemoryRecordsBuilder;
 import org.apache.kafka.common.record.internal.Record;
@@ -29,8 +30,10 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
+import io.lakestream.api.LogEntry;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
@@ -39,6 +42,8 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class KafkaRecordsPayloadTest {
 
@@ -65,34 +70,20 @@ class KafkaRecordsPayloadTest {
     }
 
     @Test
-    void testCopyAndRebaseValidatesAndRebasesEveryBatchWithoutTakingOwnership() {
-        MemoryRecords firstBatch = records(Compression.gzip().build(), "one", "two");
-        MemoryRecords secondBatch = records("three");
-        byte[] rawRecords = concatenate(firstBatch, secondBatch);
-        ByteBuf payload = Unpooled.buffer(rawRecords.length + 3);
-        payload.writeZero(3).writeBytes(rawRecords).readerIndex(3);
+    void readableRecordsRebasesMultipleBatchesWithoutCopying() {
+        MemoryRecords first = MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord("a".getBytes()), new SimpleRecord("b".getBytes()));
+        MemoryRecords second = MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("c".getBytes()));
+        ByteBuffer joined = ByteBuffer.allocate(first.sizeInBytes() + second.sizeInBytes());
+        joined.put(first.buffer().duplicate()).put(second.buffer().duplicate()).flip();
+        ByteBuf payload = Unpooled.wrappedBuffer(joined);
 
-        try {
-            int readerIndex = payload.readerIndex();
-            int refCount = payload.refCnt();
-            MemoryRecords rebased = KafkaRecordsPayload.copyAndRebase(payload, 41L, 3);
+        MemoryRecords rebased = KafkaRecordsPayload.readableRecords(payload, 100L, 3);
 
-            List<Long> batchBaseOffsets = new ArrayList<>();
-            List<Long> recordOffsets = new ArrayList<>();
-            for (RecordBatch batch : rebased.batches()) {
-                batchBaseOffsets.add(batch.baseOffset());
-                for (Record record : batch) {
-                    recordOffsets.add(record.offset());
-                }
-            }
-            assertEquals(List.of(41L, 43L), batchBaseOffsets);
-            assertEquals(List.of(41L, 42L, 43L), recordOffsets);
-            assertEquals(readerIndex, payload.readerIndex());
-            assertEquals(refCount, payload.refCnt());
-            assertArrayEquals(rawRecords, ByteBufUtil.getBytes(payload, readerIndex, rawRecords.length));
-        } finally {
-            payload.release();
-        }
+        List<Long> offsets = new ArrayList<>();
+        rebased.records().forEach(r -> offsets.add(r.offset()));
+        assertEquals(List.of(100L, 101L, 102L), offsets);
+        assertEquals(0, payload.readerIndex());
     }
 
     @Test
@@ -118,23 +109,10 @@ class KafkaRecordsPayloadTest {
         rawRecords.release();
 
         try {
-            assertThrows(RuntimeException.class, () -> KafkaRecordsPayload.copyAndRebase(prefixed, 0L, 1));
+            assertThrows(RuntimeException.class, () -> KafkaRecordsPayload.readableRecords(prefixed, 0L, 1));
             assertEquals(1, prefixed.refCnt());
         } finally {
             prefixed.release();
-        }
-    }
-
-    @Test
-    void testRejectsCorruptBatchCrc() {
-        byte[] records = toByteArray(records("one").buffer());
-        records[records.length - 1] ^= 1;
-        ByteBuf payload = Unpooled.wrappedBuffer(records);
-        try {
-            assertThrows(RuntimeException.class, () -> KafkaRecordsPayload.copyAndRebase(payload, 0L, 1));
-            assertEquals(1, payload.refCnt());
-        } finally {
-            payload.release();
         }
     }
 
@@ -146,12 +124,9 @@ class KafkaRecordsPayloadTest {
     }
 
     @Test
-    void testRejectsNonCanonicalV2Offsets() {
+    void testRejectsNonCanonicalV2OffsetRange() {
         ByteBuf invalidRange = KafkaRecordsPayload.copyForAppend(recordsWithOffsets(0L, 7L, 0L, 1L));
         assertInvalid(invalidRange, 2, "offset range does not match");
-
-        ByteBuf nonSequential = KafkaRecordsPayload.copyForAppend(recordsWithOffsets(0L, 1L, 0L, 2L));
-        assertInvalid(nonSequential, 2, "non-sequential offset");
     }
 
     @Test
@@ -169,16 +144,65 @@ class KafkaRecordsPayloadTest {
         assertInvalid(transactional, 1, "transactional batch");
     }
 
+    @Test
+    void compressedBatchIsNotDecompressedOnRead() {
+        MemoryRecords compressed = MemoryRecords.withRecords(
+                Compression.gzip().build(), new SimpleRecord("payload".getBytes()));
+        ByteBuffer corruptedRecord = compressed.buffer().duplicate();
+        // flip a byte inside the compressed records section (after the 61-byte v2 header) so a
+        // decompressing reader would fail; the header-only path must still rebase it.
+        corruptedRecord.put(DefaultRecordBatch.RECORD_BATCH_OVERHEAD + 2, (byte) 0x7f);
+        MemoryRecords rebased = KafkaRecordsPayload.readableRecords(Unpooled.wrappedBuffer(corruptedRecord), 5L, 1);
+        assertEquals(5L, rebased.batches().iterator().next().baseOffset());
+    }
+
+    @Test
+    void assembleCopiesEachEntryOnce() {
+        LogEntry e1 = entry(10L, MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("x".getBytes())));
+        LogEntry e2 = entry(11L, MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord("y".getBytes()), new SimpleRecord("z".getBytes())));
+        MemoryRecords assembled = KafkaRecordsPayload.assemble(List.of(e1, e2));
+        List<Long> offsets = new ArrayList<>();
+        assembled.records().forEach(r -> offsets.add(r.offset()));
+        assertEquals(List.of(10L, 11L, 12L), offsets);
+        assertEquals(e1.payload().readableBytes() + e2.payload().readableBytes(), assembled.sizeInBytes());
+    }
+
+    @Test
+    void setLogAppendTimeStampsEveryBatch() {
+        MemoryRecords records = MemoryRecords.withRecords(Compression.NONE, new SimpleRecord(1L, "a".getBytes()));
+        KafkaRecordsPayload.setLogAppendTime(records, 4242L);
+        RecordBatch batch = records.batches().iterator().next();
+        assertEquals(TimestampType.LOG_APPEND_TIME, batch.timestampType());
+        assertEquals(4242L, batch.maxTimestamp());
+        assertTrue(batch.isValid());
+    }
+
     private static void assertInvalid(ByteBuf payload, int expectedRecordCount, String expectedMessage) {
         try {
             IllegalArgumentException error = assertThrows(
                     IllegalArgumentException.class,
-                    () -> KafkaRecordsPayload.copyAndRebase(payload, 0L, expectedRecordCount));
+                    () -> KafkaRecordsPayload.readableRecords(payload, 0L, expectedRecordCount));
             assertTrue(error.getMessage().contains(expectedMessage));
             assertEquals(1, payload.refCnt());
         } finally {
             payload.release();
         }
+    }
+
+    private static LogEntry entry(long offset, MemoryRecords records) {
+        int recordCount = 0;
+        for (Iterator<Record> it = records.records().iterator(); it.hasNext(); it.next()) {
+            recordCount++;
+        }
+        ByteBuf payload = Unpooled.wrappedBuffer(records.buffer().duplicate());
+
+        LogEntry entry = mock(LogEntry.class);
+        when(entry.offset()).thenReturn(offset);
+        when(entry.numberOfRecords()).thenReturn(recordCount);
+        when(entry.payload()).thenReturn(payload);
+        when(entry.size()).thenReturn(payload.readableBytes());
+        return entry;
     }
 
     private static MemoryRecords records(String... values) {
@@ -211,18 +235,6 @@ class KafkaRecordsPayloadTest {
         }
         builder.overrideLastOffset(lastOffset);
         return builder.build();
-    }
-
-    private static byte[] concatenate(MemoryRecords... recordSets) {
-        int size = 0;
-        for (MemoryRecords records : recordSets) {
-            size = Math.addExact(size, records.buffer().remaining());
-        }
-        ByteBuffer combined = ByteBuffer.allocate(size);
-        for (MemoryRecords records : recordSets) {
-            combined.put(records.buffer().duplicate());
-        }
-        return combined.array();
     }
 
     private static byte[] toByteArray(ByteBuffer buffer) {

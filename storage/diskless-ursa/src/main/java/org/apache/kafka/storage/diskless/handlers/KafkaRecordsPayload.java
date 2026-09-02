@@ -16,6 +16,7 @@
  */
 package org.apache.kafka.storage.diskless.handlers;
 
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.MutableRecordBatch;
 import org.apache.kafka.common.record.internal.Record;
@@ -23,12 +24,22 @@ import org.apache.kafka.common.record.internal.RecordBatch;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
+import io.lakestream.api.LogEntry;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
-/** Utilities for storing and reading raw Kafka {@link MemoryRecords} payloads. */
+/**
+ * Utilities for storing and reading raw Kafka {@link MemoryRecords} payloads.
+ *
+ * <p>Validation and rebasing here only ever inspect record <em>batch headers</em>: the
+ * control/transactional batch flags, the v2 base offset, and the declared record count. Individual
+ * records are never decoded, so a compressed batch is never decompressed and a record's CRC is
+ * never recomputed on this path. The storage entry header (offset and record count) is the
+ * authoritative source of truth for what was durably appended.
+ */
 public final class KafkaRecordsPayload {
 
     private KafkaRecordsPayload() {
@@ -41,40 +52,29 @@ public final class KafkaRecordsPayload {
      * request buffer after the request lifecycle has ended.
      */
     public static ByteBuf copyForAppend(MemoryRecords records) {
-        ByteBuffer source = records.buffer().duplicate();
-        return Unpooled.copiedBuffer(source);
+        return Unpooled.copiedBuffer(records.buffer().duplicate());
     }
 
     /** Validates that records can be stored as one complete raw payload with the supplied record count. */
     public static void validateForAppend(MemoryRecords records, int expectedRecordCount) {
-        ByteBuffer source = records.buffer();
-        if (!source.hasRemaining()) {
+        int payloadSize = records.buffer().remaining();
+        if (payloadSize == 0) {
             throw new IllegalArgumentException("Kafka append contains no MemoryRecords payload");
         }
-        validateRecords(records, source.remaining(), expectedRecordCount);
+        validateHeaders(records, payloadSize, expectedRecordCount);
     }
 
     /**
-     * Copies, validates, and rebases a raw Kafka records payload.
+     * Wraps a storage entry's payload as readable records without copying, and rebases its batches
+     * to the entry's storage offset.
      *
-     * <p>The returned records do not retain or otherwise depend on {@code payload}. The storage
-     * entry header is authoritative for both the base offset and record count.
+     * <p>The returned records are backed directly by {@code payload}'s memory: rebasing writes
+     * through to it in place. Use this only while the entry that owns {@code payload} stays open
+     * for the duration of the call (single-entry decoding, e.g. replay or list-offsets). For a
+     * batch of entries that will be closed before the caller is done with the records, copy them
+     * with {@link #assemble} instead.
      */
-    public static MemoryRecords copyAndRebase(
-            ByteBuf payload,
-            long baseOffset,
-            int expectedRecordCount) {
-        validateEntryMetadata(payload, expectedRecordCount);
-
-        int payloadSize = payload.readableBytes();
-        ByteBuffer copy = copyPayload(payload, payloadSize);
-        MemoryRecords records = MemoryRecords.readableRecords(copy);
-        ValidatedBatches validated = validateRecords(records, payloadSize, expectedRecordCount);
-        rebase(validated, baseOffset);
-        return records;
-    }
-
-    private static void validateEntryMetadata(ByteBuf payload, int expectedRecordCount) {
+    public static MemoryRecords readableRecords(ByteBuf payload, long baseOffset, int expectedRecordCount) {
         if (payload == null || !payload.isReadable()) {
             throw new IllegalArgumentException("Kafka storage entry contains no MemoryRecords payload");
         }
@@ -82,33 +82,76 @@ public final class KafkaRecordsPayload {
             throw new IllegalArgumentException(
                     "Kafka storage entry must contain at least one record, but expected " + expectedRecordCount);
         }
+        int size = payload.readableBytes();
+        MemoryRecords records = MemoryRecords.readableRecords(payload.nioBuffer(payload.readerIndex(), size));
+        List<Integer> counts = validateHeaders(records, size, expectedRecordCount);
+        rebase(records, counts, baseOffset);
+        return records;
     }
 
-    private static ByteBuffer copyPayload(ByteBuf payload, int payloadSize) {
-        int readerIndex = payload.readerIndex();
-        ByteBuffer copy = ByteBuffer.allocate(payloadSize);
-        copy.put(payload.nioBuffer(readerIndex, payloadSize).duplicate());
-        copy.flip();
-        return copy;
-    }
-
-    private static ValidatedBatches validateRecords(
-            MemoryRecords records,
-            int payloadSize,
-            int expectedRecordCount) {
-        int validBytes = 0;
-        int decodedRecordCount = 0;
-        List<MutableRecordBatch> batches = new ArrayList<>();
-        List<Integer> batchRecordCounts = new ArrayList<>();
-        for (MutableRecordBatch batch : records.batches()) {
-            batches.add(batch);
-            int batchRecordCount = validateBatch(batch);
-            batchRecordCounts.add(batchRecordCount);
-            validBytes = Math.addExact(validBytes, batch.sizeInBytes());
-            decodedRecordCount = Math.addExact(decodedRecordCount, batchRecordCount);
+    /**
+     * Concatenates a sequence of storage entries into one independently owned {@link MemoryRecords},
+     * copying each entry's payload exactly once and rebasing its batches to that entry's offset.
+     */
+    public static MemoryRecords assemble(List<LogEntry> entries) {
+        int total = 0;
+        for (LogEntry entry : entries) {
+            total = Math.addExact(total, entry.payload().readableBytes());
+        }
+        if (total == 0) {
+            return MemoryRecords.EMPTY;
         }
 
-        if (batches.isEmpty()) {
+        ByteBuffer combined = ByteBuffer.allocate(total);
+        for (LogEntry entry : entries) {
+            ByteBuf payload = entry.payload();
+            int start = combined.position();
+            int size = payload.readableBytes();
+
+            ByteBuffer target = combined.duplicate();
+            target.position(start);
+            target.limit(start + size);
+            payload.getBytes(payload.readerIndex(), target);
+            combined.position(start + size);
+
+            ByteBuffer entrySlice = combined.duplicate();
+            entrySlice.position(start);
+            entrySlice.limit(start + size);
+            MemoryRecords decoded = MemoryRecords.readableRecords(entrySlice.slice());
+            List<Integer> counts = validateHeaders(decoded, size, entry.numberOfRecords());
+            rebase(decoded, counts, entry.offset());
+        }
+        combined.flip();
+        return MemoryRecords.readableRecords(combined);
+    }
+
+    /** Stamps every batch with the broker's log-append timestamp, in place. */
+    public static void setLogAppendTime(MemoryRecords records, long timestamp) {
+        for (MutableRecordBatch batch : records.batches()) {
+            batch.setMaxTimestamp(TimestampType.LOG_APPEND_TIME, timestamp);
+        }
+    }
+
+    /**
+     * Header-only validation: rejects control and transactional batches, requires v2 batches to
+     * declare base offset 0 with a record count consistent with their offset range, and requires
+     * the decoded batches to exactly cover {@code payloadSize} bytes and {@code expectedRecordCount}
+     * records overall. Never iterates individual records of a v2 batch.
+     *
+     * @return each batch's record count, in batch order
+     */
+    private static List<Integer> validateHeaders(MemoryRecords records, int payloadSize, int expectedRecordCount) {
+        List<Integer> counts = new ArrayList<>();
+        int validBytes = 0;
+        int totalRecords = 0;
+        for (MutableRecordBatch batch : records.batches()) {
+            validateBatchType(batch);
+            int count = batch.magic() >= RecordBatch.MAGIC_VALUE_V2 ? validateV2Batch(batch) : countLegacyBatch(batch);
+            counts.add(count);
+            validBytes = Math.addExact(validBytes, batch.sizeInBytes());
+            totalRecords = Math.addExact(totalRecords, count);
+        }
+        if (counts.isEmpty()) {
             throw new IllegalArgumentException("Kafka MemoryRecords contains no complete record batch");
         }
         if (validBytes != payloadSize) {
@@ -116,23 +159,12 @@ public final class KafkaRecordsPayload {
                     "Kafka MemoryRecords contains trailing or incomplete bytes: valid="
                             + validBytes + ", payload=" + payloadSize);
         }
-        if (decodedRecordCount != expectedRecordCount) {
+        if (totalRecords != expectedRecordCount) {
             throw new IllegalArgumentException(
                     "Kafka record count does not match the storage header: decoded="
-                            + decodedRecordCount + ", expected=" + expectedRecordCount);
+                            + totalRecords + ", expected=" + expectedRecordCount);
         }
-        return new ValidatedBatches(batches, batchRecordCounts);
-    }
-
-    private static int validateBatch(MutableRecordBatch batch) {
-        batch.ensureValid();
-        validateBatchType(batch);
-        boolean validateV2Offsets = batch.magic() >= RecordBatch.MAGIC_VALUE_V2;
-        validateBaseOffset(batch, validateV2Offsets);
-        int batchRecordCount = validateBatchRecords(batch, validateV2Offsets);
-        validateBatchRecordCount(batch, batchRecordCount);
-        validateBatchOffsetRange(batch, batchRecordCount, validateV2Offsets);
-        return batchRecordCount;
+        return counts;
     }
 
     private static void validateBatchType(MutableRecordBatch batch) {
@@ -144,75 +176,45 @@ public final class KafkaRecordsPayload {
         }
     }
 
-    private static void validateBaseOffset(MutableRecordBatch batch, boolean validateV2Offsets) {
-        if (validateV2Offsets && batch.baseOffset() != 0L) {
+    /** Validates a v2+ batch header and returns its declared record count. */
+    private static int validateV2Batch(MutableRecordBatch batch) {
+        if (batch.baseOffset() != 0L) {
             throw new IllegalArgumentException(
                     "Kafka producer record batch must have base offset 0, but was " + batch.baseOffset());
         }
+        Integer declared = batch.countOrNull();
+        if (declared == null || declared <= 0) {
+            throw new IllegalArgumentException("Kafka record batch declares no records");
+        }
+        long fromOffsets = batch.lastOffset() - batch.baseOffset() + 1L;
+        if (fromOffsets != declared) {
+            throw new IllegalArgumentException(
+                    "Kafka record batch offset range does not match its count: range="
+                            + fromOffsets + ", declared=" + declared);
+        }
+        return declared;
     }
 
-    private static int validateBatchRecords(MutableRecordBatch batch, boolean validateV2Offsets) {
-        int batchRecordCount = 0;
-        long expectedRecordOffset = batch.baseOffset();
-        for (Record record : batch) {
-            record.ensureValid();
-            if (validateV2Offsets) {
-                validateRecordOffset(record, expectedRecordOffset);
-                expectedRecordOffset = Math.addExact(expectedRecordOffset, 1L);
-            }
-            batchRecordCount = Math.addExact(batchRecordCount, 1);
+    /** v0/v1 batches carry no record count in the header, so this is the one path that decodes records. */
+    private static int countLegacyBatch(MutableRecordBatch batch) {
+        int count = 0;
+        for (Iterator<Record> it = batch.iterator(); it.hasNext(); it.next()) {
+            count++;
         }
-        if (batchRecordCount <= 0) {
+        if (count == 0) {
             throw new IllegalArgumentException("Kafka MemoryRecords contains an empty record batch");
         }
-        return batchRecordCount;
+        return count;
     }
 
-    private static void validateRecordOffset(Record record, long expectedRecordOffset) {
-        if (record.offset() != expectedRecordOffset) {
-            throw new IllegalArgumentException(
-                    "Kafka record batch contains a non-sequential offset: expected="
-                            + expectedRecordOffset + ", actual=" + record.offset());
+    /** Rebases each batch's offsets sequentially from {@code baseOffset}, using each batch's record count. */
+    private static void rebase(MemoryRecords records, List<Integer> counts, long baseOffset) {
+        long next = baseOffset;
+        int i = 0;
+        for (MutableRecordBatch batch : records.batches()) {
+            long last = Math.addExact(next, counts.get(i++) - 1L);
+            batch.setLastOffset(last);
+            next = Math.addExact(last, 1L);
         }
-    }
-
-    private static void validateBatchRecordCount(MutableRecordBatch batch, int batchRecordCount) {
-        Integer declaredRecordCount = batch.countOrNull();
-        if (declaredRecordCount != null && declaredRecordCount != batchRecordCount) {
-            throw new IllegalArgumentException(
-                    "Kafka record batch count does not match its contents: decoded="
-                            + batchRecordCount + ", declared=" + declaredRecordCount);
-        }
-    }
-
-    private static void validateBatchOffsetRange(
-            MutableRecordBatch batch,
-            int batchRecordCount,
-            boolean validateV2Offsets) {
-        if (!validateV2Offsets) {
-            return;
-        }
-        long recordCountFromOffsets = batch.lastOffset() - batch.baseOffset() + 1L;
-        if (recordCountFromOffsets != batchRecordCount) {
-            throw new IllegalArgumentException(
-                    "Kafka record batch offset range does not match its contents: range="
-                            + recordCountFromOffsets + ", decoded=" + batchRecordCount);
-        }
-    }
-
-    private static void rebase(ValidatedBatches validated, long baseOffset) {
-        long nextBatchOffset = baseOffset;
-        for (int i = 0; i < validated.batches().size(); i++) {
-            MutableRecordBatch batch = validated.batches().get(i);
-            int batchRecordCount = validated.batchRecordCounts().get(i);
-            long lastOffset = Math.addExact(nextBatchOffset, batchRecordCount - 1L);
-            batch.setLastOffset(lastOffset);
-            nextBatchOffset = Math.addExact(lastOffset, 1L);
-        }
-    }
-
-    private record ValidatedBatches(
-            List<MutableRecordBatch> batches,
-            List<Integer> batchRecordCounts) {
     }
 }

@@ -1361,7 +1361,7 @@ public class ProducerStateManager implements Closeable {
         long baseOffset = entry.offset();
         long nextOffset = Math.addExact(baseOffset, entry.numberOfRecords());
 
-        MemoryRecords memoryRecords = KafkaRecordsPayload.copyAndRebase(
+        MemoryRecords memoryRecords = KafkaRecordsPayload.readableRecords(
                 entry.payload(), baseOffset, entry.numberOfRecords());
         boolean hasProducerBatch = false;
         for (RecordBatch batch : memoryRecords.batches()) {

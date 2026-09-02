@@ -610,7 +610,7 @@ final class UrsaPartitionLog {
     }
 
     private MemoryRecords readableKafkaRecords(LogEntry entry) {
-        return KafkaRecordsPayload.copyAndRebase(
+        return KafkaRecordsPayload.readableRecords(
                 entry.payload(), entry.offset(), entry.numberOfRecords());
     }
 
