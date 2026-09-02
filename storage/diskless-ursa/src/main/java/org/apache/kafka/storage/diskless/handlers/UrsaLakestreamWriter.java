@@ -58,8 +58,7 @@ public final class UrsaLakestreamWriter implements Writer {
 
         List<CompletableFuture<AbstractMap.SimpleEntry<TopicIdPartition, PartitionResponse>>> futures =
                 entriesPerPartition.entrySet().stream()
-                        .map(entry -> state.getOrCreatePartitionLog(entry.getKey())
-                                .write(entry.getValue(), zone, WRITER_NAME)
+                        .map(entry -> write(entry.getKey(), entry.getValue(), zone)
                                 .thenApply(response -> new AbstractMap.SimpleEntry<>(entry.getKey(), response)))
                         .toList();
 
@@ -75,6 +74,26 @@ public final class UrsaLakestreamWriter implements Writer {
                     log.debug("Completed writing to {} partitions via {}", result.size(), WRITER_NAME);
                     return result;
                 });
+    }
+
+    /**
+     * Appends one partition of the request. A partition whose log cannot be resolved -- a topic
+     * deleted under this broker, or a storage state that is closing -- fails on its own rather than
+     * taking the whole request with it: the partitions resolved before it have already been handed
+     * to storage, and reporting those as failed would have the producer send them a second time.
+     */
+    private CompletableFuture<PartitionResponse> write(
+            TopicIdPartition topicIdPartition,
+            MemoryRecords records,
+            String zone) {
+        UrsaPartitionLog partitionLog;
+        try {
+            partitionLog = state.getOrCreatePartitionLog(topicIdPartition);
+        } catch (Throwable lookupError) {
+            return CompletableFuture.completedFuture(new PartitionResponse(
+                    UrsaPartitionLog.unresolved(topicIdPartition, "produce", lookupError)));
+        }
+        return partitionLog.write(records, zone, WRITER_NAME);
     }
 
     @Override

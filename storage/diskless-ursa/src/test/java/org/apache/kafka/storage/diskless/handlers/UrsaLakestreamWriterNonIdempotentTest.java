@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.MemoryRecords;
@@ -38,6 +39,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -124,6 +126,48 @@ class UrsaLakestreamWriterNonIdempotentTest {
 
         assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, response.error);
         verify(logInstance, never()).append(anyInt(), any(ByteBuf.class));
+    }
+
+    @Test
+    void testPartitionThatCannotBeResolvedFailsOnItsOwn() throws Exception {
+        TopicIdPartition healthy = testTopicPartition();
+        TopicIdPartition deleted = new TopicIdPartition(
+                Uuid.randomUuid(), new TopicPartition("deleted-topic", 0));
+        TopicIdPartition closing = new TopicIdPartition(
+                Uuid.randomUuid(), new TopicPartition("closing-topic", 0));
+        Log logInstance = mock(Log.class);
+        LogEntryHeader appended = mockLogEntryHeader(4L);
+        when(logInstance.append(anyInt(), any(ByteBuf.class)))
+                .thenReturn(CompletableFuture.completedFuture(appended));
+        UrsaStorageState state = newWriterState(healthy, logInstance);
+        when(state.getOrCreatePartitionLog(deleted))
+                .thenThrow(new NotLeaderOrFollowerException("Topic deleted-topic was deleted"));
+        when(state.getOrCreatePartitionLog(closing))
+                .thenThrow(new IllegalStateException("Ursa storage state is closed"));
+
+        // The healthy partition is resolved and appended first, so a throw from a later partition
+        // must not take down records that already reached storage: the producer would retry them.
+        Map<TopicIdPartition, MemoryRecords> entries = new LinkedHashMap<>();
+        entries.put(healthy, MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))));
+        entries.put(deleted, MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord("b".getBytes(StandardCharsets.UTF_8))));
+        entries.put(closing, MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord("c".getBytes(StandardCharsets.UTF_8))));
+
+        UrsaLakestreamWriter writer = new UrsaLakestreamWriter(state);
+        try {
+            Map<TopicIdPartition, PartitionResponse> responses =
+                    writer.write(entries, DisklessClientZone.NO_ZONE).get(5, TimeUnit.SECONDS);
+
+            assertEquals(Errors.NONE, responses.get(healthy).error);
+            assertEquals(4L, responses.get(healthy).baseOffset);
+            assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, responses.get(deleted).error);
+            assertEquals(Errors.KAFKA_STORAGE_ERROR, responses.get(closing).error);
+            verify(logInstance).append(anyInt(), any(ByteBuf.class));
+        } finally {
+            writer.close();
+        }
     }
 
     @Test

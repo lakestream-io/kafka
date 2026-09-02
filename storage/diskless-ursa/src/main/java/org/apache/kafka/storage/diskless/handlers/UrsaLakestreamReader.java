@@ -63,8 +63,18 @@ public class UrsaLakestreamReader implements Reader {
             return CompletableFuture.completedFuture(Map.of());
         }
 
+        // A partition whose log cannot be resolved fails on its own; the rest of the request is
+        // read and, if it has nothing to send yet, still allowed to wait.
         Map<TopicIdPartition, UrsaPartitionLog> partitionLogs = new LinkedHashMap<>();
-        fetchInfos.keySet().forEach(tp -> partitionLogs.put(tp, state.getOrCreatePartitionLog(tp)));
+        Map<TopicIdPartition, FetchPartitionData> unresolved = new LinkedHashMap<>();
+        fetchInfos.keySet().forEach(tp -> {
+            try {
+                partitionLogs.put(tp, state.getOrCreatePartitionLog(tp));
+            } catch (Throwable lookupError) {
+                unresolved.put(tp, UrsaPartitionLog.createFetchErrorResponse(
+                        UrsaPartitionLog.unresolved(tp, "fetch", lookupError)));
+            }
+        });
 
         // Registered before the first read: an append that lands between the read's high-watermark
         // snapshot and the decision to wait must still wake this request.
@@ -73,16 +83,18 @@ public class UrsaLakestreamReader implements Reader {
                 : Map.of();
 
         CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> result =
-                read(partitionLogs, fetchInfos, fetchInfos.keySet())
+                read(partitionLogs, fetchInfos, partitionLogs.keySet())
                         .thenCompose(responses -> {
                             List<TopicIdPartition> caughtUp = caughtUpPartitions(responses, fetchInfos);
-                            if (waiters.isEmpty() || caughtUp.isEmpty() || answered(responses)) {
+                            if (waiters.isEmpty() || caughtUp.isEmpty()
+                                    || !unresolved.isEmpty() || answered(responses)) {
                                 return CompletableFuture.completedFuture(responses);
                             }
                             return awaitAnyAppend(waiters)
                                     .thenCompose(ignored -> read(partitionLogs, fetchInfos, caughtUp))
-                                    .thenApply(rereads -> merge(fetchInfos.keySet(), responses, rereads));
-                        });
+                                    .thenApply(rereads -> merge(partitionLogs.keySet(), responses, rereads));
+                        })
+                        .thenApply(responses -> withUnresolved(fetchInfos.keySet(), responses, unresolved));
 
         if (waiters.isEmpty()) {
             return result;
@@ -101,8 +113,7 @@ public class UrsaLakestreamReader implements Reader {
 
         List<CompletableFuture<AbstractMap.SimpleEntry<TopicIdPartition, ListOffsetsPartitionResponse>>> futures =
                 requests.entrySet().stream()
-                        .map(entry -> state.getOrCreatePartitionLog(entry.getKey())
-                                .listOffsets(entry.getValue())
+                        .map(entry -> listOffsets(entry.getKey(), entry.getValue())
                                 .thenApply(response -> new AbstractMap.SimpleEntry<>(entry.getKey(), response)))
                         .toList();
 
@@ -118,6 +129,37 @@ public class UrsaLakestreamReader implements Reader {
 
     @Override
     public void close() throws IOException {
+    }
+
+    /** Lists one partition's offsets, failing only that partition when its log cannot be resolved. */
+    private CompletableFuture<ListOffsetsPartitionResponse> listOffsets(
+            TopicIdPartition topicIdPartition,
+            ListOffsetsPartitionRequest request) {
+        UrsaPartitionLog partitionLog;
+        try {
+            partitionLog = state.getOrCreatePartitionLog(topicIdPartition);
+        } catch (Throwable lookupError) {
+            return CompletableFuture.completedFuture(ListOffsetsPartitionResponse.error(
+                    topicIdPartition,
+                    UrsaPartitionLog.unresolved(topicIdPartition, "listOffsets", lookupError)));
+        }
+        return partitionLog.listOffsets(request);
+    }
+
+    /** Puts the partitions that never reached storage back into the response, in request order. */
+    private static Map<TopicIdPartition, FetchPartitionData> withUnresolved(
+            Collection<TopicIdPartition> requestOrder,
+            Map<TopicIdPartition, FetchPartitionData> responses,
+            Map<TopicIdPartition, FetchPartitionData> unresolved) {
+        if (unresolved.isEmpty()) {
+            return responses;
+        }
+        Map<TopicIdPartition, FetchPartitionData> merged = new LinkedHashMap<>();
+        requestOrder.forEach(tp -> {
+            FetchPartitionData response = responses.get(tp);
+            merged.put(tp, response != null ? response : unresolved.get(tp));
+        });
+        return merged;
     }
 
     private static Map<TopicIdPartition, CompletableFuture<Void>> registerWaiters(

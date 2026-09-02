@@ -334,36 +334,60 @@ final class UrsaPartitionLog {
         }));
     }
 
-    private Errors mapException(Throwable error) {
+    /**
+     * The error a client sees for one storage failure. Classification alone: the failure may have
+     * been raised by the partition-log lookup itself, before any handle existed to retire.
+     */
+    static Errors classify(Throwable error) {
         Throwable cause = DisklessFutures.unwrap(error);
         if (hasCause(cause, NotLeaderOrFollowerException.class)
                 || hasCause(cause, LogFencedException.class)) {
-            invalidate();
             return Errors.NOT_LEADER_OR_FOLLOWER;
         }
         if (hasCause(cause, NoSuchStreamException.class)) {
-            invalidate();
             return Errors.UNKNOWN_TOPIC_OR_PARTITION;
         }
         return Errors.KAFKA_STORAGE_ERROR;
     }
 
+    private Errors mapException(Throwable error) {
+        Errors mapped = classify(error);
+        if (mapped == Errors.NOT_LEADER_OR_FOLLOWER || mapped == Errors.UNKNOWN_TOPIC_OR_PARTITION) {
+            // The handle behind this partition log is gone; the next request opens a fresh one.
+            invalidate();
+        }
+        return mapped;
+    }
+
     private PartitionResponse writeErrorResponse(Throwable error) {
+        Errors mapped = classify(error);
         Throwable cause = DisklessFutures.unwrap(error);
-        if (hasCause(cause, NotLeaderOrFollowerException.class)
-                || hasCause(cause, LogFencedException.class)) {
+        if (mapped == Errors.NOT_LEADER_OR_FOLLOWER) {
             invalidate();
             log.info("Partition log is no longer local owner for partition {}", topicIdPartition, cause);
-            return new PartitionResponse(Errors.NOT_LEADER_OR_FOLLOWER);
-        }
-        if (hasCause(cause, NoSuchStreamException.class)) {
+        } else if (mapped == Errors.UNKNOWN_TOPIC_OR_PARTITION) {
             invalidate();
             log.debug("Partition log is not provisioned yet for partition {}", topicIdPartition, cause);
-            return new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION);
+        } else {
+            log.error("Failed to write to partition {}", topicIdPartition, error);
         }
+        return new PartitionResponse(mapped);
+    }
 
-        log.error("Failed to write to partition {}", topicIdPartition, error);
-        return new PartitionResponse(Errors.KAFKA_STORAGE_ERROR);
+    /**
+     * Answers one partition of a request whose partition log could not be resolved at all -- the
+     * topic was deleted under this broker, or the storage state is closing.
+     *
+     * <p>Resolution happens partition by partition while the request is being fanned out, so by the
+     * time one partition throws the earlier ones may already have been handed to storage. Failing
+     * only the partition that could not be resolved is what keeps those earlier records from being
+     * reported as failed and produced a second time.
+     */
+    static Errors unresolved(TopicIdPartition topicIdPartition, String operation, Throwable error) {
+        Errors mapped = classify(error);
+        log.debug("Diskless {} for partition {} failed with {} before its log was resolved",
+                operation, topicIdPartition, mapped, error);
+        return mapped;
     }
 
     static boolean hasCause(Throwable error, Class<? extends Throwable> type) {
@@ -377,7 +401,7 @@ final class UrsaPartitionLog {
         return false;
     }
 
-    private FetchPartitionData createFetchErrorResponse(Errors error) {
+    static FetchPartitionData createFetchErrorResponse(Errors error) {
         return new FetchPartitionData(
                 error,
                 -1,

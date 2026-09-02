@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.MemoryRecords;
@@ -533,6 +534,75 @@ class UrsaLakestreamReaderTest {
         ListOffsetsPartitionResponse response = reader.listOffsets(Map.of(tp, request)).get().get(tp);
 
         assertEquals(Errors.KAFKA_STORAGE_ERROR, response.error());
+    }
+
+    @Test
+    void testFetchPartitionThatCannotBeResolvedFailsOnItsOwn() throws Exception {
+        TopicIdPartition healthy = createTestPartition();
+        TopicIdPartition deleted = createTestPartition();
+        TopicIdPartition closing = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        when(logInstance.getFirstOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(0L, 1)));
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(0L, 1)));
+        when(logInstance.openEphemeralCursor(anyString(), eq(0L)))
+                .thenReturn(CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(1L))).thenAnswer(
+                invocation -> CompletableFuture.completedFuture(
+                        List.of(createKafkaRecordsEntry(0L, new long[]{1000L}))));
+        attachReaderPartitionLog(state, healthy, logInstance);
+        when(state.getOrCreatePartitionLog(deleted))
+                .thenThrow(new NotLeaderOrFollowerException("Topic was deleted"));
+        when(state.getOrCreatePartitionLog(closing))
+                .thenThrow(new IllegalStateException("Ursa storage state is closed"));
+
+        Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos = new LinkedHashMap<>();
+        fetchInfos.put(healthy, fetchPartitionData(0L));
+        fetchInfos.put(deleted, fetchPartitionData(0L));
+        fetchInfos.put(closing, fetchPartitionData(0L));
+
+        Map<TopicIdPartition, FetchPartitionData> responses =
+                new UrsaLakestreamReader(state).fetch(createFetchParams(30_000L), fetchInfos)
+                        .get(5, TimeUnit.SECONDS);
+
+        assertEquals(List.of(healthy, deleted, closing), new ArrayList<>(responses.keySet()));
+        assertEquals(Errors.NONE, responses.get(healthy).error);
+        assertEquals(1, countRecords(responses.get(healthy).records));
+        assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, responses.get(deleted).error);
+        assertEquals(Errors.KAFKA_STORAGE_ERROR, responses.get(closing).error);
+        assertTrue(timer.getQueue().isEmpty(), "Long-poll timeouts must be cancelled with the request");
+    }
+
+    @Test
+    void testListOffsetsPartitionThatCannotBeResolvedFailsOnItsOwn() throws Exception {
+        TopicIdPartition healthy = createTestPartition();
+        TopicIdPartition deleted = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        Log logInstance = mock(Log.class);
+        when(logInstance.getFirstOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(5L, 1)));
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(10L, 5)));
+        attachReaderPartitionLog(state, healthy, logInstance);
+        when(state.getOrCreatePartitionLog(deleted))
+                .thenThrow(new NotLeaderOrFollowerException("Topic was deleted"));
+
+        Map<TopicIdPartition, ListOffsetsPartitionRequest> requests = new LinkedHashMap<>();
+        requests.put(healthy, new ListOffsetsPartitionRequest(
+                healthy, ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP, Optional.empty()));
+        requests.put(deleted, new ListOffsetsPartitionRequest(
+                deleted, ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP, Optional.empty()));
+
+        Map<TopicIdPartition, ListOffsetsPartitionResponse> responses =
+                new UrsaLakestreamReader(state).listOffsets(requests).get(5, TimeUnit.SECONDS);
+
+        assertEquals(List.of(healthy, deleted), new ArrayList<>(responses.keySet()));
+        assertEquals(Errors.NONE, responses.get(healthy).error());
+        assertEquals(5L, responses.get(healthy).offset());
+        assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, responses.get(deleted).error());
     }
 
     private static FetchParams createFetchParams() {
