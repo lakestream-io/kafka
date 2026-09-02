@@ -16,7 +16,10 @@
  */
 package org.apache.kafka.storage.diskless.idempotent;
 
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
+
+import java.util.Optional;
 
 /** Oxia key builder for diskless producer-state snapshots. */
 public final class ProducerStateSnapshotKeys {
@@ -72,5 +75,41 @@ public final class ProducerStateSnapshotKeys {
             return legacyKey;
         }
         return legacyKey + "/" + zone;
+    }
+
+    /**
+     * Kafka topic ID owning {@code key}, or empty when {@code key} does not name a snapshot of one
+     * Kafka topic incarnation. Both the unzoned {@code <prefix><topicId>-<partition>} and the zoned
+     * {@code <prefix><topicId>-<partition>/<zone>} forms are recognised.
+     *
+     * <p>A topic ID is base64url and may contain the {@code '-'} that separates it from the
+     * partition index, so the separator is the last one: a partition index is only digits.
+     */
+    public static Optional<Uuid> topicIdOfSnapshotKey(String key) {
+        if (key == null || !key.startsWith(SNAPSHOT_PREFIX)) {
+            return Optional.empty();
+        }
+        String suffix = key.substring(SNAPSHOT_PREFIX.length());
+        int zoneStart = suffix.indexOf('/');
+        if (zoneStart >= 0) {
+            suffix = suffix.substring(0, zoneStart);
+        }
+        int partitionStart = suffix.lastIndexOf('-') + 1;
+        if (partitionStart <= 1 || partitionStart == suffix.length()) {
+            return Optional.empty();
+        }
+        for (int i = partitionStart; i < suffix.length(); i++) {
+            char digit = suffix.charAt(i);
+            if (digit < '0' || digit > '9') {
+                return Optional.empty();
+            }
+        }
+        try {
+            Uuid topicId = Uuid.fromString(suffix.substring(0, partitionStart - 1));
+            // A zero ID never identifies a Kafka topic, so it is not a topic's snapshot either.
+            return Uuid.ZERO_UUID.equals(topicId) ? Optional.empty() : Optional.of(topicId);
+        } catch (IllegalArgumentException notATopicId) {
+            return Optional.empty();
+        }
     }
 }

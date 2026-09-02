@@ -222,16 +222,13 @@ final class LakestreamStorageHolder implements Closeable {
     static LakestreamStorageHolder create(UrsaStorageConfig config) throws Exception {
         StreamCatalog catalog = null;
         AsyncOxiaClient producerStateOxiaClient = null;
-        CompletableFuture<AsyncOxiaClient> producerStateOxiaClientFuture = null;
         try {
             String oxiaUrl = config.getCatalogOxiaServiceUrl();
             Properties properties = buildStorageProperties(config);
 
             catalog = StreamCatalogLoader.open(oxiaUrl, properties);
 
-            producerStateOxiaClientFuture = new OxiaServiceUrl(config.getUrsaOxiaServiceUrl()).client();
-            producerStateOxiaClient = producerStateOxiaClientFuture.get(
-                    OXIA_CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            producerStateOxiaClient = connectProducerStateOxiaClient(config);
 
             return new LakestreamStorageHolder(catalog, producerStateOxiaClient);
         } catch (Exception e) {
@@ -241,7 +238,26 @@ final class LakestreamStorageHolder implements Closeable {
                 }
             } catch (Exception ignored) {
             }
-            closeOxiaClientAfterFailedCreate(producerStateOxiaClient, producerStateOxiaClientFuture, e);
+            closeOxiaClientAfterFailedCreate(producerStateOxiaClient, null, e);
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Connects the Oxia client that Kafka owns for producer-state snapshots, waiting at most
+     * {@link #OXIA_CONNECT_TIMEOUT_SECONDS}. A client that only connects after that deadline is
+     * closed rather than leaked.
+     */
+    static AsyncOxiaClient connectProducerStateOxiaClient(UrsaStorageConfig config) throws Exception {
+        CompletableFuture<AsyncOxiaClient> pending =
+                new OxiaServiceUrl(config.getUrsaOxiaServiceUrl()).client();
+        try {
+            return pending.get(OXIA_CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            closeOxiaClientAfterFailedCreate(null, pending, e);
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }

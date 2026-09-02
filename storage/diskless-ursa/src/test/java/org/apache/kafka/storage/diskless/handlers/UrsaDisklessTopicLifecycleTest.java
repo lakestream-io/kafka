@@ -18,12 +18,18 @@ package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.storage.diskless.DisklessTopicLifecycle;
+import org.apache.kafka.storage.diskless.idempotent.ProducerStateSnapshotKeys;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import io.lakestream.api.LifecycleState;
 import io.lakestream.api.Partitioning;
@@ -36,21 +42,42 @@ import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.exception.AlreadyExistsException;
 import io.lakestream.api.exception.NoSuchStreamException;
+import io.lakestream.api.exception.StreamPermanentlyDeletedException;
+import io.oxia.client.api.AsyncOxiaClient;
+import io.oxia.client.api.PutResult;
+import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
+import io.oxia.client.api.options.PutOption;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.startsWith;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class UrsaDisklessTopicLifecycleTest {
 
+    private static final long TIMEOUT_SECONDS = 30;
+
+    private final StreamCatalog catalog = mock(StreamCatalog.class);
+    private final AsyncOxiaClient oxia = mock(AsyncOxiaClient.class);
+
     @Test
     void testListsOnlyStreamsWithVerifiedKafkaOwnershipMetadata() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         StreamIdentifier owned = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         StreamIdentifier missingManagedMarker = StreamIdentifier.of("default", "missing-managed-marker");
@@ -130,7 +157,7 @@ class UrsaDisklessTopicLifecycleTest {
                                         KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "-1"),
                                 LifecycleState.ACTIVE))));
 
-        try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             assertEquals(
                     List.of(new DisklessTopicLifecycle.ManagedTopic("orders", topicId, 42L)),
                     lifecycle.listManagedTopics().get());
@@ -139,7 +166,6 @@ class UrsaDisklessTopicLifecycleTest {
 
     @Test
     void testListManagedTopicsIncludesKafkaOwnedDeletingEntry() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier(
                 "deleting-topic", topicId);
@@ -153,7 +179,7 @@ class UrsaDisklessTopicLifecycleTest {
                                 KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY, "43"),
                         LifecycleState.DELETING))));
 
-        try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             assertEquals(
                     List.of(new DisklessTopicLifecycle.ManagedTopic("deleting-topic", topicId, 43L)),
                     lifecycle.listManagedTopics().get());
@@ -161,14 +187,41 @@ class UrsaDisklessTopicLifecycleTest {
     }
 
     @Test
+    void testEnsureTopicCreatesGrowsAndReplacesProperties() throws Exception {
+        Uuid topicId = Uuid.randomUuid();
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);
+        StreamMetadata created = metadata(2);
+        StreamMetadata grown = metadata(4);
+        when(catalog.loadStream(id))
+                .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)));
+        when(catalog.createStream(eq(id), any(), any(), any(), anyMap()))
+                .thenReturn(CompletableFuture.completedFuture(created));
+        when(catalog.increasePartitions(id, 4))
+                .thenReturn(CompletableFuture.completedFuture(grown));
+        when(catalog.replaceStreamProperties(eq(id), anyMap(), eq(42L)))
+                .thenReturn(CompletableFuture.completedFuture(grown));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            lifecycle.ensureTopic("orders", topicId, 4, Map.of("retention.ms", "5"), 42L).get();
+        }
+
+        verify(catalog).increasePartitions(id, 4);
+        verify(catalog).replaceStreamProperties(
+                eq(id),
+                argThat(properties ->
+                        "orders".equals(properties.get(KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY))
+                                && "5".equals(properties.get("retention.ms"))),
+                eq(42L));
+    }
+
+    @Test
     void testCreatesMissingStreamAndRecordsKafkaRevision() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.fromString("65WMNfybQpCDVulYOxMCTw");
         StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         Map<String, String> properties = Map.of("retention.ms", "60000");
         Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, properties, 17L);
-        StreamMetadata created = metadataWithPartitions(3);
+        StreamMetadata created = metadata(3);
         when(catalog.loadStream(identifier))
                 .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(identifier)));
         when(catalog.createStream(
@@ -181,7 +234,7 @@ class UrsaDisklessTopicLifecycleTest {
         when(catalog.replaceStreamProperties(identifier, streamProperties, 17))
                 .thenReturn(CompletableFuture.completedFuture(created));
 
-        try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             lifecycle.ensureTopic("orders", topicId, 3, properties, 17).get();
         }
 
@@ -198,37 +251,36 @@ class UrsaDisklessTopicLifecycleTest {
 
     @Test
     void testExistingStreamIsGrownBeforePropertiesAreReplaced() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, Map.of(), 18L);
-        StreamMetadata existing = metadataWithPartitions(1);
-        StreamMetadata expanded = metadataWithPartitions(3);
-        when(catalog.loadStream(identifier)).thenReturn(CompletableFuture.completedFuture(existing));
+        StreamMetadata existing = metadata(1);
+        StreamMetadata expanded = metadata(3);
+        when(catalog.loadStream(identifier))
+                .thenReturn(CompletableFuture.completedFuture(existing));
         when(catalog.increasePartitions(identifier, 3))
                 .thenReturn(CompletableFuture.completedFuture(expanded));
         when(catalog.replaceStreamProperties(identifier, streamProperties, 18))
                 .thenReturn(CompletableFuture.completedFuture(expanded));
 
-        try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             lifecycle.ensureTopic("orders", topicId, 3, Map.of(), 18).get();
         }
 
-        verify(catalog).increasePartitions(identifier, 3);
-        verify(catalog).replaceStreamProperties(identifier, streamProperties, 18);
-        verify(catalog, never()).createStream(
-                any(), any(), any(), any(), any());
+        InOrder inOrder = inOrder(catalog);
+        inOrder.verify(catalog).increasePartitions(identifier, 3);
+        inOrder.verify(catalog).replaceStreamProperties(identifier, streamProperties, 18);
+        verify(catalog, never()).createStream(any(), any(), any(), any(), any());
     }
 
     @Test
     void testConcurrentCreateLoadsWinnerAndReconcilesIt() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
         Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
                 "orders", topicId, Map.of(), 19L);
-        StreamMetadata winner = metadataWithPartitions(3);
+        StreamMetadata winner = metadata(3);
         when(catalog.loadStream(identifier))
                 .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(identifier)))
                 .thenReturn(CompletableFuture.completedFuture(winner));
@@ -238,7 +290,7 @@ class UrsaDisklessTopicLifecycleTest {
         when(catalog.replaceStreamProperties(identifier, streamProperties, 19))
                 .thenReturn(CompletableFuture.completedFuture(winner));
 
-        try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             lifecycle.ensureTopic("orders", topicId, 3, Map.of(), 19).get();
         }
 
@@ -246,18 +298,205 @@ class UrsaDisklessTopicLifecycleTest {
     }
 
     @Test
-    void testDeletePermanentlyDropsStream() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
+    void testEnsureTopicFailsTerminallyWhenPermanentlyDeleted() throws Exception {
         Uuid topicId = Uuid.randomUuid();
-        StreamIdentifier identifier = KafkaStreamIdentity.streamIdentifier("orders", topicId);
-        when(catalog.dropStream(identifier, true))
-                .thenReturn(CompletableFuture.completedFuture(true));
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);
+        when(catalog.loadStream(id))
+                .thenReturn(CompletableFuture.failedFuture(new StreamPermanentlyDeletedException(id)));
 
-        try (UrsaDisklessTopicLifecycle lifecycle = new UrsaDisklessTopicLifecycle(catalog)) {
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> lifecycle.ensureTopic("orders", topicId, 1, Map.of(), 1L).get());
+            assertInstanceOf(StreamPermanentlyDeletedException.class, failure.getCause());
+        }
+
+        verify(catalog, never()).createStream(any(), any(), any(), any(), anyMap());
+        verify(catalog, never()).replaceStreamProperties(any(), anyMap(), anyLong());
+    }
+
+    @Test
+    void testConcurrentGrowIsNotAFailureWhenTheLayoutReachedTheTarget() throws Exception {
+        Uuid topicId = Uuid.randomUuid();
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);
+        Map<String, String> streamProperties = KafkaStreamIdentity.streamProperties(
+                "orders", topicId, Map.of(), 20L);
+        StreamMetadata beforeGrow = metadata(1);
+        StreamMetadata afterConcurrentGrow = metadata(3);
+        when(catalog.loadStream(id))
+                .thenReturn(CompletableFuture.completedFuture(beforeGrow))
+                .thenReturn(CompletableFuture.completedFuture(afterConcurrentGrow));
+        when(catalog.increasePartitions(id, 3)).thenReturn(
+                CompletableFuture.failedFuture(new IllegalStateException("grown concurrently")));
+        when(catalog.replaceStreamProperties(id, streamProperties, 20))
+                .thenReturn(CompletableFuture.completedFuture(afterConcurrentGrow));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            lifecycle.ensureTopic("orders", topicId, 3, Map.of(), 20).get();
+        }
+
+        verify(catalog).replaceStreamProperties(id, streamProperties, 20);
+    }
+
+    @Test
+    void testFailedGrowPropagatesWhenTheLayoutIsStillTooSmall() throws Exception {
+        Uuid topicId = Uuid.randomUuid();
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);
+        StreamMetadata beforeGrow = metadata(1);
+        StreamMetadata stillTooSmall = metadata(2);
+        when(catalog.loadStream(id))
+                .thenReturn(CompletableFuture.completedFuture(beforeGrow))
+                .thenReturn(CompletableFuture.completedFuture(stillTooSmall));
+        when(catalog.increasePartitions(id, 3)).thenReturn(
+                CompletableFuture.failedFuture(new IllegalStateException("grow rejected")));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> lifecycle.ensureTopic("orders", topicId, 3, Map.of(), 21).get());
+            assertInstanceOf(IllegalStateException.class, failure.getCause());
+        }
+
+        verify(catalog, never()).replaceStreamProperties(any(), anyMap(), anyLong());
+    }
+
+    @Test
+    void testDeleteTopicDropsStreamAndFencesThenDeletesSnapshots() throws Exception {
+        Uuid topicId = Uuid.randomUuid();
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);
+        String fenceKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
+        String prefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId.toString());
+        when(catalog.dropStream(id, true)).thenReturn(CompletableFuture.completedFuture(true));
+        when(oxia.put(eq(fenceKey), any(), eq(Set.of(PutOption.IfRecordDoesNotExist))))
+                .thenReturn(CompletableFuture.completedFuture(new PutResult(fenceKey, null)));
+        when(oxia.deleteRange(anyString(), anyString()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             lifecycle.deleteTopic("orders", topicId).get();
         }
 
-        verify(catalog).dropStream(identifier, true);
+        // The fence must be durable before any snapshot is removed, so a broker that reads it
+        // afterwards can never recreate one behind the range delete.
+        InOrder inOrder = inOrder(oxia);
+        inOrder.verify(oxia).put(eq(fenceKey), any(), anySet());
+        inOrder.verify(oxia).deleteRange(prefix, prefix + '\uffff');
+        verify(catalog).dropStream(id, true);
+    }
+
+    @Test
+    void testOverlappingDeleteTopicCallsBothComplete() throws Exception {
+        Uuid topicId = Uuid.randomUuid();
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);
+        String fenceKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId.toString());
+        String prefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId.toString());
+        CompletableFuture<Boolean> firstDrop = new CompletableFuture<>();
+        CompletableFuture<Boolean> secondDrop = new CompletableFuture<>();
+        CompletableFuture<PutResult> firstFence = new CompletableFuture<>();
+        CompletableFuture<PutResult> secondFence = new CompletableFuture<>();
+        when(catalog.dropStream(id, true)).thenReturn(firstDrop, secondDrop);
+        when(oxia.put(eq(fenceKey), any(), anySet())).thenReturn(firstFence, secondFence);
+        when(oxia.deleteRange(anyString(), anyString()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            // The reconciler only cancels a timed-out operation best effort, so a retry can overlap
+            // the original delete inside this class.
+            CompletableFuture<Void> first = lifecycle.deleteTopic("orders", topicId);
+            CompletableFuture<Void> second = lifecycle.deleteTopic("orders", topicId);
+
+            secondFence.completeExceptionally(new KeyAlreadyExistsException(fenceKey));
+            firstFence.complete(new PutResult(fenceKey, null));
+            secondDrop.complete(false);
+            firstDrop.complete(true);
+
+            first.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            second.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        verify(oxia, times(2)).deleteRange(prefix, prefix + '\uffff');
+    }
+
+    @Test
+    void testSweepDeletesCatalogOrphansAndUnreferencedProducerState() throws Exception {
+        Uuid live = Uuid.randomUuid();
+        Uuid orphan = Uuid.randomUuid();
+        Uuid staleSnapshotOnly = Uuid.randomUuid();
+        Uuid tooNew = Uuid.randomUuid();
+        when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE))
+                .thenReturn(CompletableFuture.completedFuture(List.of(
+                        managedEntry("a", live, 10L),
+                        managedEntry("b", orphan, 10L),
+                        managedEntry("c", tooNew, 99L))));
+        when(oxia.list(eq(ProducerStateSnapshotKeys.topicIndexKey("")), anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(List.of(
+                        ProducerStateSnapshotKeys.snapshotKey(live.toString(), 0),
+                        ProducerStateSnapshotKeys.snapshotKey(staleSnapshotOnly.toString(), 0))));
+        when(catalog.dropStream(any(), eq(true))).thenReturn(CompletableFuture.completedFuture(true));
+        when(oxia.put(anyString(), any(), anySet()))
+                .thenAnswer(invocation -> CompletableFuture.completedFuture(
+                        new PutResult(invocation.getArgument(0), null)));
+        when(oxia.deleteRange(anyString(), anyString()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            lifecycle.sweepOrphans(Set.of(live), 50L).get();
+        }
+
+        verify(catalog).dropStream(KafkaStreamIdentity.streamIdentifier("b", orphan), true);
+        // A stream created from a newer image than the caller has seen is never dropped.
+        verify(catalog, never()).dropStream(KafkaStreamIdentity.streamIdentifier("c", tooNew), true);
+        verify(catalog, never()).dropStream(KafkaStreamIdentity.streamIdentifier("a", live), true);
+        verify(oxia).deleteRange(
+                startsWith(ProducerStateSnapshotKeys.topicSnapshotPrefix(staleSnapshotOnly.toString())),
+                anyString());
+        // Neither the range delete nor its permanent fence may touch a live topic.
+        verify(oxia, never()).deleteRange(
+                startsWith(ProducerStateSnapshotKeys.topicSnapshotPrefix(live.toString())), anyString());
+        verify(oxia, never()).put(
+                eq(ProducerStateSnapshotKeys.deletedTopicMarkerKey(live.toString())), any(), anySet());
+        verify(oxia, never()).deleteRange(
+                startsWith(ProducerStateSnapshotKeys.topicSnapshotPrefix(tooNew.toString())), anyString());
+        verify(oxia, never()).put(
+                eq(ProducerStateSnapshotKeys.deletedTopicMarkerKey(tooNew.toString())), any(), anySet());
+    }
+
+    @Test
+    void testSweepReadsTheSnapshotIndexBeforeTheCatalog() throws Exception {
+        when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+        when(oxia.list(anyString(), anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            lifecycle.sweepOrphans(Set.of(), 50L).get();
+        }
+
+        // A stream is always created before a snapshot can be written for it, so reading the
+        // snapshot index first guarantees the later catalog listing covers every topic seen here.
+        InOrder inOrder = inOrder(oxia, catalog);
+        inOrder.verify(oxia).list(anyString(), anyString(), anySet());
+        inOrder.verify(catalog).listStreamEntries(KafkaStreamIdentity.NAMESPACE);
+    }
+
+    @Test
+    void testCloseClosesTheCatalogAndThenTheProducerStateClient() throws Exception {
+        lifecycle().close();
+
+        InOrder inOrder = inOrder(catalog, oxia);
+        inOrder.verify(catalog).close();
+        inOrder.verify(oxia).close();
+    }
+
+    @Test
+    void testCloseStillClosesTheProducerStateClientWhenTheCatalogFails() throws Exception {
+        IOException catalogFailure = new IOException("catalog close failed");
+        doThrow(catalogFailure).when(catalog).close();
+
+        UrsaDisklessTopicLifecycle lifecycle = lifecycle();
+        assertSame(catalogFailure, assertThrows(IOException.class, lifecycle::close));
+
+        verify(oxia).close();
     }
 
     @Test
@@ -270,7 +509,11 @@ class UrsaDisklessTopicLifecycleTest {
         assertNotEquals(first, second);
     }
 
-    private static StreamMetadata metadataWithPartitions(int partitions) {
+    private UrsaDisklessTopicLifecycle lifecycle() {
+        return new UrsaDisklessTopicLifecycle(catalog, oxia);
+    }
+
+    private static StreamMetadata metadata(int partitions) {
         StreamMetadata metadata = mock(StreamMetadata.class);
         when(metadata.partitioning()).thenReturn(indexedPartitions(partitions));
         return metadata;
@@ -281,6 +524,13 @@ class UrsaDisklessTopicLifecycleTest {
             Map<String, String> properties,
             LifecycleState state) {
         return new StreamCatalogEntry(identifier, state, properties, 1L);
+    }
+
+    private static StreamCatalogEntry managedEntry(String topicName, Uuid topicId, long sourceRevision) {
+        return entry(
+                KafkaStreamIdentity.streamIdentifier(topicName, topicId),
+                KafkaStreamIdentity.streamProperties(topicName, topicId, Map.of(), sourceRevision),
+                LifecycleState.ACTIVE);
     }
 
     private static Partitioning indexedPartitions(int partitions) {
