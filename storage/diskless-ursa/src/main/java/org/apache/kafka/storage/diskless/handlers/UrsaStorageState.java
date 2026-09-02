@@ -22,6 +22,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.server.config.ServerLogConfigs;
 import org.apache.kafka.storage.diskless.DisklessStorageStateOperations;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
@@ -30,6 +31,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -62,8 +64,6 @@ import io.oxia.client.api.AsyncOxiaClient;
 public class UrsaStorageState implements DisklessStorageStateOperations {
 
     private static final Logger log = LoggerFactory.getLogger(UrsaStorageState.class);
-    private static final long TOPIC_CONFIG_UPDATE_TIMEOUT_SECONDS = 30;
-    private static final long RETIRED_LOG_CLOSE_RETRY_MS = 1_000;
     private static final long SHUTDOWN_TIMEOUT_MS = 5_000;
 
     private final Time time;
@@ -73,14 +73,12 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final DisklessLogMetrics logMetrics = new DisklessLogMetrics();
 
     private final ConcurrentHashMap<TopicIdPartition, UrsaPartitionLog> partitionLogs = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UrsaPartitionLog, CompletableFuture<Void>> retiredPartitionLogs =
-            new ConcurrentHashMap<>();
 
     private final LakestreamStorageHolder lakestreamStorageHolder;
     private final StreamCatalog catalog;
     private final Supplier<AsyncOxiaClient> oxiaClientSupplier;
     private final ScheduledExecutorService producerStateScheduler;
-    /** One timer for every periodic and delayed task: retention checks, long polls, retired-log close retries. */
+    /** One timer for every periodic and delayed task: retention checks and long-poll timeouts. */
     private final ScheduledExecutorService disklessTimer;
     private final ScheduledFuture<?> retentionTask;
     private final Map<String, Object> logConfigDefaults;
@@ -93,10 +91,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final CompletableFuture<Void> producerStateCleanupDrain = new CompletableFuture<>();
     private int pendingProducerStateCleanups;
     private boolean producerStateCleanupRegistrationSealed;
-    private boolean shutdownInitialized;
-    private volatile boolean resourcesClosed;
-    private CompletableFuture<Void> shutdownDrain;
-    private CompletableFuture<Void> holderCloseAttempt;
+    private boolean resourcesClosed;
 
     /**
      * Creates UrsaStorageState for production use.
@@ -213,7 +208,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         return brokerId;
     }
 
-    /** The shared timer behind retention checks, long-poll timeouts and retired-log close retries. */
+    /** The shared timer behind retention checks and long-poll timeouts. */
     ScheduledExecutorService timer() {
         return disklessTimer;
     }
@@ -269,33 +264,12 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     }
 
     public void applyTopicConfig(String topicName, Uuid topicId, Map<String, String> topicConfig) {
-        try {
-            applyTopicConfigAsync(topicName, topicId, topicConfig)
-                    .get(TOPIC_CONFIG_UPDATE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while updating topic config for " + topicName, e);
-        } catch (ExecutionException e) {
-            throw new RuntimeException("Failed to update topic config for " + topicName, e.getCause());
-        } catch (TimeoutException e) {
-            throw new RuntimeException("Timed out after " + TOPIC_CONFIG_UPDATE_TIMEOUT_SECONDS
-                    + " seconds while updating topic config for " + topicName, e);
-        }
-    }
-
-    CompletableFuture<Void> applyTopicConfigAsync(
-            String topicName,
-            Uuid topicId,
-            Map<String, String> topicConfig
-    ) {
         if (topicName == null || topicId == null || topicConfig == null) {
-            return CompletableFuture.completedFuture(null);
+            return;
         }
-        Map<String, String> configSnapshot = Map.copyOf(topicConfig);
         // Kafka metadata is authoritative for broker-side retention. Catalog properties are
         // reconciled by the active controller's DisklessTopicLifecycleReconciler.
-        triggerRetentionForTopic(topicName, topicId, configSnapshot);
-        return CompletableFuture.completedFuture(null);
+        triggerRetentionForTopic(topicName, topicId, Map.copyOf(topicConfig));
     }
 
     public void fenceDeletedTopic(String topicName, Uuid topicId) {
@@ -313,30 +287,31 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         triggerRetentionForTopic(topicName, topicId, Map.of());
     }
 
+    /**
+     * The partition log for {@code tp}, opening one if this broker does not hold it yet. The common
+     * case - a partition that is already open - answers from the map without taking the lifecycle
+     * lock, so a produce or fetch never queues behind an open or a close.
+     */
     UrsaPartitionLog getOrCreatePartitionLog(TopicIdPartition tp) {
+        UrsaPartitionLog existing = partitionLogs.get(tp);
+        if (existing != null && !existing.initializationFailed()) {
+            return existing;
+        }
         synchronized (lifecycleLock) {
             if (closed.get()) {
                 throw new IllegalStateException("Ursa storage state is closed");
             }
-            UrsaPartitionLog partitionLog = partitionLogs.computeIfAbsent(tp,
-                    ignored -> new UrsaPartitionLog(
-                            tp,
-                            this,
-                            logMetrics,
-                            openLog(tp),
-                            oxiaClientSupplier,
-                            config.getProducerStateSnapshotIntervalMs(),
-                            config.getProducerStateSnapshotRecordThreshold(),
-                            producerStateScheduler));
-            // An already-failed open can complete in the constructor, before computeIfAbsent
-            // publishes the value and before the init callback can evict it. Remove it after
-            // publication so a subsequent request can retry.
+            UrsaPartitionLog partitionLog = partitionLogs.compute(tp, (key, current) ->
+                    current != null && !current.initializationFailed() ? current : newPartitionLog(key));
+            // An already-failed open completes in the constructor, before compute publishes the
+            // value and before the init callback can evict it. Remove it after publication so a
+            // subsequent request can retry.
             if (partitionLog.initializationFailed()) {
                 partitionLogs.remove(tp, partitionLog);
             } else {
                 try {
                     RetentionConfig retentionConfig = buildRetentionConfig(tp);
-                    partitionLog.triggerInitialRetention(
+                    partitionLog.retention().request(
                             retentionConfig.retentionMs(),
                             retentionConfig.retentionBytes());
                 } catch (Throwable error) {
@@ -344,6 +319,25 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
                 }
             }
             return partitionLog;
+        }
+    }
+
+    private UrsaPartitionLog newPartitionLog(TopicIdPartition tp) {
+        return new UrsaPartitionLog(
+                tp,
+                this,
+                logMetrics,
+                openLog(tp),
+                oxiaClientSupplier,
+                config.getProducerStateSnapshotIntervalMs(),
+                config.getProducerStateSnapshotRecordThreshold(),
+                producerStateScheduler);
+    }
+
+    /** Test-only hook: runs {@code task} while holding the lock that guards partition lifecycle. */
+    void withLifecycleLock(Runnable task) {
+        synchronized (lifecycleLock) {
+            task.run();
         }
     }
 
@@ -356,89 +350,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             return;
         }
         partitionLogs.remove(tp, partitionLog);
-    }
-
-    void trackRetiredPartitionLog(
-            UrsaPartitionLog partitionLog,
-            CompletableFuture<Void> closeAttempt) {
-        Objects.requireNonNull(partitionLog, "partitionLog must not be null");
-        Objects.requireNonNull(closeAttempt, "closeAttempt must not be null");
-        while (true) {
-            CompletableFuture<Void> current = retiredPartitionLogs.get(partitionLog);
-            if (current != null && !current.isDone()) {
-                return;
-            }
-            boolean installed = current == null
-                    ? retiredPartitionLogs.putIfAbsent(partitionLog, closeAttempt) == null
-                    : retiredPartitionLogs.replace(partitionLog, current, closeAttempt);
-            if (installed) {
-                observeRetiredPartitionLogClose(partitionLog, closeAttempt);
-                return;
-            }
-        }
-    }
-
-    private void observeRetiredPartitionLogClose(
-            UrsaPartitionLog partitionLog,
-            CompletableFuture<Void> closeAttempt) {
-        closeAttempt.whenComplete((ignored, error) -> {
-            if (error == null) {
-                retiredPartitionLogs.remove(partitionLog, closeAttempt);
-                return;
-            }
-            if (retiredPartitionLogs.get(partitionLog) != closeAttempt) {
-                return;
-            }
-            try {
-                disklessTimer.schedule(
-                        () -> retryRetiredPartitionLog(partitionLog, closeAttempt),
-                        RETIRED_LOG_CLOSE_RETRY_MS,
-                        TimeUnit.MILLISECONDS);
-            } catch (RuntimeException scheduleError) {
-                if (!resourcesClosed) {
-                    log.warn("Failed to schedule Log close retry for {}",
-                            partitionLog.topicIdPartition(), scheduleError);
-                }
-            }
-        });
-    }
-
-    private void retryRetiredPartitionLog(
-            UrsaPartitionLog partitionLog,
-            CompletableFuture<Void> previousAttempt) {
-        if (retiredPartitionLogs.get(partitionLog) != previousAttempt) {
-            return;
-        }
-        CompletableFuture<Void> retry = partitionLog.retryCloseLog();
-        if (retiredPartitionLogs.replace(partitionLog, previousAttempt, retry)) {
-            observeRetiredPartitionLogClose(partitionLog, retry);
-        }
-    }
-
-    void retryRetiredPartitionLogs() {
-        retiredPartitionLogs.forEach((partitionLog, attempt) -> {
-            if (attempt.isDone()) {
-                retryRetiredPartitionLog(partitionLog, attempt);
-            }
-        });
-    }
-
-    CompletableFuture<Void> runRetiredResourceClose(RetiredResourceClose closeOperation) {
-        try {
-            return CompletableFuture.runAsync(() -> {
-                try {
-                    closeOperation.close();
-                } catch (Throwable error) {
-                    throw new java.util.concurrent.CompletionException(error);
-                }
-            }, disklessTimer);
-        } catch (RuntimeException scheduleError) {
-            return CompletableFuture.failedFuture(scheduleError);
-        }
-    }
-
-    int retiredPartitionLogCount() {
-        return retiredPartitionLogs.size();
     }
 
     /**
@@ -465,7 +376,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         if (tp == null) {
             return false;
         }
-        retryRetiredPartitionLogs();
         synchronized (lifecycleLock) {
             if (closed.get()) {
                 return false;
@@ -473,8 +383,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             AtomicBoolean cleaned = new AtomicBoolean();
             partitionLogs.computeIfPresent(tp, (ignored, partitionLog) -> {
                 // Publish the local closed state while this key is still locked in the map. A
-                // concurrent computeIfAbsent can only install a new leased handle after the retired
-                // handle has stopped accepting broker requests.
+                // concurrent open can only install a new leased handle after the retired handle has
+                // stopped accepting broker requests.
                 partitionLog.close(deletePartition);
                 cleaned.set(true);
                 return null;
@@ -549,46 +459,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         return producerStateCleanupDrain;
     }
 
-    CompletableFuture<Log> maybeApplyRetention(Log logInstance, long retentionMs, long retentionBytes) {
-        return maybeApplyRetention(null, logInstance, retentionMs, retentionBytes)
-                .exceptionally(error -> {
-                    log.warn("Failed to apply retention to log {}", logInstance.id(), error);
-                    return logInstance;
-                });
-    }
-
-    CompletableFuture<Log> maybeApplyRetention(
-            UrsaPartitionLog owner,
-            Log logInstance,
-            long retentionMs,
-            long retentionBytes) {
-        if (retentionMs < 0 && retentionBytes < 0) {
-            return CompletableFuture.completedFuture(logInstance);
-        }
-        return logInstance.getLastOffset()
-                .thenCompose(lastOffset -> lastOffset == null || lastOffset.offset() < 0
-                        ? CompletableFuture.completedFuture(-1L)
-                        : logInstance.computeRetentionTrimOffset(
-                                lastOffset.offset(), retentionMs, retentionBytes))
-                .thenCompose(trimOffset -> maybeTrim(owner, logInstance, trimOffset));
-    }
-
-    private CompletableFuture<Log> maybeTrim(UrsaPartitionLog owner, Log logInstance, long trimOffset) {
-        if (trimOffset < 0) {
-            return CompletableFuture.completedFuture(logInstance);
-        }
-        return logInstance.getFirstOffset()
-                .thenCompose(firstOffset -> {
-                    if (firstOffset == null || firstOffset.offset() < 0 || trimOffset < firstOffset.offset()) {
-                        return CompletableFuture.completedFuture(logInstance);
-                    }
-                    if (owner != null) {
-                        return owner.softTrimIfActive(logInstance, trimOffset);
-                    }
-                    return logInstance.softTrim(trimOffset).thenApply(ignored -> logInstance);
-                });
-    }
-
     private RetentionConfig buildRetentionConfig(TopicIdPartition tp) {
         Map<String, String> topicConfigs = null;
         if (topicConfigSupplier != null) {
@@ -631,7 +501,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         partitionLogs.forEach((tp, partitionLog) -> {
             try {
                 RetentionConfig retentionConfig = buildRetentionConfig(tp);
-                partitionLog.triggerRetention(retentionConfig.retentionMs(), retentionConfig.retentionBytes());
+                partitionLog.retention().request(
+                        retentionConfig.retentionMs(), retentionConfig.retentionBytes());
             } catch (Throwable error) {
                 log.warn("Failed to schedule retention for {}", tp, error);
             }
@@ -647,7 +518,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             RetentionConfig retentionConfig = buildRetentionConfig(topicConfig);
             partitionLogs.forEach((tp, partitionLog) -> {
                 if (tp.topic().equals(topicName) && tp.topicId().equals(topicId)) {
-                    partitionLog.triggerRetention(retentionConfig.retentionMs(), retentionConfig.retentionBytes());
+                    partitionLog.retention().request(
+                            retentionConfig.retentionMs(), retentionConfig.retentionBytes());
                 }
             });
         } catch (Throwable error) {
@@ -691,111 +563,48 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         close(SHUTDOWN_TIMEOUT_MS);
     }
 
-    void close(long timeoutMs) throws IOException {
+    /**
+     * Retires every partition log and then releases the shared resources. The wait is bounded: a
+     * partition log that does not settle within {@code timeoutMs} is logged and left behind rather
+     * than allowed to hold the catalog, the Oxia client and the schedulers open.
+     */
+    void close(long timeoutMs) {
         if (timeoutMs <= 0) {
             throw new IllegalArgumentException("timeoutMs must be greater than zero");
         }
-        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         synchronized (shutdownLock) {
             if (resourcesClosed) {
                 return;
             }
-            initializeShutdown();
-            awaitShutdownStage(shutdownDrain, deadlineNanos, "partition and producer-state cleanup");
-
-            if (lakestreamStorageHolder != null) {
-                if (holderCloseAttempt == null
-                        || holderCloseAttempt.isCompletedExceptionally()
-                        || holderCloseAttempt.isCancelled()) {
-                    holderCloseAttempt = runRetiredResourceClose(lakestreamStorageHolder::close);
+            List<CompletableFuture<Void>> drains = new ArrayList<>();
+            synchronized (lifecycleLock) {
+                if (closed.compareAndSet(false, true)) {
+                    retentionTask.cancel(false);
                 }
-                try {
-                    awaitShutdownStage(holderCloseAttempt, deadlineNanos, "Ursa storage resources");
-                } catch (IOException closeError) {
-                    if (holderCloseAttempt.isDone()) {
-                        holderCloseAttempt = null;
-                    }
-                    throw closeError;
-                }
+                partitionLogs.values().forEach(partitionLog -> drains.add(partitionLog.close(false)));
             }
-
-            shutdownScheduler(producerStateScheduler, deadlineNanos, "producer-state scheduler");
-            // Last: the timer also runs the retired-resource closes awaited above.
-            shutdownScheduler(disklessTimer, deadlineNanos, "diskless timer");
-            retiredPartitionLogs.clear();
-            resourcesClosed = true;
+            // Cleanups started by an earlier cleanupPartition are no longer reachable through a
+            // partition log, so they are drained separately.
+            drains.add(sealProducerStateCleanups());
+            try {
+                CompletableFuture.allOf(drains.toArray(new CompletableFuture<?>[0]))
+                        .get(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException | ExecutionException error) {
+                log.warn("Diskless partition logs did not close within {} ms", timeoutMs, error);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            } finally {
+                partitionLogs.clear();
+                Utils.closeQuietly(lakestreamStorageHolder, "Ursa storage resources");
+                shutdownScheduler(disklessTimer);
+                shutdownScheduler(producerStateScheduler);
+                resourcesClosed = true;
+            }
         }
     }
 
-    private void initializeShutdown() {
-        if (shutdownInitialized) {
-            return;
-        }
-        List<UrsaPartitionLog> partitionLogsToClose;
-        synchronized (lifecycleLock) {
-            if (closed.compareAndSet(false, true)) {
-                retentionTask.cancel(false);
-            }
-            LinkedHashSet<UrsaPartitionLog> logsToClose = new LinkedHashSet<>(partitionLogs.values());
-            logsToClose.addAll(retiredPartitionLogs.keySet());
-            partitionLogsToClose = List.copyOf(logsToClose);
-            partitionLogs.clear();
-        }
-        List<CompletableFuture<Void>> closeDrains = new java.util.ArrayList<>(partitionLogsToClose.size() + 1);
-        partitionLogsToClose.forEach(partitionLog -> closeDrains.add(partitionLog.close(false)));
-        retryRetiredPartitionLogs();
-        closeDrains.add(sealProducerStateCleanups());
-        shutdownDrain = CompletableFuture.allOf(closeDrains.toArray(new CompletableFuture<?>[0]));
-        shutdownInitialized = true;
-    }
-
-    private static void awaitShutdownStage(
-            CompletableFuture<Void> stage,
-            long deadlineNanos,
-            String description) throws IOException {
-        long remainingNanos = deadlineNanos - System.nanoTime();
-        if (remainingNanos <= 0) {
-            throw new IOException("Timed out while closing " + description);
-        }
-        try {
-            stage.get(remainingNanos, TimeUnit.NANOSECONDS);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while closing " + description, interrupted);
-        } catch (ExecutionException executionError) {
-            Throwable cause = executionError.getCause();
-            if (cause instanceof IOException ioException) {
-                throw ioException;
-            }
-            throw new IOException("Failed to close " + description, cause);
-        } catch (TimeoutException timeout) {
-            throw new IOException("Timed out while closing " + description, timeout);
-        }
-    }
-
-    private static void shutdownScheduler(
-            ScheduledExecutorService scheduler,
-            long deadlineNanos,
-            String description) throws IOException {
-        scheduler.shutdown();
-        long remainingNanos = Math.max(0L, deadlineNanos - System.nanoTime());
-        try {
-            if (!scheduler.awaitTermination(remainingNanos, TimeUnit.NANOSECONDS)) {
-                scheduler.shutdownNow();
-                if (!scheduler.isTerminated()) {
-                    throw new IOException("Timed out while closing " + description);
-                }
-            }
-        } catch (InterruptedException e) {
-            scheduler.shutdownNow();
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while closing " + description, e);
-        }
-    }
-
-    @FunctionalInterface
-    interface RetiredResourceClose {
-        void close() throws Exception;
+    private static void shutdownScheduler(ScheduledExecutorService scheduler) {
+        scheduler.shutdownNow();
     }
 
     CompletableFuture<Log> openLog(TopicIdPartition tp) {

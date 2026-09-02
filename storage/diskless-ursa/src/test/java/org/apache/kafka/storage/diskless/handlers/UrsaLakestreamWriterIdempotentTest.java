@@ -151,7 +151,7 @@ class UrsaLakestreamWriterIdempotentTest {
             assertEquals(1, prepareAppendCalls.get(), "The second write should still be queued");
             assertEquals(2, partitionLog.ownedWritePayloadCount());
 
-            partitionLog.close();
+            partitionLog.close(false);
             assertEquals(0, partitionLog.ownedWritePayloadCount());
             releaseFirstPrepare.countDown();
 

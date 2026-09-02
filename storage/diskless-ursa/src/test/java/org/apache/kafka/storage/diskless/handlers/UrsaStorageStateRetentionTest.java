@@ -27,12 +27,9 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
-import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.function.BiFunction;
 import java.util.stream.LongStream;
 
 import io.lakestream.api.Log;
@@ -44,14 +41,13 @@ import io.lakestream.api.StreamLayout;
 import io.lakestream.api.StreamMetadata;
 
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class UrsaStorageStateRetentionTest {
@@ -69,110 +65,6 @@ class UrsaStorageStateRetentionTest {
             assertSame(logInstance, result);
             verify(logInstance, never()).getLastOffset();
             verify(logInstance, never()).computeRetentionTrimOffset(anyLong(), anyLong(), anyLong());
-            verify(logInstance, never()).softTrim(anyLong());
-        }
-    }
-
-    @Test
-    void testDisabledRetentionDoesNotInspectLog() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Log logInstance = mock(Log.class);
-
-        try (UrsaStorageState state = newState(catalog)) {
-            assertSame(logInstance, state.maybeApplyRetention(logInstance, -1L, -1L).get(5, TimeUnit.SECONDS));
-            verifyNoInteractions(logInstance);
-        }
-    }
-
-    @Test
-    void testRetentionTrimAppliedAtComputedOffset() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Log logInstance = mock(Log.class);
-        LogOffset lastOffset = mockOffset(42L);
-        LogOffset firstOffset = mockOffset(5L);
-        long retentionMs = 120_000L;
-        long retentionBytes = 2L * 1024 * 1024;
-
-        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
-        when(logInstance.computeRetentionTrimOffset(42L, retentionMs, retentionBytes))
-                .thenReturn(CompletableFuture.completedFuture(10L));
-        when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
-        when(logInstance.softTrim(10L)).thenReturn(CompletableFuture.completedFuture(null));
-
-        try (UrsaStorageState state = newState(catalog)) {
-            assertSame(
-                    logInstance,
-                    state.maybeApplyRetention(logInstance, retentionMs, retentionBytes).get(5, TimeUnit.SECONDS));
-            verify(logInstance).softTrim(10L);
-        }
-    }
-
-    @Test
-    void testRetentionTrimBeforeCurrentStartIsSkipped() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Log logInstance = mock(Log.class);
-        LogOffset lastOffset = mockOffset(42L);
-        LogOffset firstOffset = mockOffset(5L);
-
-        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
-        when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
-                .thenReturn(CompletableFuture.completedFuture(4L));
-        when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
-
-        try (UrsaStorageState state = newState(catalog)) {
-            assertSame(
-                    logInstance,
-                    state.maybeApplyRetention(logInstance, 120_000L, -1L).get(5, TimeUnit.SECONDS));
-            verify(logInstance, never()).softTrim(4L);
-        }
-    }
-
-    @Test
-    void testRetentionFailureDoesNotFailLogOpen() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Log logInstance = mock(Log.class);
-        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.failedFuture(new RuntimeException("boom")));
-
-        try (UrsaStorageState state = newState(catalog)) {
-            assertSame(
-                    logInstance,
-                    state.maybeApplyRetention(logInstance, 120_000L, -1L).get(5, TimeUnit.SECONDS));
-            verify(logInstance, never()).computeRetentionTrimOffset(anyLong(), anyLong(), anyLong());
-            verify(logInstance, never()).softTrim(anyLong());
-        }
-    }
-
-    @Test
-    void testEmptyLogSkipsRetentionComputation() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Log logInstance = mock(Log.class);
-        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(LogOffset.NOT_FOUND));
-
-        try (UrsaStorageState state = newState(catalog)) {
-            assertSame(
-                    logInstance,
-                    state.maybeApplyRetention(logInstance, 120_000L, -1L).get(5, TimeUnit.SECONDS));
-            verify(logInstance, never()).computeRetentionTrimOffset(anyLong(), anyLong(), anyLong());
-            verify(logInstance, never()).getFirstOffset();
-            verify(logInstance, never()).softTrim(anyLong());
-        }
-    }
-
-    @Test
-    void testMissingFirstOffsetSkipsTrim() throws Exception {
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Log logInstance = mock(Log.class);
-        LogOffset lastOffset = mockOffset(42L);
-
-        when(logInstance.getLastOffset()).thenReturn(CompletableFuture.completedFuture(lastOffset));
-        when(logInstance.computeRetentionTrimOffset(42L, 120_000L, -1L))
-                .thenReturn(CompletableFuture.completedFuture(10L));
-        when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(null));
-
-        try (UrsaStorageState state = newState(catalog)) {
-            assertSame(
-                    logInstance,
-                    state.maybeApplyRetention(logInstance, 120_000L, -1L).get(5, TimeUnit.SECONDS));
             verify(logInstance, never()).softTrim(anyLong());
         }
     }
@@ -244,7 +136,7 @@ class UrsaStorageStateRetentionTest {
                         ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG, 60_000L),
                 ignored -> Map.of())) {
             state.getOrCreatePartitionLog(tp);
-            state.applyTopicConfigAsync(tp.topic(), tp.topicId(), updatedConfig).get(5, TimeUnit.SECONDS);
+            state.applyTopicConfig(tp.topic(), tp.topicId(), updatedConfig);
 
             verify(logInstance).softTrim(10L);
         }
@@ -257,15 +149,7 @@ class UrsaStorageStateRetentionTest {
         Log logInstance = mock(Log.class);
         LogOffset firstOffset = mockOffset(5L);
         LogOffset lastOffset = mockOffset(42L);
-        CountDownLatch trimAwaited = new CountDownLatch(1);
-        CompletableFuture<Long> trimResult = new CompletableFuture<>() {
-            @Override
-            public <U> CompletableFuture<U> handle(
-                    BiFunction<? super Long, Throwable, ? extends U> function) {
-                trimAwaited.countDown();
-                return super.handle(function);
-            }
-        };
+        CompletableFuture<Long> trimResult = new CompletableFuture<>();
 
         stubCatalogLog(catalog, tp, logInstance);
         when(logInstance.getFirstOffset()).thenReturn(CompletableFuture.completedFuture(firstOffset));
@@ -289,24 +173,16 @@ class UrsaStorageStateRetentionTest {
             state.getOrCreatePartitionLog(tp);
             verify(logInstance).softTrim(10L);
 
-            CompletableFuture<Boolean> cleanupFuture = CompletableFuture.supplyAsync(
-                    () -> state.cleanupPartition(tp, false));
-            assertTrue(trimAwaited.await(5, TimeUnit.SECONDS));
-            assertTrue(cleanupFuture.get(5, TimeUnit.SECONDS));
-            verify(logInstance, never()).close();
-            assertThrows(IOException.class, () -> state.close(100L));
-            verify(logInstance, never()).close();
+            // The trim is still in flight, so the caller returns while the handle stays open.
+            assertTrue(state.cleanupPartition(tp, false));
+            verify(logInstance, never()).closeAsync();
 
             trimResult.complete(11L);
-            state.close(5_000L);
-            org.apache.kafka.test.TestUtils.waitForCondition(
-                    () -> state.retiredPartitionLogCount() == 0,
-                    5_000,
-                    "Expected Log close after the in-flight trim settled");
 
+            verify(logInstance, timeout(5_000)).closeAsync();
             InOrder closeOrder = inOrder(logInstance);
             closeOrder.verify(logInstance).softTrim(10L);
-            closeOrder.verify(logInstance).close();
+            closeOrder.verify(logInstance).closeAsync();
             verify(logInstance, never()).fence();
         }
     }

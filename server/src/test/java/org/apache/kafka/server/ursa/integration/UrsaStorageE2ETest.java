@@ -1120,15 +1120,27 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         Object logInstance = ((CompletableFuture<?>) logFuture)
                 .get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
+        // Retention lives in PartitionRetention now and is coalesced and asynchronous, so the trim
+        // is driven straight through the Log handle to keep this check deterministic.
         Class<?> logClass = Class.forName(
                 "io.lakestream.api.Log",
                 true,
                 logInstance.getClass().getClassLoader());
-        var trimMethod = state.getClass()
-                .getDeclaredMethod("maybeApplyRetention", logClass, long.class, long.class);
-        trimMethod.setAccessible(true);
-        Object trimFuture = trimMethod.invoke(state, logInstance, 1L, -1L);
-        ((CompletableFuture<?>) trimFuture).get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        Object lastOffset = awaitFuture(logClass.getMethod("getLastOffset").invoke(logInstance));
+        long lastOffsetValue = (long) lastOffset.getClass().getMethod("offset").invoke(lastOffset);
+        assertTrue(lastOffsetValue >= 0, "Expected the partition to hold records before trimming");
+
+        Object trimOffset = awaitFuture(logClass
+                .getMethod("computeRetentionTrimOffset", long.class, long.class, long.class)
+                .invoke(logInstance, lastOffsetValue, 1L, -1L));
+        long trimOffsetValue = ((Number) trimOffset).longValue();
+        assertTrue(trimOffsetValue >= 0, "Expected retention to select a trim offset");
+
+        awaitFuture(logClass.getMethod("softTrim", long.class).invoke(logInstance, trimOffsetValue));
+    }
+
+    private static Object awaitFuture(Object future) throws Exception {
+        return ((CompletableFuture<?>) future).get(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     private static Object unwrapUrsaStorageState(Object ursaStateOrEngine) throws Exception {

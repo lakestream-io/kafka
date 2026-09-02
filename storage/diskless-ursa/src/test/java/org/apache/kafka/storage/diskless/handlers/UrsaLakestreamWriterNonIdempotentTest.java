@@ -99,10 +99,10 @@ class UrsaLakestreamWriterNonIdempotentTest {
                 tp,
                 CompletableFuture.completedFuture(logInstance));
 
-        partitionLog.close();
+        partitionLog.close(false);
 
         verify(logInstance, never()).fence();
-        verify(logInstance, timeout(5_000)).close();
+        verify(logInstance, timeout(5_000)).closeAsync();
     }
 
     @Test
@@ -115,7 +115,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
                 Compression.NONE,
                 new SimpleRecord("after-close".getBytes(StandardCharsets.UTF_8)));
 
-        partitionLog.close();
+        partitionLog.close(false);
 
         PartitionResponse response = partitionLog.write(
                 records,
@@ -171,7 +171,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
             assertEquals(Errors.INVALID_RECORD, response.error);
             verify(logInstance, never()).append(anyInt(), any(ByteBuf.class));
         } finally {
-            partitionLog.close();
+            partitionLog.close(false);
         }
     }
 
@@ -202,9 +202,9 @@ class UrsaLakestreamWriterNonIdempotentTest {
 
         verify(replacementLog, never()).fence();
         verify(staleLog, never()).fence();
-        verify(staleLog, timeout(5_000)).close();
+        verify(staleLog, timeout(5_000)).closeAsync();
 
-        replacementPartitionLog.close();
+        replacementPartitionLog.close(false);
     }
 
     @Test
@@ -383,7 +383,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
             assertArrayEquals(expectedQueuedPayload, secondAppendedPayload.get());
             assertEquals(0, partitionLog.ownedWritePayloadCount());
         } finally {
-            partitionLog.close();
+            partitionLog.close(false);
         }
     }
 
@@ -413,7 +413,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
             assertEquals(0, appendedBuffer.get().refCnt());
             assertEquals(0, partitionLog.ownedWritePayloadCount());
         } finally {
-            partitionLog.close();
+            partitionLog.close(false);
         }
     }
 
@@ -437,7 +437,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
             assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, response.error);
             verify(state).removePartitionLog(eq(tp), same(partitionLog));
             verify(logInstance, never()).fence();
-            verify(logInstance, timeout(5_000)).close();
+            verify(logInstance, timeout(5_000)).closeAsync();
         } finally {
             writer.close();
         }

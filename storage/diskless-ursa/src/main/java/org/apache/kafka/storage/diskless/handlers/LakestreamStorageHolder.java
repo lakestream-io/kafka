@@ -865,6 +865,32 @@ final class LakestreamStorageHolder implements Closeable {
                 return;
             }
             delegate.close();
+            markClosed();
+        }
+
+        /**
+         * Forwards the asynchronous close instead of inheriting the interface default, which would
+         * run the blocking {@link #close()} on the caller's thread. A handle that fails to close
+         * stays tracked, so the drain at holder close still retries it.
+         */
+        @Override
+        public CompletableFuture<Void> closeAsync() {
+            synchronized (this) {
+                if (closed) {
+                    return CompletableFuture.completedFuture(null);
+                }
+            }
+            return delegate.closeAsync().whenComplete((ignored, error) -> {
+                if (error == null) {
+                    markClosed();
+                }
+            });
+        }
+
+        private synchronized void markClosed() {
+            if (closed) {
+                return;
+            }
             closed = true;
             onClosed.accept(this);
         }

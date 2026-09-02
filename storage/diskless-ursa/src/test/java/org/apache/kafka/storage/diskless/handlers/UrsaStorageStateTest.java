@@ -28,11 +28,9 @@ import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateManager;
 import org.apache.kafka.storage.internals.log.LogMetricNames;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
-import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.Test;
 
-import java.io.IOException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -54,16 +52,15 @@ import io.oxia.client.api.AsyncOxiaClient;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -83,8 +80,8 @@ class UrsaStorageStateTest {
         CountDownLatch closeLatch = new CountDownLatch(1);
         doAnswer(invocation -> {
             closeLatch.countDown();
-            return null;
-        }).when(log1).close();
+            return CompletableFuture.completedFuture(null);
+        }).when(log1).closeAsync();
 
         AtomicInteger openCount = new AtomicInteger();
         stubCatalogLayout(catalog);
@@ -109,40 +106,63 @@ class UrsaStorageStateTest {
     }
 
     @Test
-    void testTransientLogCloseFailureIsRetainedAndRetriedBeforeReopen() throws Exception {
-        TopicIdPartition tp = new TopicIdPartition(
-                Uuid.randomUuid(), new TopicPartition("close-retry-topic", 0));
-        StreamCatalog catalog = mock(StreamCatalog.class);
-        Log firstLog = mockLog(0L, 0L, 1, 10L, 10, 10L, 10);
-        Log replacementLog = mockLog(0L, 0L, 1, 10L, 10, 10L, 10);
-        doThrow(new IOException("temporary lease release failure"))
-                .doNothing()
-                .when(firstLog)
-                .close();
-        stubCatalogLayout(catalog);
-        when(catalog.openLog(any(), any()))
-                .thenReturn(CompletableFuture.completedFuture(firstLog))
-                .thenReturn(CompletableFuture.completedFuture(replacementLog));
+    void testGetOrCreatePartitionLogDoesNotLockForExistingLog() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("lock-free-topic", 0));
+        StreamCatalog catalog = mockCatalogWithLog(mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
 
         try (UrsaStorageState state = newState(catalog)) {
-            UrsaPartitionLog first = state.getOrCreatePartitionLog(tp);
+            UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
 
-            assertTrue(state.cleanupPartition(tp));
-            assertNull(state.partitionLog(tp));
-            assertEquals(1, state.retiredPartitionLogCount());
-
-            TestUtils.waitForCondition(
-                    () -> state.retiredPartitionLogCount() == 0,
-                    5_000,
-                    "Expected the failed leased Log close to be retried in the background");
-            verify(firstLog, times(2)).close();
-            verify(firstLog, never()).fence();
-
-            UrsaPartitionLog replacement = state.getOrCreatePartitionLog(tp);
-            assertNotSame(first, replacement);
-            assertSame(replacement, state.partitionLog(tp));
-            verify(catalog, times(2)).openLog(any(), any());
+            CountDownLatch lockHeld = new CountDownLatch(1);
+            CountDownLatch releaseLock = new CountDownLatch(1);
+            CompletableFuture<Void> lockHolder = CompletableFuture.runAsync(() ->
+                    state.withLifecycleLock(() -> {
+                        lockHeld.countDown();
+                        try {
+                            assertTrue(releaseLock.await(5, TimeUnit.SECONDS));
+                        } catch (InterruptedException error) {
+                            Thread.currentThread().interrupt();
+                            throw new RuntimeException(error);
+                        }
+                    }));
+            try {
+                assertTrue(lockHeld.await(5, TimeUnit.SECONDS));
+                CompletableFuture<UrsaPartitionLog> lookup =
+                        CompletableFuture.supplyAsync(() -> state.getOrCreatePartitionLog(tp));
+                assertSame(partitionLog, lookup.get(1, TimeUnit.SECONDS));
+            } finally {
+                releaseLock.countDown();
+                lockHolder.get(5, TimeUnit.SECONDS);
+            }
         }
+    }
+
+    @Test
+    void testCloseAlwaysClosesHolderEvenIfPartitionCloseHangs() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("close-hang-topic", 0));
+        Log logInstance = mockLog(0L, 0L, 1, 10L, 10, 10L, 10);
+        when(logInstance.closeAsync()).thenReturn(new CompletableFuture<>());
+        StreamCatalog catalog = mockCatalogWithLog(logInstance);
+        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
+        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, oxiaClient);
+        UrsaStorageState state = new UrsaStorageState(
+                Time.SYSTEM,
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                holder,
+                Map.of(),
+                null);
+        ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
+        when(producerStateManager.cleanup(false)).thenReturn(new CompletableFuture<>());
+        state.getOrCreatePartitionLog(tp).installProducerStateManager(
+                DisklessClientZone.NO_ZONE, producerStateManager);
+
+        state.close(200L);
+
+        verify(catalog).close();
+        verify(oxiaClient).close();
+        assertTrue(state.timer().isShutdown());
     }
 
     @Test
@@ -231,39 +251,6 @@ class UrsaStorageStateTest {
     }
 
     @Test
-    void testStateCloseTimeoutKeepsResourcesForRetry() throws Exception {
-        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("close-timeout-topic", 0));
-        CompletableFuture<Void> cleanupGate = new CompletableFuture<>();
-        ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
-        when(producerStateManager.cleanup(false)).thenReturn(cleanupGate);
-        StreamCatalog catalog = mockCatalogWithLog(mockLog(0L, 0L, 1, 10L, 10, 10L, 10));
-        AsyncOxiaClient oxiaClient = mock(AsyncOxiaClient.class);
-        LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, oxiaClient);
-        UrsaStorageState state = new UrsaStorageState(
-                Time.SYSTEM,
-                1,
-                mock(UrsaStorageConfig.class),
-                mock(BrokerTopicStats.class),
-                holder,
-                Map.of(),
-                null);
-
-        UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
-        partitionLog.installProducerStateManager(DisklessClientZone.NO_ZONE, producerStateManager);
-
-        IOException timeout = assertThrows(IOException.class, () -> state.close(100L));
-        assertTrue(timeout.getMessage().contains("Timed out"));
-        verify(catalog, never()).close();
-        verify(oxiaClient, never()).close();
-
-        cleanupGate.complete(null);
-        state.close(5_000L);
-
-        verify(catalog).close();
-        verify(oxiaClient).close();
-    }
-
-    @Test
     void testStateCloseReleasesResourcesAfterProducerStateCleanupFailure() throws Exception {
         TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("close-failure-topic", 0));
         ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
@@ -341,7 +328,7 @@ class UrsaStorageStateTest {
             closeFuture.get(5, TimeUnit.SECONDS);
 
             assertTrue(state.snapshotTrackedPartitions().isEmpty());
-            verify(logInstance).close();
+            verify(logInstance, timeout(5_000)).closeAsync();
         } finally {
             allowOpen.countDown();
             state.close();
@@ -498,8 +485,8 @@ class UrsaStorageStateTest {
         CountDownLatch firstCloseLatch = new CountDownLatch(1);
         doAnswer(invocation -> {
             firstCloseLatch.countDown();
-            return null;
-        }).when(firstLog).close();
+            return CompletableFuture.completedFuture(null);
+        }).when(firstLog).closeAsync();
 
         AtomicInteger openCount = new AtomicInteger();
         CompletableFuture<Log> firstOpenFuture = new CompletableFuture<>();
@@ -624,7 +611,7 @@ class UrsaStorageStateTest {
                 holder,
                 Map.of(),
                 ignored -> Map.of())) {
-            state.applyTopicConfigAsync(tp.topic(), tp.topicId(), latestConfig).get();
+            state.applyTopicConfig(tp.topic(), tp.topicId(), latestConfig);
 
             verifyNoInteractions(catalog);
         }

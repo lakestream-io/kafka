@@ -286,7 +286,7 @@ class UrsaLakestreamReaderTest {
 
             verify(lateEntry, timeout(5_000)).close();
         } finally {
-            partitionLog.close();
+            partitionLog.close(false);
         }
     }
 
@@ -464,7 +464,7 @@ class UrsaLakestreamReaderTest {
         partitionLog.close(false).get(5, TimeUnit.SECONDS);
 
         verify(cursor).close();
-        verify(logInstance).close();
+        verify(logInstance).closeAsync();
     }
 
     @Test
@@ -673,7 +673,7 @@ class UrsaLakestreamReaderTest {
             assertEquals(1L, result.get(appended).highWatermark);
             assertTrue(timer.getQueue().isEmpty(), "Long-poll timeouts must be cancelled with the request");
         } finally {
-            appendedPartitionLog.close();
+            appendedPartitionLog.close(false);
         }
     }
 
@@ -715,7 +715,7 @@ class UrsaLakestreamReaderTest {
             assertEquals(1, countRecords(response.records));
             assertTrue(timer.getQueue().isEmpty(), "Long-poll timeouts must be cancelled with the request");
         } finally {
-            partitionLog.close();
+            partitionLog.close(false);
         }
     }
 
