@@ -182,10 +182,15 @@ In this LIP, diskless topics are handled by the Lakestream-backed implementation
 |-----------|----------------|
 | `DisklessStorageReplicaManagerSupport` | Entry point; partitions requests between diskless and classic paths |
 | `UrsaLakestreamWriter` | Write path for diskless topics; appends records to a Lakestream log |
-| `UrsaLakestreamReader` | Read path for diskless topics; handles Fetch and ListOffsets via a Lakestream log |
+| `UrsaLakestreamReader` | Read path for diskless topics; fans Fetch and ListOffsets out over partitions and decides the request-level long poll |
 | `UrsaStorageState` | Manages partition LogId handles, offset tracking, and shared state |
+| `UrsaPartitionLog` | One diskless partition: the Lakestream log handle, its writer, reader and retention, and the storage-error mapping |
+| `PartitionWriter` | Per-partition write path: validation, per-partition ordering, payload ownership, the append, and the long-poll wake-up |
+| `PartitionReader` | Per-partition read path: the cached fetch cursor, and the ListOffsets lookups |
+| `PartitionRetention` | Per-partition retention: coalesces trim requests and drives them against the log |
 | `ProducerStateManager` | Validates idempotent producer sequences and persists snapshots to Oxia |
-| `DisklessTopicLifecycleReconciler` | Active-controller reconciler: ensures/deletes diskless topics from metadata deltas and sweeps orphans on a configurable interval |
+| `DisklessTopicLifecycle` | Controller-side SPI for one topic's storage: `ensureTopic`, `deleteTopic`, `listManagedTopics`, `sweepOrphans` |
+| `DisklessTopicLifecycleReconciler` | Active-controller reconciler: drives `DisklessTopicLifecycle` towards the metadata image and sweeps orphans on a configurable interval |
 | `UrsaStorageConfig` | Configuration holder for Ursa settings |
 | `MetadataCacheDisklessStorageView` | Determines if a topic is diskless based on topic config |
 | `ListOffsetsPartitionRequest` | Request DTO for diskless ListOffsets operations |
@@ -196,10 +201,10 @@ In this LIP, diskless topics are handled by the Lakestream-backed implementation
 | Actor | Responsibility |
 |---|---|
 | Broker | Opens a partition with create-if-absent: `openLog(id, p)`; on `NoSuchStreamException` calls `createStream` with the topic's partition count and identity properties, on "partition not in layout" calls `increasePartitions`, then opens again. Retries once on `AlreadyExistsException`. |
-| Active controller | Reconciles properties, partition growth, deletion, and orphan cleanup through one `DisklessTopicLifecycle`. |
+| Active controller | Reconciles properties, partition growth, deletion, and orphan cleanup through one `DisklessTopicLifecycle`. The reconciler records each topic's desired state from the metadata image and drives it on its own executor, retrying with backoff until it succeeds or the desired state changes; operations are therefore idempotent and safe to overlap. |
 | Ursa provider | Fans a lifecycle call out to the catalog and to producer-state cleanup. The controller never sees two stores. |
 
-**Producer State**: Producer state keeps only `producer-state-snapshot/<topicId>-<partition>[/<zone>]` keys and a `producer-state-deleted/<topicId>` fence. Deletion is fence then range delete, and a periodic sweep on the active controller removes leftovers.
+**Producer State**: Producer state keeps only `producer-state-snapshot/<topicId>-<partition>[/<zone>]` keys and a `producer-state-snapshot-deleted/<topicId>` fence. Deletion writes the fence first, so a broker claiming a snapshot cannot recreate one behind the delete; then a range delete over the unzoned prefix; then a per-key delete of the zoned snapshots enumerated through the `producer-state-snapshot-topic` secondary index, because Oxia compares keys one path segment at a time and no fixed range bound covers a zone of arbitrary depth. A periodic sweep on the active controller removes whatever a claim recreated inside its own fence-read window.
 
 #### Write Path (Produce)
 
@@ -363,11 +368,11 @@ ReplicaManager.fetchOffset()
        │         │                   │
        │         │                   ├──▶ LATEST (-1): Log.getLastOffset() → HWM
        │         │                   │
-       │         │                   ├──▶ MAX_TIMESTAMP (-3): scan Kafka record timestamps
+       │         │                   ├──▶ MAX_TIMESTAMP (-3): last entry header (offset + write time)
        │         │                   │
        │         │                   ├──▶ LATEST_TIERED (-5): return -1 (N/A)
        │         │                   │
-       │         │                   └──▶ timestamp >= 0: scan Kafka records from the first offset
+       │         │                   └──▶ timestamp >= 0: binary search entry headers, then scan forward
        │         │
        │         └──▶ NO: fetchOffsetClassic() (local log)
        │
@@ -381,10 +386,10 @@ ReplicaManager.fetchOffset()
 |-----------------|---------|-------------------|
 | `-2` (EARLIEST) | First available offset | Returns the first available Lakestream log offset |
 | `-1` (LATEST) | High watermark | Returns the end offset derived from the last Lakestream log offset and record count |
-| `-3` (MAX_TIMESTAMP) | Offset with highest timestamp | Scans record timestamps and returns the maximum timestamp and its Kafka offset |
+| `-3` (MAX_TIMESTAMP) | Offset with highest timestamp | Answers from the last entry's header alone: its base offset and its write timestamp (see **Limitations**) |
 | `-4` (EARLIEST_LOCAL) | First local offset | Same as EARLIEST for diskless (no local/remote distinction) |
 | `-5` (LATEST_TIERED) | End of tiered storage | Returns -1 (not applicable for diskless) |
-| `>= 0` | First offset with timestamp >= value | Scans Kafka records from the first available log offset |
+| `>= 0` | First offset with timestamp >= value | Binary searches entry headers, then reads forward over at most 256 entries |
 
 **Key Implementation Details**:
 
@@ -394,7 +399,7 @@ ReplicaManager.fetchOffset()
 
 2. **EARLIEST/LATEST Optimization**: EARLIEST/LATEST are served from the first and last Lakestream log offsets.
 
-3. **Timestamp Search**: Opens an ephemeral Lakestream cursor at the first available offset and scans Kafka record timestamps. The broker does not depend on a provider-specific publish-time index.
+3. **Timestamp Search**: Binary searches the Lakestream entry headers for the last entry whose write time predates the target, then decodes entries forward from it until one holds a record at or after the target. A record's create time is never newer than the write time of the entry carrying it, which is what lets the binary search skip everything before that point; past it the records can lag their headers by any amount, so the forward scan is bounded at 256 entries. Exhausting the bound answers with the base offset and write time of the earliest scanned entry written at or after the target -- at or before the true answer, never past it, so a consumer seeking there re-reads a little rather than skipping records. No cursor is opened, and the broker does not depend on a provider-specific publish-time index.
 
 4. **Async Execution**: All ListOffsets operations return `CompletableFuture` to avoid blocking request handler threads.
 
@@ -441,7 +446,8 @@ No changes to the Kafka protocol. Existing `ProduceRequest`, `FetchRequest`, and
 
 **Behavioral Differences**:
 - Transactional produce requests are rejected with `INVALID_REQUEST` for diskless topics
-- Long-polling fetch behavior may return earlier for diskless topics (no purgatory waiting)
+- Long-polling fetch waits inside the diskless read path rather than in the fetch purgatory: a request wakes on the first append to any of its caught-up partitions, or on `maxWaitMs`. `minBytes` is honoured only through that wait -- a fetch never waits when any of its partitions already has data.
+- `ListOffsets` by timestamp can answer with an offset at or before the exact match on a topic whose record timestamps lag their entries' write times by more than 256 entries (see **Limitations**)
 
 #### Binary Protocol
 
@@ -645,7 +651,7 @@ Traditional Kafka uses `DelayedOperationPurgatory` for:
 
 For diskless topics:
 - **DelayedProduce**: Not needed; Ursa ack is sufficient
-- **DelayedFetch**: Currently returns immediately; future enhancement may add Ursa-aware waiting
+- **DelayedFetch**: Replaced by a long poll inside the diskless read path. Every requested partition registers an append waiter before the first read, so an append landing during that read still wakes the request; a request that already has records, an error, or nothing that waiting could change answers at once. Otherwise it waits for the first append on any of its caught-up partitions, or for the single timeout the request schedules for all of them, and re-reads exactly those partitions once.
 
 ### Limitations
 
@@ -653,12 +659,13 @@ For diskless topics:
 2. **No K/V Compaction**: K/V Log compaction is not supported
 3. **RF=1 Only**: Multi-replica diskless topics not supported
 4. **No Internal Topics**: System topics use traditional storage
+5. **MAX_TIMESTAMP is approximate**: `ListOffsets(-3)` answers with the last entry's base offset and its write timestamp instead of scanning records for the true maximum create time. Entries are written in write-timestamp order, so this is exact whenever record timestamps follow write order; where they do not, the answer names the last entry rather than the record with the highest timestamp. The exact answer would cost one index lookup per record.
+6. **Timestamp lookups scan a bounded window**: `ListOffsets(t)` reads at most 256 entries past its binary search. Beyond that it answers with the first entry written at or after `t`, which is at or before the true offset and never past it.
 
 ### Future Enhancements
 
 1. **Transaction Support**: Integrate with Ursa's transaction capabilities
 2. **Multi-Region**: Cross-region replication via Ursa
-3. **Long-Poll Fetch**: Implement Ursa-aware fetch waiting
 
 ### Compaction Support
 
