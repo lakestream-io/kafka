@@ -70,7 +70,7 @@ class KafkaRecordsPayloadTest {
     }
 
     @Test
-    void readableRecordsRebasesMultipleBatchesWithoutCopying() {
+    void readableRecordsRebasesMultipleBatches() {
         MemoryRecords first = MemoryRecords.withRecords(
                 Compression.NONE, new SimpleRecord("a".getBytes()), new SimpleRecord("b".getBytes()));
         MemoryRecords second = MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("c".getBytes()));
@@ -84,6 +84,27 @@ class KafkaRecordsPayloadTest {
         rebased.records().forEach(r -> offsets.add(r.offset()));
         assertEquals(List.of(100L, 101L, 102L), offsets);
         assertEquals(0, payload.readerIndex());
+    }
+
+    @Test
+    void readableRecordsAcceptsReadOnlyPayloads() {
+        MemoryRecords first = MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord("a".getBytes()), new SimpleRecord("b".getBytes()));
+        MemoryRecords second = MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("c".getBytes()));
+        ByteBuffer joined = ByteBuffer.allocate(first.sizeInBytes() + second.sizeInBytes());
+        joined.put(first.buffer().duplicate()).put(second.buffer().duplicate()).flip();
+        ByteBuf payload = Unpooled.wrappedBuffer(joined).asReadOnly();
+
+        MemoryRecords rebased = KafkaRecordsPayload.readableRecords(payload, 100L, 3);
+
+        List<Long> offsets = new ArrayList<>();
+        rebased.records().forEach(r -> offsets.add(r.offset()));
+        assertEquals(List.of(100L, 101L, 102L), offsets);
+
+        // the source was copied, not mutated in place: its batches are still at base offset 0.
+        List<Long> sourceBaseOffsets = new ArrayList<>();
+        MemoryRecords.readableRecords(joined.duplicate()).batches().forEach(b -> sourceBaseOffsets.add(b.baseOffset()));
+        assertEquals(List.of(0L, 0L), sourceBaseOffsets);
     }
 
     @Test
@@ -169,6 +190,17 @@ class KafkaRecordsPayloadTest {
     }
 
     @Test
+    void assembleAcceptsReadOnlyPayloads() {
+        LogEntry e1 = readOnlyEntry(10L, MemoryRecords.withRecords(Compression.NONE, new SimpleRecord("x".getBytes())));
+        LogEntry e2 = readOnlyEntry(11L, MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord("y".getBytes()), new SimpleRecord("z".getBytes())));
+        MemoryRecords assembled = KafkaRecordsPayload.assemble(List.of(e1, e2));
+        List<Long> offsets = new ArrayList<>();
+        assembled.records().forEach(r -> offsets.add(r.offset()));
+        assertEquals(List.of(10L, 11L, 12L), offsets);
+    }
+
+    @Test
     void setLogAppendTimeStampsEveryBatch() {
         MemoryRecords records = MemoryRecords.withRecords(Compression.NONE, new SimpleRecord(1L, "a".getBytes()));
         KafkaRecordsPayload.setLogAppendTime(records, 4242L);
@@ -196,6 +228,22 @@ class KafkaRecordsPayloadTest {
             recordCount++;
         }
         ByteBuf payload = Unpooled.wrappedBuffer(records.buffer().duplicate());
+
+        LogEntry entry = mock(LogEntry.class);
+        when(entry.offset()).thenReturn(offset);
+        when(entry.numberOfRecords()).thenReturn(recordCount);
+        when(entry.payload()).thenReturn(payload);
+        when(entry.size()).thenReturn(payload.readableBytes());
+        return entry;
+    }
+
+    /** Like {@link #entry}, but {@code payload()} returns a read-only view, matching the real {@code LogEntry} contract. */
+    private static LogEntry readOnlyEntry(long offset, MemoryRecords records) {
+        int recordCount = 0;
+        for (Iterator<Record> it = records.records().iterator(); it.hasNext(); it.next()) {
+            recordCount++;
+        }
+        ByteBuf payload = Unpooled.wrappedBuffer(records.buffer().duplicate()).asReadOnly();
 
         LogEntry entry = mock(LogEntry.class);
         when(entry.offset()).thenReturn(offset);

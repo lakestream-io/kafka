@@ -1238,7 +1238,7 @@ class ProducerStateManagerTest {
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(numMessages);
         when(entry.size()).thenReturn(data.readableBytes());
-        when(entry.payload()).thenReturn(data);
+        when(entry.payload()).thenReturn(data.asReadOnly());
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
                 data.release();
@@ -1272,7 +1272,7 @@ class ProducerStateManagerTest {
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(3);
         when(entry.size()).thenReturn(data.readableBytes());
-        when(entry.payload()).thenReturn(data);
+        when(entry.payload()).thenReturn(data.asReadOnly());
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
                 data.release();
@@ -1297,7 +1297,7 @@ class ProducerStateManagerTest {
         when(entry.offset()).thenReturn(baseOffset);
         when(entry.numberOfRecords()).thenReturn(numMessages);
         when(entry.size()).thenReturn(data.readableBytes());
-        when(entry.payload()).thenReturn(data);
+        when(entry.payload()).thenReturn(data.asReadOnly());
         doAnswer(invocation -> {
             if (closed.compareAndSet(false, true)) {
                 data.release();

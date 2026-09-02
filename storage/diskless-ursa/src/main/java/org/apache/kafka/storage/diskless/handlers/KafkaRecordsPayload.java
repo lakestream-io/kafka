@@ -65,14 +65,15 @@ public final class KafkaRecordsPayload {
     }
 
     /**
-     * Wraps a storage entry's payload as readable records without copying, and rebases its batches
-     * to the entry's storage offset.
+     * Copies a storage entry's payload into an independently owned buffer, then validates its
+     * batch headers and rebases its batches to the entry's storage offset.
      *
-     * <p>The returned records are backed directly by {@code payload}'s memory: rebasing writes
-     * through to it in place. Use this only while the entry that owns {@code payload} stays open
-     * for the duration of the call (single-entry decoding, e.g. replay or list-offsets). For a
-     * batch of entries that will be closed before the caller is done with the records, copy them
-     * with {@link #assemble} instead.
+     * <p>The copy is required because {@link LogEntry#payload()} is a read-only view: rebasing
+     * writes through {@link MutableRecordBatch#setLastOffset}, which only works on a buffer this
+     * method owns. Validation is still header-only (see the class javadoc), so the copy is the
+     * only added cost — no record is decoded or its CRC recomputed. For a whole batch of entries,
+     * prefer {@link #assemble}, which copies the batch into one shared buffer instead of one
+     * buffer per entry.
      */
     public static MemoryRecords readableRecords(ByteBuf payload, long baseOffset, int expectedRecordCount) {
         if (payload == null || !payload.isReadable()) {
@@ -83,10 +84,19 @@ public final class KafkaRecordsPayload {
                     "Kafka storage entry must contain at least one record, but expected " + expectedRecordCount);
         }
         int size = payload.readableBytes();
-        MemoryRecords records = MemoryRecords.readableRecords(payload.nioBuffer(payload.readerIndex(), size));
+        ByteBuffer copy = copyPayload(payload, size);
+        MemoryRecords records = MemoryRecords.readableRecords(copy);
         List<Integer> counts = validateHeaders(records, size, expectedRecordCount);
         rebase(records, counts, baseOffset);
         return records;
+    }
+
+    private static ByteBuffer copyPayload(ByteBuf payload, int payloadSize) {
+        int readerIndex = payload.readerIndex();
+        ByteBuffer copy = ByteBuffer.allocate(payloadSize);
+        copy.put(payload.nioBuffer(readerIndex, payloadSize).duplicate());
+        copy.flip();
+        return copy;
     }
 
     /**
