@@ -145,7 +145,10 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
                         .build()))
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_ENABLE_CONFIG, "true")
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_TOPIC_DEFAULT_ENABLE_CONFIG, "false")
-                .setConfigProp(ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG, oxiaServiceAddress)
+                .setConfigProp(ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG,
+                        "oxia://" + oxiaServiceAddress + "/default")
+                .setConfigProp(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG,
+                        "oxia://" + oxiaServiceAddress + "/default")
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_CONFIG, "LOCAL")
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_PATH_CONFIG, storagePath.toString())
                 .setConfigProp("offsets.topic.replication.factor", "1")
@@ -905,7 +908,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
         private void putProducerStateSnapshotsInOxia(Uuid topicId, int partitions) throws Exception {
             String oxiaServiceAddress = oxiaContainer.getServiceAddress();
-            String namespace = ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
+            String namespace = "default";
             String topicIndexName = IsolatedUrsaCatalogInspector.producerStateTopicIndexName(cluster);
             String topicIndexKey = IsolatedUrsaCatalogInspector.producerStateTopicIndexKey(
                     cluster, topicId.toString());
@@ -974,7 +977,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
 
         private AsyncOxiaClient createOxiaClient() throws Exception {
             return OxiaClientBuilder.create(oxiaContainer.getServiceAddress())
-                    .namespace(ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT)
+                    .namespace("default")
                     .asyncClient()
                     .get();
         }
@@ -1078,8 +1081,7 @@ public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
         }
 
         private IsolatedUrsaCatalogInspector createCatalogInspector() throws Exception {
-            String catalogUri = "oxia://" + oxiaContainer.getServiceAddress()
-                    + "/" + ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
+            String catalogUri = "oxia://" + oxiaContainer.getServiceAddress() + "/default";
             Properties properties = new Properties();
             properties.setProperty("backendStorageType", "LOCAL");
             properties.setProperty("storagePath", baseDir.toString());

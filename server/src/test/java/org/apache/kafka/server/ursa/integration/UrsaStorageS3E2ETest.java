@@ -154,7 +154,10 @@ public class UrsaStorageS3E2ETest extends UrsaStorageE2ETestBase {
                         .setNumControllerNodes(1)
                         .build()))
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_ENABLE_CONFIG, "true")
-                .setConfigProp(ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG, oxiaServiceAddress)
+                .setConfigProp(ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG,
+                        "oxia://" + oxiaServiceAddress + "/default")
+                .setConfigProp(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG,
+                        "oxia://" + oxiaServiceAddress + "/default")
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_CONFIG, "S3")
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_PATH_CONFIG, s3Prefix)
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_S3_ENDPOINT_CONFIG, s3Endpoint.toString())

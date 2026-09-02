@@ -190,15 +190,11 @@ public class LogConfig extends AbstractConfig {
             .define(ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG, STRING,
                     ServerLogConfigs.URSA_STORAGE_CLASS_PATH_DEFAULT, LOW,
                     ServerLogConfigs.URSA_STORAGE_CLASS_PATH_DOC)
-            .define(ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_DEFAULT,
-                    new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_DOC)
             .define(ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG, STRING,
                     ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_DOC)
             .define(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG, STRING, ServerLogConfigs.URSA_OXIA_SERVICE_URL_DEFAULT,
                     new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_OXIA_SERVICE_URL_DOC)
-            .define(ServerLogConfigs.URSA_STORAGE_NAMESPACE_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT,
-                    new ConfigDef.NonEmptyString(), LOW, ServerLogConfigs.URSA_STORAGE_NAMESPACE_DOC)
             .define(ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_CONFIG, STRING, ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_DEFAULT,
                     ConfigDef.ValidString.in("LOCAL", "S3", "GCS", "AZURE_BLOB", "AZUREBLOB"),
                     LOW, ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_DOC)

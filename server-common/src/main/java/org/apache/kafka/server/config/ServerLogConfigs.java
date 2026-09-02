@@ -195,25 +195,15 @@ public class ServerLogConfigs {
             "Optional classpath for the Ursa diskless storage runtime. If unset, brokers load jars from " +
                     "<code>$KAFKA_HOME/ursa-storage/*</code>.";
 
-    // Deprecated (do not use annotation to pass checkstyle check)
-    public static final String URSA_STORAGE_OXIA_SERVICE_URL_CONFIG = "ursa.storage.oxia.service.url";
-    public static final String URSA_STORAGE_OXIA_SERVICE_URL_DEFAULT = "localhost:6648";
-    public static final String URSA_STORAGE_OXIA_SERVICE_URL_DOC = "The Oxia service URL for Ursa storage metadata.";
-
     public static final String URSA_CATALOG_OXIA_SERVICE_URL_CONFIG = "ursa.catalog.oxia.service.url";
     public static final String URSA_CATALOG_OXIA_SERVICE_URL_DEFAULT = "oxia://localhost:6648/default";
-    public static final String URSA_CATALOG_OXIA_SERVICE_URL_DOC = "The Oxia service URL for the Ursa log catalog. " +
-            "The format should be 'oxia://host:port/[namespace]'. If the namespace is not provided, 'default' will be used.";
+    public static final String URSA_CATALOG_OXIA_SERVICE_URL_DOC =
+            "The Oxia service URL (oxia://host:port/namespace) for the Ursa log catalog.";
 
     public static final String URSA_OXIA_SERVICE_URL_CONFIG = "ursa.oxia.service.url";
     public static final String URSA_OXIA_SERVICE_URL_DEFAULT = "oxia://localhost:6648/default";
-    public static final String URSA_OXIA_SERVICE_URL_DOC = "The Oxia service URL for Ursa storage metadata. " +
-            "The format should be 'oxia://host:port/[namespace]'. If the namespace is not provided, 'default' will be used.";
-
-    // Deprecated (do not use annotation to pass checkstyle check)
-    public static final String URSA_STORAGE_NAMESPACE_CONFIG = "ursa.storage.namespace";
-    public static final String URSA_STORAGE_NAMESPACE_DEFAULT = "default";
-    public static final String URSA_STORAGE_NAMESPACE_DOC = "The namespace for Ursa storage streams.";
+    public static final String URSA_OXIA_SERVICE_URL_DOC =
+            "The Oxia service URL (oxia://host:port/namespace) for Ursa storage metadata and Kafka producer-state snapshots.";
 
     public static final String URSA_STORAGE_BACKEND_TYPE_CONFIG = "ursa.storage.backend.type";
     public static final String URSA_STORAGE_BACKEND_TYPE_DEFAULT = "LOCAL";

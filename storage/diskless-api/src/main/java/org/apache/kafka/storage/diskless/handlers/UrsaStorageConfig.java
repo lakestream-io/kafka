@@ -104,17 +104,11 @@ public class UrsaStorageConfig {
         boolean enabled = getStringConfig(configs, ServerLogConfigs.URSA_STORAGE_ENABLE_CONFIG,
                 String.valueOf(ServerLogConfigs.URSA_STORAGE_ENABLE_DEFAULT)).equals("true");
 
-        String oxiaServiceUrl = getStringConfig(configs, ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG,
-                ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_DEFAULT);
-        String namespace = getStringConfig(configs, ServerLogConfigs.URSA_STORAGE_NAMESPACE_CONFIG,
-                ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT);
-        final var defaultOxiaServiceUrl = "oxia://" + oxiaServiceUrl + "/" + namespace;
-
         final var catalogOxiaServiceUrl = getOxiaServiceUrlConfig(
                 configs, ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG,
-                defaultOxiaServiceUrl);
+                ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_DEFAULT);
         final var ursaOxiaServiceUrl = getOxiaServiceUrlConfig(configs, ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG,
-                defaultOxiaServiceUrl);
+                ServerLogConfigs.URSA_OXIA_SERVICE_URL_DEFAULT);
 
         String backendType = getStringConfig(configs, ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_CONFIG,
                 ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_DEFAULT);

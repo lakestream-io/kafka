@@ -926,12 +926,10 @@ class KafkaConfigTest {
         case ServerLogConfigs.LOG_CLEANUP_POLICY_CONFIG => assertPropertyInvalid(baseProperties, name, "unknown_policy", "0")
 
         // Ursa storage configs: many are plain strings, so do not treat "not_a_number" as invalid.
-        case ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_CLASS_PATH_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_S3_SESSION_TOKEN_CONFIG => // ignore password string
         case ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG => // ignore string
         case ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG => // ignore string
-        case ServerLogConfigs.URSA_STORAGE_NAMESPACE_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_PATH_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_COMPACTION_PREFIX_CONFIG => // ignore string
         case ServerLogConfigs.URSA_STORAGE_COMPACTION_BUCKET_CONFIG => // ignore string

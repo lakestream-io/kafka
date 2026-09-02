@@ -325,7 +325,8 @@ Diskless storage is configured via environment variables in `docker-compose.yml`
 |----------|-------------|
 | `KAFKA_URSA_STORAGE_ENABLE` | Enable diskless storage (`true`) |
 | `KAFKA_URSA_STORAGE_BACKEND_TYPE` | Storage backend (`S3`) |
-| `KAFKA_URSA_STORAGE_OXIA_SERVICE_URL` | Oxia connection URL |
+| `KAFKA_URSA_CATALOG_OXIA_SERVICE_URL` | Oxia connection URL for the Ursa log catalog |
+| `KAFKA_URSA_OXIA_SERVICE_URL` | Oxia connection URL for Ursa storage metadata and producer-state snapshots |
 | `KAFKA_URSA_STORAGE_S3_ENDPOINT` | S3 endpoint URL |
 | `KAFKA_URSA_STORAGE_S3_BUCKET` | S3 bucket name |
 | `KAFKA_URSA_STORAGE_S3_ACCESS_KEY` | S3 access key |

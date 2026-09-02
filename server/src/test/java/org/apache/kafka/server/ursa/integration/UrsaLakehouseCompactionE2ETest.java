@@ -261,7 +261,7 @@ public class UrsaLakehouseCompactionE2ETest extends UrsaStorageE2ETestBase {
             String region,
             String bucket,
             String prefix) {
-        String oxiaUrl = "oxia://" + oxiaServiceAddress + "/" + ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
+        String oxiaUrl = "oxia://" + oxiaServiceAddress + "/default";
 
         Properties properties = new Properties();
         properties.setProperty("oxiaStorageUrl", oxiaUrl);
@@ -294,7 +294,7 @@ public class UrsaLakehouseCompactionE2ETest extends UrsaStorageE2ETestBase {
             String s3Prefix,
             String region,
             String bucket) {
-        String oxiaUrl = "oxia://oxia:6648/" + ServerLogConfigs.URSA_STORAGE_NAMESPACE_DEFAULT;
+        String oxiaUrl = "oxia://oxia:6648/default";
 
         GenericContainer<?> compactor = new GenericContainer<>(compactorImage)
                 .withNetwork(network)
@@ -383,7 +383,10 @@ public class UrsaLakehouseCompactionE2ETest extends UrsaStorageE2ETestBase {
                         .setNumControllerNodes(1)
                         .build()))
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_ENABLE_CONFIG, "true")
-                .setConfigProp(ServerLogConfigs.URSA_STORAGE_OXIA_SERVICE_URL_CONFIG, oxiaServiceAddress)
+                .setConfigProp(ServerLogConfigs.URSA_CATALOG_OXIA_SERVICE_URL_CONFIG,
+                        "oxia://" + oxiaServiceAddress + "/default")
+                .setConfigProp(ServerLogConfigs.URSA_OXIA_SERVICE_URL_CONFIG,
+                        "oxia://" + oxiaServiceAddress + "/default")
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_BACKEND_TYPE_CONFIG, "S3")
                 // Used as S3 key prefix for Ursa storage
                 .setConfigProp(ServerLogConfigs.URSA_STORAGE_PATH_CONFIG, s3Prefix)
