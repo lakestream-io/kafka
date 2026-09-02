@@ -683,9 +683,9 @@ class UrsaLakestreamReaderTest {
         UrsaStorageState state = mock(UrsaStorageState.class);
         CompletableFuture<LogOffset> gatedLastOffset = new CompletableFuture<>();
         AtomicInteger lastOffsetCalls = new AtomicInteger();
-        Log logInstance = growingLog();
         // The first read hangs on its high-watermark lookup, so the append below lands after the
         // waiter was registered but before the read can report an empty log.
+        Log logInstance = mock(Log.class);
         AtomicReference<LogOffset> current = logState(logInstance);
         when(logInstance.getLastOffset()).thenAnswer(invocation -> lastOffsetCalls.getAndIncrement() == 0
                 ? gatedLastOffset

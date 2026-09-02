@@ -362,6 +362,29 @@ class UrsaDisklessTopicLifecycleTest {
     }
 
     @Test
+    void testNullReloadAfterAFailedGrowStillReportsTheGrowFailure() throws Exception {
+        Uuid topicId = Uuid.randomUuid();
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);
+        StreamMetadata beforeGrow = metadata(1);
+        IllegalStateException growFailure = new IllegalStateException("grow rejected");
+        when(catalog.loadStream(id))
+                .thenReturn(CompletableFuture.completedFuture(beforeGrow))
+                // A catalog that answers the reload with null must not turn the grow failure into
+                // an NPE that hides why the reconcile did not converge.
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(catalog.increasePartitions(id, 3)).thenReturn(CompletableFuture.failedFuture(growFailure));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> lifecycle.ensureTopic("orders", topicId, 3, Map.of(), 21).get());
+            assertSame(growFailure, failure.getCause());
+        }
+
+        verify(catalog, never()).replaceStreamProperties(any(), anyMap(), anyLong());
+    }
+
+    @Test
     void testDeleteTopicDropsStreamAndFencesThenDeletesSnapshots() throws Exception {
         Uuid topicId = Uuid.randomUuid();
         StreamIdentifier id = KafkaStreamIdentity.streamIdentifier("orders", topicId);

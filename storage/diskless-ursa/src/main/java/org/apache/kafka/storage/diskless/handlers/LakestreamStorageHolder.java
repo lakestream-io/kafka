@@ -228,25 +228,27 @@ final class LakestreamStorageHolder implements Closeable {
     }
 
     static LakestreamStorageHolder create(UrsaStorageConfig config) throws Exception {
-        StreamCatalog catalog = null;
+        StreamCatalog catalog = openCatalog(config);
         AsyncOxiaClient producerStateOxiaClient = null;
         try {
-            String oxiaUrl = config.getCatalogOxiaServiceUrl();
-            Properties properties = buildStorageProperties(config);
-
-            catalog = StreamCatalogLoader.open(oxiaUrl, properties);
-
+            // connectProducerStateOxiaClient re-sets the interrupt flag itself, so this catch
+            // must not do it a second time.
             producerStateOxiaClient = connectProducerStateOxiaClient(config);
-
             return new LakestreamStorageHolder(catalog, producerStateOxiaClient);
         } catch (Exception e) {
             try {
-                if (catalog != null) {
-                    catalog.close();
-                }
+                catalog.close();
             } catch (Exception ignored) {
             }
             closeOxiaClientAfterFailedCreate(producerStateOxiaClient, null, e);
+            throw e;
+        }
+    }
+
+    private static StreamCatalog openCatalog(UrsaStorageConfig config) throws Exception {
+        try {
+            return StreamCatalogLoader.open(config.getCatalogOxiaServiceUrl(), buildStorageProperties(config));
+        } catch (Exception e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }

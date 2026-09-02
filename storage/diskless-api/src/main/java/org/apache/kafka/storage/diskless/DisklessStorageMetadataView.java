@@ -43,6 +43,10 @@ public interface DisklessStorageMetadataView {
      * <p>Storage this broker provisions is stamped with it, so the active controller's orphan sweep
      * can tell state created from an image newer than its own from state it may delete. Never
      * negative: a broker that has applied no metadata yet reports 0.
+     *
+     * <p>Nothing reads the offset through this view: the diskless storage engine is handed the raw
+     * {@code LongSupplier} instead. This method states the contract that supplier has to fulfil,
+     * and the implementations here are what hold it to it.
      */
     long imageOffset();
 

@@ -239,7 +239,8 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
             int partitions,
             Throwable growFailure) {
         return catalog.loadStream(id).handle((reloaded, reloadError) -> {
-            if (reloadError == null && reloaded.partitioning().numPartitions() >= partitions) {
+            if (reloadError == null && reloaded != null
+                    && reloaded.partitioning().numPartitions() >= partitions) {
                 return reloaded;
             }
             if (reloadError != null) {
@@ -284,12 +285,16 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
                         DELETED_TOPIC_MARKER,
                         Set.of(PutOption.IfRecordDoesNotExist))
                 .handle((ignored, error) -> {
+                    if (error == null) {
+                        return null;
+                    }
+                    Throwable cause = DisklessFutures.unwrap(error);
                     // An overlapping delete already fenced this incarnation, which is the outcome
                     // this call wanted.
-                    if (error != null && !(DisklessFutures.unwrap(error) instanceof KeyAlreadyExistsException)) {
-                        throw new CompletionException(DisklessFutures.unwrap(error));
+                    if (cause instanceof KeyAlreadyExistsException) {
+                        return null;
                     }
-                    return null;
+                    throw new CompletionException(cause);
                 })
                 .thenCompose(ignored -> producerStateClient.deleteRange(prefix, prefix + '\uffff'));
     }
