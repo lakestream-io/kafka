@@ -64,12 +64,14 @@ Design document: `docs/LIP-diskless-storage-with-ursa-integration.md`
 
 ### How Ursa Integrates with Kafka
 
-The diskless layer is a **bypass** in `ReplicaManager` that routes storage operations to Ursa instead of local logs, on a per-topic basis (`ursa.storage.enable=true` topic config).
+The diskless layer is a **bypass** in `ReplicaManager` that routes storage operations to Ursa instead of local logs, on a per-topic basis (`ursa.storage.enable=true` topic config). Brokers open partitions with create-if-absent, creating the Lakestream stream on first partition open. The active controller reconciles properties, partition growth, deletion, and orphan cleanup through one `DisklessTopicLifecycle` SPI call that fans out to both the catalog and producer-state cleanup.
 
 ```
 KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
-                                  ├── diskless topics → UrsaLakestreamWriter / UrsaLakestreamReader → Ursa
+                                  ├── diskless topics → PartitionWriter / PartitionReader → Ursa
                                   └── classic topics  → local Log (unchanged)
+
+Controller → DisklessTopicLifecycleReconciler → DisklessTopicLifecycle → StreamCatalog + ProducerState
 ```
 
 ### Key Modules
@@ -89,18 +91,20 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 - `DisklessStorageReplicaManagerSupport.java` — Entry point; partitions requests between diskless and classic paths
 - `DisklessStorageEngine.java` — Generic engine SPI implemented by Ursa
 - `DisklessStorageEngineLoader.java` — Loads the implementation through the isolated Ursa classpath
-- `DisklessTopicLifecycle.java` / `DisklessTopicLifecycleLoader.java` — Controller-side topic lifecycle SPI and isolated loader
-- `DisklessProducerStateLifecycle.java` / `DisklessProducerStateLifecycleLoader.java` — Controller-side producer-state lifecycle SPI and isolated loader
+- `DisklessTopicLifecycle.java` — Controller-side topic lifecycle SPI (ensureTopic, deleteTopic, listManagedTopics, sweepOrphans)
+- `DisklessTopicLifecycleLoader.java` — Isolated loader for `DisklessTopicLifecycle`
+- `DisklessFutures.java` — Shared futures helper for unwrapping exceptions
+- `DisklessTopics.java` — Shared helper for topic configuration checks
 - `DisklessClassLoaderRegistry.java` — Shares plugin classloader instances by classpath and parent until all leases close
 - `handlers/UrsaStorageConfig.java` — Configuration holder shared by broker-side code and the Ursa implementation
 
 **Ursa implementation** (`storage/diskless-ursa/src/main/java/org/apache/kafka/storage/diskless/`):
 - `handlers/UrsaStorageEngineImpl.java` — Diskless storage engine implementation backed by Ursa
-- `handlers/UrsaLakestreamWriter.java` — Write path (async append via Lakestream)
-- `handlers/UrsaLakestreamReader.java` — Read path (Fetch + ListOffsets)
-- `handlers/UrsaStorageState.java` — Partition LogId handles, offset tracking, and shared state
+- `handlers/PartitionReader.java` — Read path for fetch and list offsets with cached cursor
+- `handlers/PartitionWriter.java` — Write path: validation, append, producer state, append notifications
+- `handlers/PartitionRetention.java` — Coalesced retention worker
+- `handlers/LakestreamStorageHolder.java` — Catalog and Oxia client ownership; opens partitions with create-if-absent
 - `handlers/UrsaDisklessTopicLifecycle.java` — StreamCatalog-backed topic lifecycle implementation
-- `OxiaDisklessProducerStateLifecycle.java` — Kafka-owned producer-state lifecycle metadata in Oxia
 - `idempotent/ProducerStateManager.java` — Producer state tracking backed by Oxia snapshots
 
 **Plugin classloading**:
@@ -112,6 +116,7 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 - `KafkaApis.scala` — Request handling, async produce/fetch for diskless
 - `BrokerServer.scala` — Initializes diskless storage support
 - `ReplicaFetcherThread.scala` — Skips fetching for diskless partitions
+- `metadata/DisklessTopicLifecycleReconciler.java` — Active-controller reconciler: ensures/deletes diskless topics from metadata deltas and sweeps orphans on a configurable interval
 
 **Network / Pipelining** (`core/src/main/scala/kafka/network/`):
 - `SocketServer.scala` — Request pipelining support (`socket.server.enable.request.pipelining`)
@@ -136,7 +141,7 @@ KafkaApis → ReplicaManager → DisklessStorageReplicaManagerSupport
 ### Ursa Dependencies
 Keep Ursa implementation dependencies out of Kafka's main classpath. Ursa, Oxia, cloud SDKs, and lakehouse dependencies belong in the isolated `storage:storage-diskless-ursa` runtime, not in `storage` or `core`.
 
-The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.lakestream.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state metadata and its controller-side lifecycle adapter.
+The diskless storage data/read path compiles only against `lakestream-api`. Its production sources must not import `io.lakestream.ursa.*`, select a compacted-reader implementation, or depend on Ursa catalog/Oxia metadata layouts. `ursa-storage-kafka-runtime` is the single `runtimeOnly` bundle that discovers the catalog provider and internally assembles Ursa storage plus the Kafka lakehouse reader. The separate Oxia API dependency is outside this data/read boundary: it supports Kafka-owned producer-state snapshots and their deletion fence.
 
 Release tarballs package those isolated runtime jars under `./ursa-storage/`. Kafka, Scala, SLF4J, Log4j, and other platform jars are provided by `./libs/` and should not be duplicated into `./ursa-storage/` unless the dependency is intentionally private to the Ursa runtime. The `KafkaPluginClassLoader` loads plugin-private classes child-first while keeping Kafka/logging/Scala API packages parent-first.
 

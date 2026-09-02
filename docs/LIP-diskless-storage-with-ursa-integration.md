@@ -185,11 +185,21 @@ In this LIP, diskless topics are handled by the Lakestream-backed implementation
 | `UrsaLakestreamReader` | Read path for diskless topics; handles Fetch and ListOffsets via a Lakestream log |
 | `UrsaStorageState` | Manages partition LogId handles, offset tracking, and shared state |
 | `ProducerStateManager` | Validates idempotent producer sequences and persists snapshots to Oxia |
-| `DisklessTopicLifecycleReconciler` | Reconciles Kafka topic metadata with StreamCatalog lifecycle state on the active controller |
+| `DisklessTopicLifecycleReconciler` | Active-controller reconciler: ensures/deletes diskless topics from metadata deltas and sweeps orphans on a configurable interval |
 | `UrsaStorageConfig` | Configuration holder for Ursa settings |
 | `MetadataCacheDisklessStorageView` | Determines if a topic is diskless based on topic config |
 | `ListOffsetsPartitionRequest` | Request DTO for diskless ListOffsets operations |
 | `ListOffsetsPartitionResponse` | Response DTO for diskless ListOffsets operations |
+
+#### Topic Lifecycle Ownership
+
+| Actor | Responsibility |
+|---|---|
+| Broker | Opens a partition with create-if-absent: `openLog(id, p)`; on `NoSuchStreamException` calls `createStream` with the topic's partition count and identity properties, on "partition not in layout" calls `increasePartitions`, then opens again. Retries once on `AlreadyExistsException`. |
+| Active controller | Reconciles properties, partition growth, deletion, and orphan cleanup through one `DisklessTopicLifecycle`. |
+| Ursa provider | Fans a lifecycle call out to the catalog and to producer-state cleanup. The controller never sees two stores. |
+
+**Producer State**: Producer state keeps only `producer-state-snapshot/<topicId>-<partition>[/<zone>]` keys and a `producer-state-deleted/<topicId>` fence. Deletion is fence then range delete, and a periodic sweep on the active controller removes leftovers.
 
 #### Write Path (Produce)
 
@@ -445,14 +455,13 @@ No protocol changes required.
 |----------|------|---------|-------------|
 | `ursa.storage.enable` | boolean | `false` | Master toggle for Ursa storage mode |
 | `ursa.storage.topic.default.enable` | boolean | `false` | Enable diskless storage for topics by default |
-| `ursa.storage.oxia.service.url` | string | `localhost:6648` | Oxia service URL for metadata |
 | `ursa.catalog.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for the Ursa log catalog (format: `oxia://host:port/[namespace]`) |
-| `ursa.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for Ursa storage metadata (format: `oxia://host:port/[namespace]`) |
+| `ursa.oxia.service.url` | string | `oxia://localhost:6648/default` | Oxia metadata store URL for Ursa storage metadata and producer state (format: `oxia://host:port/[namespace]`) |
 | `ursa.storage.backend.type` | string | `LOCAL` | Storage backend: `LOCAL`, `S3`, `GCS`, `AZURE_BLOB` (`AZUREBLOB` is also accepted for compatibility). Azure compaction requires an HNS-enabled account because compacted files use ABFS. |
 | `ursa.storage.path` | string | `/tmp/ursa-data` | Local storage path for `LOCAL`, or the remote object prefix for `S3`/`GCS`/Azure Blob |
 | `ursa.storage.compaction.prefix` | string | `/tmp/compaction-data` | Compaction output prefix for remote object storage backends |
-| `ursa.storage.namespace` | string | `default` | Namespace for Ursa streams |
 | `ursa.storage.write.buffer.flush.interval.ms` | long | `250` | Write buffer flush interval |
+| `ursa.storage.lifecycle.sweep.interval.ms` | long | `600000` | Active-controller periodic interval (ms) to sweep orphaned diskless topic storage. Minimum 1000ms. |
 | `ursa.storage.write.buffer.size` | int | `4194304` (4MB) | Size of each WAL write buffer segment |
 | `ursa.storage.write.buffer.flush.size` | long | `268435456` (256MB) | Write buffer flush size threshold |
 | `ursa.storage.producer.state.snapshot.interval.ms` | long | `30000` | Periodic interval (ms) for producer-state snapshot. Set `<= 0` to disable time-based snapshot. |
