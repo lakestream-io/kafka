@@ -656,11 +656,15 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     }
 
     private static ScheduledExecutorService newDaemonScheduler(String threadName) {
-        return new ScheduledThreadPoolExecutor(1, runnable -> {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, runnable -> {
             Thread thread = new Thread(runnable, threadName);
             thread.setDaemon(true);
             return thread;
         });
+        // Long-poll timeouts are cancelled as soon as their fetch is answered; drop them from the
+        // delay queue instead of letting them linger until they would have fired.
+        scheduler.setRemoveOnCancelPolicy(true);
+        return scheduler;
     }
 
     private long getDefaultLongConfig(String key, long fallback) {

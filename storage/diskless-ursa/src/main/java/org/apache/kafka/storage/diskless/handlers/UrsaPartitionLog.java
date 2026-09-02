@@ -145,29 +145,17 @@ final class UrsaPartitionLog {
     }
 
     CompletableFuture<FetchPartitionData> fetch(FetchRequest.PartitionData partitionData) {
-        return fetch(partitionData, 0L);
-    }
-
-    /**
-     * Reads once and, when the consumer is caught up and asked to wait, waits for the next append
-     * before reading a second and final time. A fetch therefore costs at most two reads, however
-     * many appends land while it waits.
-     */
-    CompletableFuture<FetchPartitionData> fetch(FetchRequest.PartitionData partitionData, long maxWaitMs) {
         return initialized()
                 .thenCompose(logInstance -> activeReader().fetch(partitionData))
-                .thenCompose(response -> caughtUpAndEmpty(response, partitionData) && maxWaitMs > 0
-                        ? writer.awaitAppend(maxWaitMs).thenCompose(ignored -> activeReader().fetch(partitionData))
-                        : CompletableFuture.completedFuture(response))
                 .exceptionally(error -> createFetchErrorResponse(mapException(error)));
     }
 
-    private static boolean caughtUpAndEmpty(
-            FetchPartitionData response,
-            FetchRequest.PartitionData partitionData) {
-        return response.error == Errors.NONE
-                && response.records.sizeInBytes() == 0
-                && partitionData.fetchOffset == response.highWatermark;
+    /**
+     * Registers a long-poll waiter for this partition. The reader registers one before its first
+     * read so that an append landing during that read wakes the request instead of being missed.
+     */
+    CompletableFuture<Void> awaitAppend(long maxWaitMs) {
+        return writer.awaitAppend(maxWaitMs);
     }
 
     CompletableFuture<ListOffsetsPartitionResponse> listOffsets(ListOffsetsPartitionRequest request) {

@@ -17,6 +17,7 @@
 package org.apache.kafka.storage.diskless.handlers;
 
 import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.server.storage.log.FetchParams;
 import org.apache.kafka.server.storage.log.FetchPartitionData;
@@ -26,6 +27,8 @@ import org.apache.kafka.storage.diskless.Reader;
 
 import java.io.IOException;
 import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +38,14 @@ import java.util.stream.Collectors;
 /**
  * Reader implementation using Lakestream for storage.
  * Per-partition read state and logic live in {@link UrsaPartitionLog}.
+ *
+ * <p>Long polling is decided for the request as a whole, the way the classic fetch purgatory does
+ * it. Every requested partition registers an append waiter <em>before</em> the first read, so an
+ * append that lands while a read is in flight wakes this request instead of being missed. If the
+ * first pass answers the request — any records, any error, or nothing that waiting could change —
+ * the waiters are completed at once and the answer is returned. Otherwise the request waits for the
+ * first append on any of the caught-up partitions (or the earliest timeout) and re-reads exactly
+ * those partitions once.
  */
 public class UrsaLakestreamReader implements Reader {
 
@@ -52,21 +63,33 @@ public class UrsaLakestreamReader implements Reader {
             return CompletableFuture.completedFuture(Map.of());
         }
 
-        List<CompletableFuture<AbstractMap.SimpleEntry<TopicIdPartition, FetchPartitionData>>> futures =
-                fetchInfos.entrySet().stream()
-                        .map(entry -> state.getOrCreatePartitionLog(entry.getKey())
-                                .fetch(entry.getValue(), params.maxWaitMs)
-                                .thenApply(response -> new AbstractMap.SimpleEntry<>(entry.getKey(), response)))
-                        .toList();
+        Map<TopicIdPartition, UrsaPartitionLog> partitionLogs = new LinkedHashMap<>();
+        fetchInfos.keySet().forEach(tp -> partitionLogs.put(tp, state.getOrCreatePartitionLog(tp)));
 
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]))
-                .thenApply(ignored -> futures.stream()
-                        .map(CompletableFuture::join)
-                        .collect(Collectors.toMap(
-                                Map.Entry::getKey,
-                                Map.Entry::getValue,
-                                (oldValue, newValue) -> oldValue,
-                                LinkedHashMap::new)));
+        // Registered before the first read: an append that lands between the read's high-watermark
+        // snapshot and the decision to wait must still wake this request.
+        Map<TopicIdPartition, CompletableFuture<Void>> waiters = params.maxWaitMs > 0
+                ? registerWaiters(partitionLogs, params.maxWaitMs)
+                : Map.of();
+
+        CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> result =
+                read(partitionLogs, fetchInfos, fetchInfos.keySet())
+                        .thenCompose(responses -> {
+                            List<TopicIdPartition> caughtUp = caughtUpPartitions(responses, fetchInfos);
+                            if (waiters.isEmpty() || caughtUp.isEmpty() || answered(responses)) {
+                                return CompletableFuture.completedFuture(responses);
+                            }
+                            return awaitAnyAppend(waiters)
+                                    .thenCompose(ignored -> read(partitionLogs, fetchInfos, caughtUp))
+                                    .thenApply(rereads -> merge(fetchInfos.keySet(), responses, rereads));
+                        });
+
+        if (waiters.isEmpty()) {
+            return result;
+        }
+        // Whatever ends the request — an answer, a wait, or a failure — releases every waiter it
+        // registered, cancelling the timeouts they scheduled.
+        return result.whenComplete((responses, error) -> completeWaiters(waiters.values()));
     }
 
     @Override
@@ -95,5 +118,66 @@ public class UrsaLakestreamReader implements Reader {
 
     @Override
     public void close() throws IOException {
+    }
+
+    private static Map<TopicIdPartition, CompletableFuture<Void>> registerWaiters(
+            Map<TopicIdPartition, UrsaPartitionLog> partitionLogs,
+            long maxWaitMs) {
+        Map<TopicIdPartition, CompletableFuture<Void>> waiters = new LinkedHashMap<>();
+        partitionLogs.forEach((tp, partitionLog) -> waiters.put(tp, partitionLog.awaitAppend(maxWaitMs)));
+        return waiters;
+    }
+
+    private static CompletableFuture<Object> awaitAnyAppend(
+            Map<TopicIdPartition, CompletableFuture<Void>> waiters) {
+        return CompletableFuture.anyOf(waiters.values().toArray(new CompletableFuture<?>[0]));
+    }
+
+    private static void completeWaiters(Collection<CompletableFuture<Void>> waiters) {
+        waiters.forEach(waiter -> waiter.complete(null));
+    }
+
+    private static CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> read(
+            Map<TopicIdPartition, UrsaPartitionLog> partitionLogs,
+            Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos,
+            Collection<TopicIdPartition> partitions) {
+        Map<TopicIdPartition, CompletableFuture<FetchPartitionData>> reads = new LinkedHashMap<>();
+        partitions.forEach(tp -> reads.put(tp, partitionLogs.get(tp).fetch(fetchInfos.get(tp))));
+        return CompletableFuture.allOf(reads.values().toArray(new CompletableFuture<?>[0]))
+                .thenApply(ignored -> {
+                    Map<TopicIdPartition, FetchPartitionData> responses = new LinkedHashMap<>();
+                    reads.forEach((tp, read) -> responses.put(tp, read.join()));
+                    return responses;
+                });
+    }
+
+    /** True once the request carries something to send: records to deliver, or an error to report. */
+    private static boolean answered(Map<TopicIdPartition, FetchPartitionData> responses) {
+        return responses.values().stream()
+                .anyMatch(response -> response.error != Errors.NONE || response.records.sizeInBytes() > 0);
+    }
+
+    /** The partitions a later append would answer: empty, healthy, and read at the high watermark. */
+    private static List<TopicIdPartition> caughtUpPartitions(
+            Map<TopicIdPartition, FetchPartitionData> responses,
+            Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos) {
+        List<TopicIdPartition> caughtUp = new ArrayList<>();
+        responses.forEach((tp, response) -> {
+            if (response.error == Errors.NONE
+                    && response.records.sizeInBytes() == 0
+                    && fetchInfos.get(tp).fetchOffset == response.highWatermark) {
+                caughtUp.add(tp);
+            }
+        });
+        return caughtUp;
+    }
+
+    private static Map<TopicIdPartition, FetchPartitionData> merge(
+            Collection<TopicIdPartition> requestOrder,
+            Map<TopicIdPartition, FetchPartitionData> responses,
+            Map<TopicIdPartition, FetchPartitionData> rereads) {
+        Map<TopicIdPartition, FetchPartitionData> merged = new LinkedHashMap<>();
+        requestOrder.forEach(tp -> merged.put(tp, rereads.getOrDefault(tp, responses.get(tp))));
+        return merged;
     }
 }

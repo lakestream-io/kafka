@@ -27,6 +27,7 @@ import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.record.internal.SimpleRecord;
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
+import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateManager;
@@ -63,6 +64,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
@@ -484,6 +486,55 @@ class UrsaLakestreamWriterIdempotentTest {
         }
     }
 
+    @Test
+    void testLogAppendTimeDuplicateReportsTheOriginalStamp() throws Exception {
+        TopicIdPartition tp = testTopicPartition(0);
+        Log logInstance = emptyLog();
+        AtomicLong nextOffset = new AtomicLong();
+        when(logInstance.append(anyInt(), any(ByteBuf.class))).thenAnswer(invocation -> {
+            int recordCount = invocation.getArgument(0);
+            return CompletableFuture.completedFuture(mockLogEntryHeader(nextOffset.getAndAdd(recordCount)));
+        });
+
+        ProducerStateManager producerStateManager = newProducerStateManager(tp, logInstance);
+        // The clock ticks on every read, so a stored bookkeeping timestamp would differ from the
+        // stamp written into the records.
+        MockTime time = new MockTime(1L, 7_000L, 0L);
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        attachPartitionLog(state, tp, logInstance, time, TimestampType.LOG_APPEND_TIME)
+                .installProducerStateManager(DisklessClientZone.NO_ZONE, producerStateManager);
+        UrsaLakestreamWriter writer = new UrsaLakestreamWriter(state);
+
+        try {
+            PartitionResponse first = writer.write(
+                    Map.of(tp, idempotentRecords(5555L, 0, "a")),
+                    DisklessClientZone.NO_ZONE).get(5, TimeUnit.SECONDS).get(tp);
+            assertEquals(Errors.NONE, first.error);
+            long stamped = first.logAppendTime;
+            assertTrue(stamped >= 7_000L, "The append is stamped with the broker clock");
+
+            // The retry is stamped later, but the duplicate must report the original append.
+            time.sleep(1_000L);
+            PartitionResponse duplicate = writer.write(
+                    Map.of(tp, idempotentRecords(5555L, 0, "a")),
+                    DisklessClientZone.NO_ZONE).get(5, TimeUnit.SECONDS).get(tp);
+
+            assertEquals(Errors.NONE, duplicate.error);
+            assertEquals(first.baseOffset, duplicate.baseOffset);
+            assertEquals(stamped, duplicate.logAppendTime);
+            assertEquals(1, appendCalls(logInstance));
+        } finally {
+            producerStateManager.close();
+            writer.close();
+        }
+    }
+
+    private static int appendCalls(Log logInstance) {
+        return (int) mockingDetails(logInstance).getInvocations().stream()
+                .filter(invocation -> "append".equals(invocation.getMethod().getName()))
+                .count();
+    }
+
     private static ProducerStateManager newProducerStateManager(TopicIdPartition tp, Log logInstance) {
         return new ProducerStateManager(tp, () -> null, () -> CompletableFuture.completedFuture(logInstance));
     }
@@ -492,9 +543,18 @@ class UrsaLakestreamWriterIdempotentTest {
             UrsaStorageState state,
             TopicIdPartition tp,
             Log logInstance) {
-        when(state.time()).thenReturn(Time.SYSTEM);
+        return attachPartitionLog(state, tp, logInstance, Time.SYSTEM, TimestampType.CREATE_TIME);
+    }
+
+    private static UrsaPartitionLog attachPartitionLog(
+            UrsaStorageState state,
+            TopicIdPartition tp,
+            Log logInstance,
+            Time time,
+            TimestampType timestampType) {
+        when(state.time()).thenReturn(time);
         when(state.timer()).thenReturn(timer);
-        when(state.timestampTypeSupplier(tp)).thenReturn(() -> TimestampType.CREATE_TIME);
+        when(state.timestampTypeSupplier(tp)).thenReturn(() -> timestampType);
         UrsaPartitionLog partitionLog = new UrsaPartitionLog(
                 tp,
                 state,

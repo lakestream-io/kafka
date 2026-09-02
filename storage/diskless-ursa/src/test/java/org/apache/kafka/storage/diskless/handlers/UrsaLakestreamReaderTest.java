@@ -42,14 +42,15 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.lakestream.api.Log;
@@ -84,15 +85,16 @@ import static org.mockito.Mockito.when;
 
 class UrsaLakestreamReaderTest {
 
-    private static ScheduledExecutorService timer;
+    private static ScheduledThreadPoolExecutor timer;
 
     @BeforeAll
     static void startTimer() {
-        timer = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        timer = new ScheduledThreadPoolExecutor(1, runnable -> {
             Thread thread = new Thread(runnable, "diskless-timer-test");
             thread.setDaemon(true);
             return thread;
         });
+        timer.setRemoveOnCancelPolicy(true);
     }
 
     @AfterAll
@@ -600,35 +602,101 @@ class UrsaLakestreamReaderTest {
     }
 
     @Test
-    void testCaughtUpFetchWaitsForTheNextAppend() throws Exception {
-        TopicIdPartition tp = createTestPartition();
+    void testRequestWithDataOnOnePartitionAnswersWithoutWaiting() throws Exception {
+        TopicIdPartition withData = createTestPartition();
+        TopicIdPartition caughtUp = createTestPartition();
         UrsaStorageState state = mock(UrsaStorageState.class);
-        Log logInstance = mock(Log.class);
+
+        Log logWithData = mock(Log.class);
         LogCursor cursor = mock(LogCursor.class);
-        AtomicReference<LogOffset> lastOffset = new AtomicReference<>(logOffset(-1L, 0));
-        when(logInstance.getFirstOffset()).thenAnswer(
-                invocation -> CompletableFuture.completedFuture(lastOffset.get()));
-        when(logInstance.getLastOffset()).thenAnswer(
-                invocation -> CompletableFuture.completedFuture(lastOffset.get()));
-        when(logInstance.openEphemeralCursor(anyString(), eq(0L)))
+        when(logWithData.getFirstOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(0L, 1)));
+        when(logWithData.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(0L, 1)));
+        when(logWithData.openEphemeralCursor(anyString(), eq(0L)))
                 .thenReturn(CompletableFuture.completedFuture(cursor));
         when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(1L))).thenAnswer(
                 invocation -> CompletableFuture.completedFuture(
                         List.of(createKafkaRecordsEntry(0L, new long[]{1000L}))));
-        when(logInstance.append(anyInt(), any(ByteBuf.class))).thenAnswer(invocation -> {
-            lastOffset.set(logOffset(0L, 1));
-            LogEntryHeader header = mock(LogEntryHeader.class);
-            when(header.offset()).thenReturn(0L);
-            return CompletableFuture.completedFuture(header);
-        });
-        UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
+        attachReaderPartitionLog(state, withData, logWithData);
+        attachReaderPartitionLog(state, caughtUp, emptyLog());
+
+        UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
+        Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos = new LinkedHashMap<>();
+        fetchInfos.put(withData, fetchPartitionData(0L));
+        fetchInfos.put(caughtUp, fetchPartitionData(0L));
+
+        // Every mocked storage future is already complete, so the request resolves inline.
+        CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> responses =
+                reader.fetch(createFetchParams(30_000L), fetchInfos);
+
+        assertTrue(responses.isDone(), "A request that already has records must not wait");
+        Map<TopicIdPartition, FetchPartitionData> result = responses.get(5, TimeUnit.SECONDS);
+        assertEquals(List.of(withData, caughtUp), new ArrayList<>(result.keySet()));
+        assertEquals(1, countRecords(result.get(withData).records));
+        assertEquals(0, result.get(caughtUp).records.sizeInBytes());
+        assertTrue(timer.getQueue().isEmpty(), "Long-poll timeouts must be cancelled with the request");
+    }
+
+    @Test
+    void testRequestWaitsUntilAnAppendLandsOnAnyPartition() throws Exception {
+        TopicIdPartition idle = createTestPartition();
+        TopicIdPartition appended = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        attachReaderPartitionLog(state, idle, emptyLog());
+        Log appendedLog = growingLog();
+        UrsaPartitionLog appendedPartitionLog = attachReaderPartitionLog(state, appended, appendedLog);
+
+        UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
+        Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos = new LinkedHashMap<>();
+        fetchInfos.put(idle, fetchPartitionData(0L));
+        fetchInfos.put(appended, fetchPartitionData(0L));
 
         try {
-            // Every mocked storage future is already complete, so the first read runs inline and the
-            // long-poll waiter is registered by the time fetch() returns.
-            CompletableFuture<FetchPartitionData> fetchFuture =
-                    partitionLog.fetch(fetchPartitionData(0L), 30_000L);
-            assertFalse(fetchFuture.isDone(), "An empty caught-up fetch must wait for an append");
+            CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> responses =
+                    reader.fetch(createFetchParams(30_000L), fetchInfos);
+            assertFalse(responses.isDone(), "An empty caught-up request must wait for an append");
+            assertEquals(2, timer.getQueue().size(), "Each partition registers one long-poll timeout");
+
+            PartitionResponse write = appendedPartitionLog.write(
+                    MemoryRecords.withRecords(
+                            Compression.NONE,
+                            new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))),
+                    DisklessClientZone.NO_ZONE,
+                    "test").get(5, TimeUnit.SECONDS);
+            assertEquals(Errors.NONE, write.error);
+
+            Map<TopicIdPartition, FetchPartitionData> result = responses.get(5, TimeUnit.SECONDS);
+            assertEquals(List.of(idle, appended), new ArrayList<>(result.keySet()));
+            assertEquals(0, result.get(idle).records.sizeInBytes());
+            assertEquals(1, countRecords(result.get(appended).records));
+            assertEquals(1L, result.get(appended).highWatermark);
+            assertTrue(timer.getQueue().isEmpty(), "Long-poll timeouts must be cancelled with the request");
+        } finally {
+            appendedPartitionLog.close();
+        }
+    }
+
+    @Test
+    void testAppendDuringTheFirstReadStillWakesTheRequest() throws Exception {
+        TopicIdPartition tp = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        CompletableFuture<LogOffset> gatedLastOffset = new CompletableFuture<>();
+        AtomicInteger lastOffsetCalls = new AtomicInteger();
+        Log logInstance = growingLog();
+        // The first read hangs on its high-watermark lookup, so the append below lands after the
+        // waiter was registered but before the read can report an empty log.
+        AtomicReference<LogOffset> current = logState(logInstance);
+        when(logInstance.getLastOffset()).thenAnswer(invocation -> lastOffsetCalls.getAndIncrement() == 0
+                ? gatedLastOffset
+                : CompletableFuture.completedFuture(current.get()));
+        UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
+
+        UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
+        try {
+            CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> responses =
+                    reader.fetch(createFetchParams(30_000L), Map.of(tp, fetchPartitionData(0L)));
+            assertFalse(responses.isDone());
 
             PartitionResponse write = partitionLog.write(
                     MemoryRecords.withRecords(
@@ -638,13 +706,55 @@ class UrsaLakestreamReaderTest {
                     "test").get(5, TimeUnit.SECONDS);
             assertEquals(Errors.NONE, write.error);
 
-            FetchPartitionData response = fetchFuture.get(5, TimeUnit.SECONDS);
+            // The first read only now reports the log as it was before the append.
+            gatedLastOffset.complete(logOffset(-1L, 0));
+
+            // A missed notification would park this request for the full 30s wait instead.
+            FetchPartitionData response = responses.get(5, TimeUnit.SECONDS).get(tp);
             assertEquals(Errors.NONE, response.error);
-            assertEquals(1L, response.highWatermark);
             assertEquals(1, countRecords(response.records));
+            assertTrue(timer.getQueue().isEmpty(), "Long-poll timeouts must be cancelled with the request");
         } finally {
             partitionLog.close();
         }
+    }
+
+    /** A log that stays empty: first and last offset both report "nothing written yet". */
+    private static Log emptyLog() {
+        Log logInstance = mock(Log.class);
+        when(logInstance.getFirstOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(-1L, 0)));
+        when(logInstance.getLastOffset()).thenReturn(
+                CompletableFuture.completedFuture(logOffset(-1L, 0)));
+        return logInstance;
+    }
+
+    /** An empty log whose single append publishes one record at offset 0. */
+    private static Log growingLog() {
+        Log logInstance = mock(Log.class);
+        logState(logInstance);
+        return logInstance;
+    }
+
+    private static AtomicReference<LogOffset> logState(Log logInstance) {
+        AtomicReference<LogOffset> current = new AtomicReference<>(logOffset(-1L, 0));
+        LogCursor cursor = mock(LogCursor.class);
+        when(logInstance.getFirstOffset()).thenAnswer(
+                invocation -> CompletableFuture.completedFuture(current.get()));
+        when(logInstance.getLastOffset()).thenAnswer(
+                invocation -> CompletableFuture.completedFuture(current.get()));
+        when(logInstance.openEphemeralCursor(anyString(), eq(0L)))
+                .thenReturn(CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(1L))).thenAnswer(
+                invocation -> CompletableFuture.completedFuture(
+                        List.of(createKafkaRecordsEntry(0L, new long[]{1000L}))));
+        when(logInstance.append(anyInt(), any(ByteBuf.class))).thenAnswer(invocation -> {
+            current.set(logOffset(0L, 1));
+            LogEntryHeader header = mock(LogEntryHeader.class);
+            when(header.offset()).thenReturn(0L);
+            return CompletableFuture.completedFuture(header);
+        });
+        return current;
     }
 
     private static int countRecords(Records records) {

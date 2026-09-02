@@ -422,10 +422,14 @@ final class PartitionWriter {
 
             @Override
             public PartitionResponse completed(LogEntryHeader entryHeader, long appendTimestamp) {
-                // Producer-state bookkeeping keeps its own wall-clock timestamp, independent of the
-                // timestamp type the response reports.
+                // A LogAppendTime topic stores the stamp it wrote into the records, so a later
+                // duplicate reports exactly what the original append reported. A CreateTime topic
+                // has no such stamp and keeps a wall-clock bookkeeping timestamp instead.
+                long storedTimestamp = appendTimestamp == RecordBatch.NO_TIMESTAMP
+                        ? time.milliseconds()
+                        : appendTimestamp;
                 ProducerStateManager.AppendResult appendResult = producerStateManager.completeAppend(
-                        pendingAppend, entryHeader.offset(), time.milliseconds());
+                        pendingAppend, entryHeader.offset(), storedTimestamp);
                 return new PartitionResponse(Errors.NONE, appendResult.baseOffset(), appendTimestamp, 0L);
             }
         };
@@ -444,9 +448,9 @@ final class PartitionWriter {
     }
 
     /**
-     * A duplicate reports the timestamp of the append it duplicates, as the classic log does. A
-     * CreateTime topic reports no log-append time at all, so the producer-state bookkeeping
-     * timestamp stays internal.
+     * A duplicate reports the timestamp of the append it duplicates, as the classic log does: for a
+     * LogAppendTime topic that is the stamp written into the original records. A CreateTime topic
+     * reports no log-append time at all, so its bookkeeping timestamp stays internal.
      */
     private static long duplicateLogAppendTime(
             long appendTimestamp,
