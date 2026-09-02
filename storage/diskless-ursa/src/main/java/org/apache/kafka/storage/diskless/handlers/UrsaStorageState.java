@@ -50,6 +50,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -230,21 +231,20 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     }
 
     /**
-     * The effective {@code message.timestamp.type} of a partition, resolved on every call so that a
-     * topic config update takes effect on the next produce request.
+     * The effective {@code message.timestamp.type} of a topic. A partition writer resolves this
+     * once, when it is built, and {@link #applyTopicConfig} pushes every later change to it: the
+     * produce path must not rebuild a topic's configuration per append.
      */
-    Supplier<TimestampType> timestampTypeSupplier(TopicIdPartition tp) {
-        return () -> timestampType(tp.topic());
+    TimestampType timestampType(String topic) {
+        Map<String, String> topicConfig =
+                topicConfigSupplier == null ? null : topicConfigSupplier.apply(topic);
+        return timestampType(topic, topicConfig);
     }
 
-    private TimestampType timestampType(String topic) {
-        String configured = null;
-        if (topicConfigSupplier != null) {
-            Map<String, String> topicConfig = topicConfigSupplier.apply(topic);
-            if (topicConfig != null) {
-                configured = topicConfig.get(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG);
-            }
-        }
+    private TimestampType timestampType(String topic, Map<String, String> topicConfig) {
+        String configured = topicConfig == null
+                ? null
+                : topicConfig.get(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG);
         if (configured == null || configured.isBlank()) {
             configured = defaultTimestampType();
         }
@@ -288,18 +288,22 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         }
         // Kafka metadata is authoritative for broker-side retention. Catalog properties are
         // reconciled by the active controller's DisklessTopicLifecycleReconciler.
-        triggerRetentionForTopic(topicName, topicId, Map.copyOf(topicConfig));
+        Map<String, String> config = Map.copyOf(topicConfig);
+        TimestampType timestampType = timestampType(topicName, config);
+        forEachPartitionOf(topicName, topicId, partitionLog -> partitionLog.applyTimestampType(timestampType));
+        triggerRetentionForTopic(topicName, topicId, config);
     }
 
+    /**
+     * Publishes the local lifecycle fence for a topic this broker has seen deleted. Nothing else
+     * happens here: the partition logs are closed by the deletion reconciler, and a topic on its
+     * way out has no retention left to enforce.
+     */
     public void fenceDeletedTopic(String topicName, Uuid topicId) {
         if (topicName == null || topicId == null) {
             return;
         }
         lakestreamStorageHolder.markTopicDeleted(topicId);
-        // Publish the local lifecycle fence before doing any best-effort cleanup work. A request
-        // racing this committed deletion must not be able to open a new leased Log while
-        // retention callbacks are being scheduled.
-        triggerRetentionForTopic(topicName, topicId, Map.of());
     }
 
     /**
@@ -539,15 +543,20 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     ) {
         try {
             RetentionConfig retentionConfig = buildRetentionConfig(topicConfig);
-            partitionLogs.forEach((tp, partitionLog) -> {
-                if (tp.topic().equals(topicName) && tp.topicId().equals(topicId)) {
-                    partitionLog.retention().request(
-                            retentionConfig.retentionMs(), retentionConfig.retentionBytes());
-                }
-            });
+            forEachPartitionOf(topicName, topicId, partitionLog -> partitionLog.retention().request(
+                    retentionConfig.retentionMs(), retentionConfig.retentionBytes()));
         } catch (Throwable error) {
             log.warn("Failed to schedule updated retention for topic {} ({})", topicName, topicId, error);
         }
+    }
+
+    /** Applies {@code action} to every open partition log of one exact topic incarnation. */
+    private void forEachPartitionOf(String topicName, Uuid topicId, Consumer<UrsaPartitionLog> action) {
+        partitionLogs.forEach((tp, partitionLog) -> {
+            if (tp.topic().equals(topicName) && tp.topicId().equals(topicId)) {
+                action.accept(partitionLog);
+            }
+        });
     }
 
     private static ScheduledExecutorService newDaemonScheduler(String threadName) {

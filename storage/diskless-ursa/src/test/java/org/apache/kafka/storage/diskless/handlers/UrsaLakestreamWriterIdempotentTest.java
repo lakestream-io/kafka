@@ -554,7 +554,7 @@ class UrsaLakestreamWriterIdempotentTest {
             TimestampType timestampType) {
         when(state.time()).thenReturn(time);
         when(state.timer()).thenReturn(timer);
-        when(state.timestampTypeSupplier(tp)).thenReturn(() -> timestampType);
+        when(state.timestampType(tp.topic())).thenReturn(timestampType);
         UrsaPartitionLog partitionLog = new UrsaPartitionLog(
                 tp,
                 state,

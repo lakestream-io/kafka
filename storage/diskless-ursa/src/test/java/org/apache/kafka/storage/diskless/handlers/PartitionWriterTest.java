@@ -31,8 +31,6 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateManager;
 
-import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -40,8 +38,6 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -68,22 +64,6 @@ class PartitionWriterTest {
     private static final TopicIdPartition TP =
             new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
     private static final String NO_ZONE = DisklessClientZone.NO_ZONE;
-
-    private ScheduledExecutorService timer;
-
-    @BeforeEach
-    void setUp() {
-        timer = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "partition-writer-test-timer");
-            thread.setDaemon(true);
-            return thread;
-        });
-    }
-
-    @AfterEach
-    void tearDown() {
-        timer.shutdownNow();
-    }
 
     @Test
     void createTimeTopicReportsNoLogAppendTime() throws Exception {
@@ -126,13 +106,32 @@ class PartitionWriterTest {
     }
 
     @Test
+    void aTimestampTypeChangeTakesEffectOnTheNextAppend() throws Exception {
+        Log log = mock(Log.class);
+        when(log.append(eq(1), any())).thenAnswer(invocation -> completedFuture(header(0L, 1, 1000L)));
+        PartitionWriter writer = writer(log, TimestampType.CREATE_TIME, new MockTime(0L, 5000L, 0L));
+
+        PartitionResponse beforeChange = writer
+                .write(records(new SimpleRecord(5L, "a".getBytes(StandardCharsets.UTF_8))), NO_ZONE)
+                .get(5, TimeUnit.SECONDS);
+        assertEquals(RecordBatch.NO_TIMESTAMP, beforeChange.logAppendTime);
+
+        writer.applyTimestampType(TimestampType.LOG_APPEND_TIME);
+
+        PartitionResponse afterChange = writer
+                .write(records(new SimpleRecord(5L, "b".getBytes(StandardCharsets.UTF_8))), NO_ZONE)
+                .get(5, TimeUnit.SECONDS);
+        assertEquals(5000L, afterChange.logAppendTime);
+    }
+
+    @Test
     void awaitAppendCompletesWhenAnAppendLands() throws Exception {
         Log log = mock(Log.class);
         CompletableFuture<LogEntryHeader> pending = new CompletableFuture<>();
         when(log.append(eq(1), any())).thenReturn(pending);
         PartitionWriter writer = writer(log, TimestampType.CREATE_TIME);
 
-        CompletableFuture<Void> waiter = writer.awaitAppend(60_000L);
+        CompletableFuture<Void> waiter = writer.awaitAppend();
         CompletableFuture<PartitionResponse> write =
                 writer.write(records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))), NO_ZONE);
         assertFalse(waiter.isDone());
@@ -144,22 +143,13 @@ class PartitionWriterTest {
     }
 
     @Test
-    void awaitAppendTimesOutQuietly() throws Exception {
-        PartitionWriter writer = writer(mock(Log.class), TimestampType.CREATE_TIME);
-
-        CompletableFuture<Void> waiter = writer.awaitAppend(50L);
-
-        assertNull(waiter.get(5, TimeUnit.SECONDS));
-    }
-
-    @Test
     void awaitAppendIsNotCompletedByAFailedAppend() throws Exception {
         Log log = mock(Log.class);
         CompletableFuture<LogEntryHeader> pending = new CompletableFuture<>();
         when(log.append(eq(1), any())).thenReturn(pending);
         PartitionWriter writer = writer(log, TimestampType.CREATE_TIME);
 
-        CompletableFuture<Void> waiter = writer.awaitAppend(60_000L);
+        CompletableFuture<Void> waiter = writer.awaitAppend();
         CompletableFuture<PartitionResponse> write =
                 writer.write(records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))), NO_ZONE);
         pending.completeExceptionally(new IllegalStateException("append failed"));
@@ -179,13 +169,12 @@ class PartitionWriterTest {
                 zone -> {
                     throw new IllegalStateException("no producer state expected for " + zone);
                 },
-                () -> TimestampType.CREATE_TIME,
-                new MockTime(0L, 1000L, 0L),
-                timer);
+                TimestampType.CREATE_TIME,
+                new MockTime(0L, 1000L, 0L));
 
         CompletableFuture<PartitionResponse> write =
                 writer.write(records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))), NO_ZONE);
-        CompletableFuture<Void> waiter = writer.awaitAppend(60_000L);
+        CompletableFuture<Void> waiter = writer.awaitAppend();
         assertEquals(1, writer.ownedWritePayloadCount());
         assertFalse(write.isDone());
 
@@ -193,7 +182,7 @@ class PartitionWriterTest {
 
         assertNull(waiter.get(5, TimeUnit.SECONDS));
         assertEquals(0, writer.ownedWritePayloadCount());
-        assertNull(writer.awaitAppend(60_000L).get(5, TimeUnit.SECONDS));
+        assertNull(writer.awaitAppend().get(5, TimeUnit.SECONDS));
         PartitionResponse afterClose = writer
                 .write(records(new SimpleRecord("b".getBytes(StandardCharsets.UTF_8))), NO_ZONE)
                 .get(5, TimeUnit.SECONDS);
@@ -226,9 +215,8 @@ class PartitionWriterTest {
                 TP,
                 () -> CompletableFuture.failedFuture(openFailure),
                 zone -> producerStateManager,
-                () -> TimestampType.CREATE_TIME,
-                new MockTime(0L, 1000L, 0L),
-                timer);
+                TimestampType.CREATE_TIME,
+                new MockTime(0L, 1000L, 0L));
 
         CompletableFuture<PartitionResponse> write = writer.write(idempotentRecords(), NO_ZONE);
 
@@ -253,9 +241,8 @@ class PartitionWriterTest {
                 TP,
                 () -> completedFuture(log),
                 zone -> producerStateManager,
-                () -> TimestampType.CREATE_TIME,
-                new MockTime(0L, 1000L, 0L),
-                timer);
+                TimestampType.CREATE_TIME,
+                new MockTime(0L, 1000L, 0L));
 
         CompletableFuture<PartitionResponse> failed = writer.write(idempotentRecords(), NO_ZONE);
 
@@ -285,9 +272,8 @@ class PartitionWriterTest {
                 zone -> {
                     throw new IllegalStateException("no producer state expected for " + zone);
                 },
-                () -> timestampType,
-                time,
-                timer);
+                timestampType,
+                time);
     }
 
     private static MemoryRecords records(SimpleRecord... records) {

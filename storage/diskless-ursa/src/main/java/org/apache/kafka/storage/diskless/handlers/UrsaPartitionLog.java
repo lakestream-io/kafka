@@ -19,6 +19,7 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
@@ -102,9 +103,8 @@ final class UrsaPartitionLog {
                 topicIdPartition,
                 this::initialized,
                 this::getOrCreateProducerStateManager,
-                state.timestampTypeSupplier(topicIdPartition),
-                state.time(),
-                state.timer());
+                state.timestampType(topicIdPartition.topic()),
+                state.time());
         this.retention = new PartitionRetention(topicIdPartition, this::initialized, error -> invalidate());
         this.initFuture = createInitFuture(logFuture);
     }
@@ -134,10 +134,16 @@ final class UrsaPartitionLog {
 
     /**
      * Registers a long-poll waiter for this partition. The reader registers one before its first
-     * read so that an append landing during that read wakes the request instead of being missed.
+     * read so that an append landing during that read wakes the request instead of being missed,
+     * and completes it when the request ends -- the deadline is the request's, not this waiter's.
      */
-    CompletableFuture<Void> awaitAppend(long maxWaitMs) {
-        return writer.awaitAppend(maxWaitMs);
+    CompletableFuture<Void> awaitAppend() {
+        return writer.awaitAppend();
+    }
+
+    /** Adopts a topic configuration change that this partition's writer caches. */
+    void applyTimestampType(TimestampType timestampType) {
+        writer.applyTimestampType(timestampType);
     }
 
     CompletableFuture<ListOffsetsPartitionResponse> listOffsets(ListOffsetsPartitionRequest request) {

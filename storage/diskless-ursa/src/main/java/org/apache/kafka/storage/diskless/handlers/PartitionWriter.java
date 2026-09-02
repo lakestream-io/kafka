@@ -37,9 +37,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -70,29 +67,38 @@ final class PartitionWriter {
     private final TopicIdPartition topicIdPartition;
     private final Supplier<CompletableFuture<Log>> logSupplier;
     private final Function<String, ProducerStateManager> producerStateForZone;
-    private final Supplier<TimestampType> timestampType;
     private final Time time;
-    private final ScheduledExecutorService timer;
     private final PartitionWriteSequencer writeSequencer;
     private final Set<OwnedWritePayload> ownedWritePayloads = ConcurrentHashMap.newKeySet();
     private final Object waitersLock = new Object();
     private List<CompletableFuture<Void>> waiters = new ArrayList<>();
+    /** The topic's effective {@code message.timestamp.type}, refreshed by config updates. */
+    private volatile TimestampType timestampType;
     private volatile boolean closed;
 
     PartitionWriter(TopicIdPartition topicIdPartition,
                     Supplier<CompletableFuture<Log>> logSupplier,
                     Function<String, ProducerStateManager> producerStateForZone,
-                    Supplier<TimestampType> timestampType,
-                    Time time,
-                    ScheduledExecutorService timer) {
+                    TimestampType timestampType,
+                    Time time) {
         this.topicIdPartition = Objects.requireNonNull(topicIdPartition, "topicIdPartition must not be null");
         this.logSupplier = Objects.requireNonNull(logSupplier, "logSupplier must not be null");
         this.producerStateForZone =
                 Objects.requireNonNull(producerStateForZone, "producerStateForZone must not be null");
         this.timestampType = Objects.requireNonNull(timestampType, "timestampType must not be null");
         this.time = Objects.requireNonNull(time, "time must not be null");
-        this.timer = Objects.requireNonNull(timer, "timer must not be null");
         this.writeSequencer = new PartitionWriteSequencer(topicIdPartition.toString());
+    }
+
+    /**
+     * Adopts a new {@code message.timestamp.type} for this partition's topic. Resolving it per
+     * append meant rebuilding the topic's configuration on the produce path; it is resolved once
+     * here instead, and the metadata layer pushes every later change through this method.
+     */
+    void applyTimestampType(TimestampType updated) {
+        if (updated != null) {
+            timestampType = updated;
+        }
     }
 
     /**
@@ -128,34 +134,21 @@ final class PartitionWriter {
     }
 
     /**
-     * Completes once an append lands after this call, or after {@code maxWaitMs}, or when this writer
-     * closes. Never fails, so a long-polling fetch can always re-evaluate itself.
+     * Completes once an append lands after this call, or when this writer closes. Never fails, so a
+     * long-polling fetch can always re-evaluate itself. The deadline belongs to the request, which
+     * completes this waiter when its own timeout fires.
      */
-    CompletableFuture<Void> awaitAppend(long maxWaitMs) {
+    CompletableFuture<Void> awaitAppend() {
         CompletableFuture<Void> waiter = new CompletableFuture<>();
-        if (maxWaitMs <= 0) {
-            waiter.complete(null);
-            return waiter;
-        }
         synchronized (waitersLock) {
             if (closed) {
                 waiter.complete(null);
                 return waiter;
             }
-            // Waiters that already timed out drop out here, so an idle partition that never appends
-            // keeps at most as many waiters as it has fetches in flight.
+            // Waiters whose request already ended drop out here, so an idle partition that never
+            // appends keeps at most as many waiters as it has fetches in flight.
             waiters.removeIf(CompletableFuture::isDone);
             waiters.add(waiter);
-        }
-        try {
-            ScheduledFuture<?> timeout =
-                    timer.schedule(() -> waiter.complete(null), maxWaitMs, TimeUnit.MILLISECONDS);
-            waiter.whenComplete((ignored, error) -> timeout.cancel(false));
-        } catch (RuntimeException scheduleError) {
-            // The timer is shutting down; answering the fetch immediately is always correct.
-            log.debug("Failed to schedule the long-poll timeout for partition {}",
-                    topicIdPartition, scheduleError);
-            waiter.complete(null);
         }
         return waiter;
     }
@@ -206,7 +199,7 @@ final class PartitionWriter {
         final boolean idempotent = hasProducerId;
         try {
             long appendTimestamp = RecordBatch.NO_TIMESTAMP;
-            if (timestampType.get() == TimestampType.LOG_APPEND_TIME) {
+            if (timestampType == TimestampType.LOG_APPEND_TIME) {
                 appendTimestamp = time.milliseconds();
                 KafkaRecordsPayload.setLogAppendTime(records, appendTimestamp);
             }

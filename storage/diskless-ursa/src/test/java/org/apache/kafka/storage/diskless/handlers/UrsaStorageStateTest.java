@@ -19,9 +19,16 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.record.internal.SimpleRecord;
+import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
+import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.metrics.KafkaMetricsGroup;
 import org.apache.kafka.server.metrics.KafkaYammerMetrics;
@@ -34,6 +41,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -46,11 +54,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.lakestream.api.Log;
+import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.StreamCatalog;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.StreamMetadata;
 import io.lakestream.api.exception.NoSuchStreamException;
+import io.netty.buffer.ByteBuf;
 import io.oxia.client.api.AsyncOxiaClient;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -672,17 +682,63 @@ class UrsaStorageStateTest {
                 mock(StreamCatalog.class),
                 Map.of(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, TimestampType.LOG_APPEND_TIME.name),
                 ignored -> topicConfig)) {
-            assertEquals(TimestampType.LOG_APPEND_TIME, state.timestampTypeSupplier(tp).get());
+            assertEquals(TimestampType.LOG_APPEND_TIME, state.timestampType(tp.topic()));
 
             topicConfig.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, TimestampType.CREATE_TIME.name);
-            assertEquals(TimestampType.CREATE_TIME, state.timestampTypeSupplier(tp).get());
+            assertEquals(TimestampType.CREATE_TIME, state.timestampType(tp.topic()));
 
             topicConfig.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, "NotATimestampType");
-            assertEquals(TimestampType.CREATE_TIME, state.timestampTypeSupplier(tp).get());
+            assertEquals(TimestampType.CREATE_TIME, state.timestampType(tp.topic()));
         }
 
         try (UrsaStorageState withoutConfigs = newState(mock(StreamCatalog.class))) {
-            assertEquals(TimestampType.CREATE_TIME, withoutConfigs.timestampTypeSupplier(tp).get());
+            assertEquals(TimestampType.CREATE_TIME, withoutConfigs.timestampType(tp.topic()));
+        }
+    }
+
+    @Test
+    void testTimestampTypeIsResolvedOncePerWriterAndRefreshedByConfigUpdates() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(
+                Uuid.randomUuid(), new TopicPartition("timestamp-config-topic", 0));
+        Map<String, String> topicConfig = new HashMap<>();
+        topicConfig.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, TimestampType.CREATE_TIME.name);
+        AtomicInteger configLookups = new AtomicInteger();
+        Log logInstance = mockLog(0L, 0L, 1, 10L, 10, 10L, 10);
+        LogEntryHeader appended = mock(LogEntryHeader.class);
+        when(appended.offset()).thenReturn(0L);
+        when(logInstance.append(anyInt(), any(ByteBuf.class)))
+                .thenReturn(CompletableFuture.completedFuture(appended));
+
+        try (UrsaStorageState state = new UrsaStorageState(
+                new MockTime(0L, 7_000L, 0L),
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                new LakestreamStorageHolder(mockCatalogWithLog(logInstance), null),
+                Map.of(),
+                topic -> {
+                    configLookups.incrementAndGet();
+                    return topicConfig;
+                })) {
+            UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
+            int lookupsAfterOpen = configLookups.get();
+
+            PartitionResponse beforeChange = partitionLog
+                    .write(oneRecord("a"), DisklessClientZone.NO_ZONE, "test")
+                    .get(5, TimeUnit.SECONDS);
+            assertEquals(Errors.NONE, beforeChange.error);
+            assertEquals(RecordBatch.NO_TIMESTAMP, beforeChange.logAppendTime);
+            assertEquals(lookupsAfterOpen, configLookups.get(),
+                    "The produce path must not rebuild the topic configuration per append");
+
+            topicConfig.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, TimestampType.LOG_APPEND_TIME.name);
+            state.applyTopicConfig(tp.topic(), tp.topicId(), topicConfig);
+
+            PartitionResponse afterChange = partitionLog
+                    .write(oneRecord("b"), DisklessClientZone.NO_ZONE, "test")
+                    .get(5, TimeUnit.SECONDS);
+            assertEquals(Errors.NONE, afterChange.error);
+            assertEquals(7_000L, afterChange.logAppendTime);
         }
     }
 
@@ -754,6 +810,11 @@ class UrsaStorageStateTest {
                 mock(UrsaStorageConfig.class),
                 mock(BrokerTopicStats.class),
                 catalog);
+    }
+
+    private static MemoryRecords oneRecord(String value) {
+        return MemoryRecords.withRecords(
+                Compression.NONE, new SimpleRecord(5L, value.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static StreamCatalog mockCatalogWithLog(Log logInstance) {

@@ -25,6 +25,9 @@ import org.apache.kafka.storage.diskless.ListOffsetsPartitionRequest;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
 import org.apache.kafka.storage.diskless.Reader;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
@@ -33,6 +36,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -44,10 +49,12 @@ import java.util.stream.Collectors;
  * append that lands while a read is in flight wakes this request instead of being missed. If the
  * first pass answers the request — any records, any error, or nothing that waiting could change —
  * the waiters are completed at once and the answer is returned. Otherwise the request waits for the
- * first append on any of the caught-up partitions (or the earliest timeout) and re-reads exactly
- * those partitions once.
+ * first append on any of the caught-up partitions, or for the one timeout the request schedules for
+ * all of them, and re-reads exactly those partitions once.
  */
 public class UrsaLakestreamReader implements Reader {
+
+    private static final Logger log = LoggerFactory.getLogger(UrsaLakestreamReader.class);
 
     private final UrsaStorageState state;
 
@@ -79,8 +86,13 @@ public class UrsaLakestreamReader implements Reader {
         // Registered before the first read: an append that lands between the read's high-watermark
         // snapshot and the decision to wait must still wake this request.
         Map<TopicIdPartition, CompletableFuture<Void>> waiters = params.maxWaitMs > 0
-                ? registerWaiters(partitionLogs, params.maxWaitMs)
+                ? registerWaiters(partitionLogs)
                 : Map.of();
+        // One deadline for the whole request, shared by every partition's waiter: a fetch over a
+        // thousand partitions costs the timer a single task rather than a thousand.
+        CompletableFuture<Void> deadline = waiters.isEmpty()
+                ? CompletableFuture.completedFuture(null)
+                : scheduleDeadline(params.maxWaitMs);
 
         CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> result =
                 read(partitionLogs, fetchInfos, partitionLogs.keySet())
@@ -90,7 +102,7 @@ public class UrsaLakestreamReader implements Reader {
                                     || !unresolved.isEmpty() || answered(responses)) {
                                 return CompletableFuture.completedFuture(responses);
                             }
-                            return awaitAnyAppend(waiters)
+                            return awaitAnyAppend(waiters, deadline)
                                     .thenCompose(ignored -> read(partitionLogs, fetchInfos, caughtUp))
                                     .thenApply(rereads -> merge(partitionLogs.keySet(), responses, rereads));
                         })
@@ -100,8 +112,11 @@ public class UrsaLakestreamReader implements Reader {
             return result;
         }
         // Whatever ends the request — an answer, a wait, or a failure — releases every waiter it
-        // registered, cancelling the timeouts they scheduled.
-        return result.whenComplete((responses, error) -> completeWaiters(waiters.values()));
+        // registered and cancels the one timeout it scheduled.
+        return result.whenComplete((responses, error) -> {
+            completeWaiters(waiters.values());
+            deadline.complete(null);
+        });
     }
 
     @Override
@@ -163,16 +178,36 @@ public class UrsaLakestreamReader implements Reader {
     }
 
     private static Map<TopicIdPartition, CompletableFuture<Void>> registerWaiters(
-            Map<TopicIdPartition, UrsaPartitionLog> partitionLogs,
-            long maxWaitMs) {
+            Map<TopicIdPartition, UrsaPartitionLog> partitionLogs) {
         Map<TopicIdPartition, CompletableFuture<Void>> waiters = new LinkedHashMap<>();
-        partitionLogs.forEach((tp, partitionLog) -> waiters.put(tp, partitionLog.awaitAppend(maxWaitMs)));
+        partitionLogs.forEach((tp, partitionLog) -> waiters.put(tp, partitionLog.awaitAppend()));
         return waiters;
     }
 
+    /**
+     * The request's single long-poll timeout. It is cancelled as soon as the request ends, whether
+     * it ends on an append, on this deadline, or on a failure.
+     */
+    private CompletableFuture<Void> scheduleDeadline(long maxWaitMs) {
+        CompletableFuture<Void> deadline = new CompletableFuture<>();
+        try {
+            ScheduledFuture<?> timeout = state.timer()
+                    .schedule(() -> deadline.complete(null), maxWaitMs, TimeUnit.MILLISECONDS);
+            deadline.whenComplete((ignored, error) -> timeout.cancel(false));
+        } catch (RuntimeException scheduleError) {
+            // The timer is shutting down; answering the fetch immediately is always correct.
+            log.debug("Failed to schedule the long-poll timeout for a diskless fetch", scheduleError);
+            deadline.complete(null);
+        }
+        return deadline;
+    }
+
     private static CompletableFuture<Object> awaitAnyAppend(
-            Map<TopicIdPartition, CompletableFuture<Void>> waiters) {
-        return CompletableFuture.anyOf(waiters.values().toArray(new CompletableFuture<?>[0]));
+            Map<TopicIdPartition, CompletableFuture<Void>> waiters,
+            CompletableFuture<Void> deadline) {
+        List<CompletableFuture<?>> wakeups = new ArrayList<>(waiters.values());
+        wakeups.add(deadline);
+        return CompletableFuture.anyOf(wakeups.toArray(new CompletableFuture<?>[0]));
     }
 
     private static void completeWaiters(Collection<CompletableFuture<Void>> waiters) {

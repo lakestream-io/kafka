@@ -537,6 +537,53 @@ class UrsaLakestreamReaderTest {
     }
 
     @Test
+    void testRequestSchedulesOneTimeoutForEveryPartitionItWaitsOn() throws Exception {
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos = new LinkedHashMap<>();
+        List<UrsaPartitionLog> partitionLogs = new ArrayList<>();
+        for (int partition = 0; partition < 100; partition++) {
+            TopicIdPartition tp = new TopicIdPartition(
+                    Uuid.randomUuid(), new TopicPartition("many-partitions-topic", partition));
+            partitionLogs.add(attachReaderPartitionLog(state, tp, emptyLog()));
+            fetchInfos.put(tp, fetchPartitionData(0L));
+        }
+
+        UrsaLakestreamReader reader = new UrsaLakestreamReader(state);
+        try {
+            CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> responses =
+                    reader.fetch(createFetchParams(30_000L), fetchInfos);
+
+            assertFalse(responses.isDone(), "An empty caught-up request must wait for an append");
+            assertEquals(1, timer.getQueue().size(),
+                    "The whole request shares one deadline, however many partitions it holds");
+        } finally {
+            partitionLogs.forEach(partitionLog -> partitionLog.close(false));
+        }
+    }
+
+    @Test
+    void testRequestIsAnsweredWhenItsSharedDeadlineFires() throws Exception {
+        TopicIdPartition first = createTestPartition();
+        TopicIdPartition second = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        attachReaderPartitionLog(state, first, emptyLog());
+        attachReaderPartitionLog(state, second, emptyLog());
+
+        Map<TopicIdPartition, FetchRequest.PartitionData> fetchInfos = new LinkedHashMap<>();
+        fetchInfos.put(first, fetchPartitionData(0L));
+        fetchInfos.put(second, fetchPartitionData(0L));
+
+        Map<TopicIdPartition, FetchPartitionData> responses =
+                new UrsaLakestreamReader(state).fetch(createFetchParams(50L), fetchInfos)
+                        .get(5, TimeUnit.SECONDS);
+
+        assertEquals(List.of(first, second), new ArrayList<>(responses.keySet()));
+        assertEquals(0, responses.get(first).records.sizeInBytes());
+        assertEquals(0, responses.get(second).records.sizeInBytes());
+        assertTrue(timer.getQueue().isEmpty(), "The long-poll timeout must be cancelled with the request");
+    }
+
+    @Test
     void testFetchPartitionThatCannotBeResolvedFailsOnItsOwn() throws Exception {
         TopicIdPartition healthy = createTestPartition();
         TopicIdPartition deleted = createTestPartition();
@@ -726,7 +773,7 @@ class UrsaLakestreamReaderTest {
             CompletableFuture<Map<TopicIdPartition, FetchPartitionData>> responses =
                     reader.fetch(createFetchParams(30_000L), fetchInfos);
             assertFalse(responses.isDone(), "An empty caught-up request must wait for an append");
-            assertEquals(2, timer.getQueue().size(), "Each partition registers one long-poll timeout");
+            assertEquals(1, timer.getQueue().size(), "A request schedules one long-poll timeout");
 
             PartitionResponse write = appendedPartitionLog.write(
                     MemoryRecords.withRecords(
@@ -842,7 +889,7 @@ class UrsaLakestreamReaderTest {
             Log logInstance) {
         when(state.time()).thenReturn(Time.SYSTEM);
         when(state.timer()).thenReturn(timer);
-        when(state.timestampTypeSupplier(tp)).thenReturn(() -> TimestampType.CREATE_TIME);
+        when(state.timestampType(tp.topic())).thenReturn(TimestampType.CREATE_TIME);
         UrsaPartitionLog partitionLog = new UrsaPartitionLog(
                 tp,
                 state,
