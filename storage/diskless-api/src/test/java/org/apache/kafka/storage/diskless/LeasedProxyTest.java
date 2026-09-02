@@ -23,6 +23,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -34,6 +35,34 @@ class LeasedProxyTest {
 
     interface Component extends AutoCloseable {
         String ping();
+    }
+
+    @Test
+    void proxyKeepsItsOwnIdentityAndForwardsToString() throws Exception {
+        DisklessClassLoaderRegistry.Lease lease = mock(DisklessClassLoaderRegistry.Lease.class);
+        when(lease.classLoader()).thenReturn(getClass().getClassLoader());
+        Component delegate = new Component() {
+            @Override
+            public String ping() {
+                return "pong";
+            }
+
+            @Override
+            public void close() {
+            }
+
+            @Override
+            public String toString() {
+                return "the-delegate";
+            }
+        };
+        Component leased = DisklessClassLoaderContext.leased(Component.class, delegate, lease);
+
+        // The proxy, not the delegate, is what callers hold and put in collections.
+        assertEquals(leased, leased);
+        assertNotEquals(leased, delegate);
+        assertEquals(System.identityHashCode(leased), leased.hashCode());
+        assertEquals("the-delegate", leased.toString());
     }
 
     @Test

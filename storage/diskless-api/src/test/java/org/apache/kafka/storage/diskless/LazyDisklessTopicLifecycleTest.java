@@ -24,10 +24,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -83,6 +85,36 @@ class LazyDisklessTopicLifecycleTest {
         assertInstanceOf(IllegalStateException.class, failure.getCause());
         verify(real, timeout(10_000)).close();
         verify(real, never()).listManagedTopics();
+    }
+
+    @Test
+    void aLoadCompletingDuringCloseClosesTheDelegateExactlyOnce() throws Exception {
+        AtomicReference<LazyDisklessTopicLifecycle> holder = new AtomicReference<>();
+        CountDownLatch callbacksRegistered = new CountDownLatch(1);
+        DisklessTopicLifecycle real = mock(DisklessTopicLifecycle.class);
+        // The operation runs on the loading thread as soon as the load completes, before that
+        // thread reaches the post-load callback. Closing from here is the interleaving where
+        // close() sees a delegate that the post-load callback is also about to close.
+        when(real.listManagedTopics()).thenAnswer(invocation -> {
+            holder.get().close();
+            return CompletableFuture.completedFuture(List.of());
+        });
+        LazyDisklessTopicLifecycle lazy = new LazyDisklessTopicLifecycle(() -> {
+            try {
+                callbacksRegistered.await();
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            return real;
+        });
+        holder.set(lazy);
+
+        CompletableFuture<List<DisklessTopicLifecycle.ManagedTopic>> pending = lazy.listManagedTopics();
+        // Only release the load once both of the loading future's callbacks are registered.
+        callbacksRegistered.countDown();
+        assertEquals(List.of(), pending.get(10, TimeUnit.SECONDS));
+
+        verify(real, after(500).times(1)).close();
     }
 
     @Test

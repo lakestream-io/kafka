@@ -44,6 +44,7 @@ final class LazyDisklessTopicLifecycle implements DisklessTopicLifecycle {
     private final Object lock = new Object();
     private CompletableFuture<DisklessTopicLifecycle> loading;
     private boolean closed;
+    private boolean delegateClosed;
 
     LazyDisklessTopicLifecycle(Supplier<DisklessTopicLifecycle> loader) {
         this.loader = Objects.requireNonNull(loader, "loader must not be null");
@@ -123,11 +124,28 @@ final class LazyDisklessTopicLifecycle implements DisklessTopicLifecycle {
                 }
                 return;
             }
-            closeLoaded = closed;
+            closeLoaded = claimDelegateCloseLocked();
         }
         if (closeLoaded) {
             closeQuietly(loaded);
         }
+    }
+
+    /**
+     * Claims the right to close the loaded delegate, once the facade is closed.
+     *
+     * <p>{@link #close} and {@link #onLoaded} can both observe a loaded, unclosed delegate: a load
+     * that completes after {@code close()} has published {@code closed} but before it inspects the
+     * loading future is visible to both. Exactly one of them wins this claim, so the delegate is
+     * closed once.
+     */
+    private boolean claimDelegateCloseLocked() {
+        assert Thread.holdsLock(lock) : "claimDelegateCloseLocked must be called with the lock held";
+        if (!closed || delegateClosed) {
+            return false;
+        }
+        delegateClosed = true;
+        return true;
     }
 
     @Override
@@ -140,10 +158,18 @@ final class LazyDisklessTopicLifecycle implements DisklessTopicLifecycle {
             closed = true;
             current = loading;
         }
-        if (current != null && current.isDone() && !current.isCompletedExceptionally()) {
-            current.join().close();
+        if (current == null || !current.isDone() || current.isCompletedExceptionally()) {
+            // An in-flight load closes its result in onLoaded.
+            return;
         }
-        // An in-flight load closes its result in onLoaded.
+        DisklessTopicLifecycle loaded = current.join();
+        boolean closeLoaded;
+        synchronized (lock) {
+            closeLoaded = claimDelegateCloseLocked();
+        }
+        if (closeLoaded) {
+            loaded.close();
+        }
     }
 
     private static void closeQuietly(DisklessTopicLifecycle lifecycle) {
