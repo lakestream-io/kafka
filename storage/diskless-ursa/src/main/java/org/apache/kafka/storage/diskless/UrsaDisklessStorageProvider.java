@@ -32,7 +32,8 @@ public final class UrsaDisklessStorageProvider implements DisklessStorageProvide
                 context.brokerTopicStats(),
                 context.logConfigDefaults(),
                 context.topicConfigSupplier(),
-                context.partitionCountSupplier());
+                context.partitionCountSupplier(),
+                context.imageOffsetSupplier());
     }
 
     @Override

@@ -364,6 +364,9 @@ class BrokerServer(
           val numPartitions = metadataCache.numPartitions(topic)
           if (numPartitions.isPresent) OptionalInt.of(numPartitions.get) else OptionalInt.empty()
         },
+        // Streams this broker provisions are stamped with the metadata offset it has applied, so
+        // the controller's orphan sweep can tell them from state it may delete.
+        () => metadataCache.currentImage().offset(),
         (listenerName: ListenerName) => metadataCache.getAliveBrokerNodes(listenerName),
         config.interBrokerListenerName
       )

@@ -31,10 +31,12 @@ import org.apache.kafka.storage.internals.log.LogMetricNames;
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -44,6 +46,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import io.lakestream.api.Log;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.StreamCatalog;
+import io.lakestream.api.StreamIdentifier;
+import io.lakestream.api.StreamMetadata;
+import io.lakestream.api.exception.NoSuchStreamException;
 import io.oxia.client.api.AsyncOxiaClient;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -55,6 +60,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -648,6 +655,67 @@ class UrsaStorageStateTest {
         try (UrsaStorageState withoutConfigs = newState(mock(StreamCatalog.class))) {
             assertEquals(TimestampType.CREATE_TIME, withoutConfigs.timestampTypeSupplier(tp).get());
         }
+    }
+
+    @Test
+    void testOpenLogStampsTheStreamWithTheBrokersMetadataOffset() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("orders", 0));
+        StreamCatalog catalog = mock(StreamCatalog.class);
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier(tp.topic(), tp.topicId());
+        when(catalog.openLog(id, 0))
+                .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)))
+                .thenReturn(CompletableFuture.completedFuture(mockLog(0L, 0L, 1, 10L, 10, 10L, 10)));
+        when(catalog.createStream(eq(id), any(), any(), any(), anyMap()))
+                .thenReturn(CompletableFuture.completedFuture(mock(StreamMetadata.class)));
+
+        try (UrsaStorageState state = new UrsaStorageState(
+                Time.SYSTEM,
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                new LakestreamStorageHolder(catalog, null),
+                Map.of(),
+                topic -> Map.of(),
+                topic -> OptionalInt.of(1),
+                () -> 918L)) {
+            state.openLog(tp).get(5, TimeUnit.SECONDS);
+        }
+
+        ArgumentCaptor<Map<String, String>> properties = ArgumentCaptor.forClass(Map.class);
+        verify(catalog).createStream(eq(id), any(), any(), any(), properties.capture());
+        assertEquals(
+                "918",
+                properties.getValue().get(KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY));
+    }
+
+    @Test
+    void testOpenLogStampsZeroWhenNoMetadataHasBeenApplied() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("orders", 0));
+        StreamCatalog catalog = mock(StreamCatalog.class);
+        StreamIdentifier id = KafkaStreamIdentity.streamIdentifier(tp.topic(), tp.topicId());
+        when(catalog.openLog(id, 0))
+                .thenReturn(CompletableFuture.failedFuture(new NoSuchStreamException(id)))
+                .thenReturn(CompletableFuture.completedFuture(mockLog(0L, 0L, 1, 10L, 10, 10L, 10)));
+        when(catalog.createStream(eq(id), any(), any(), any(), anyMap()))
+                .thenReturn(CompletableFuture.completedFuture(mock(StreamMetadata.class)));
+
+        try (UrsaStorageState state = new UrsaStorageState(
+                Time.SYSTEM,
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                new LakestreamStorageHolder(catalog, null),
+                Map.of(),
+                topic -> Map.of(),
+                topic -> OptionalInt.of(1),
+                // An empty metadata image reports -1, which is not a usable source revision.
+                () -> -1L)) {
+            state.openLog(tp).get(5, TimeUnit.SECONDS);
+        }
+
+        ArgumentCaptor<Map<String, String>> properties = ArgumentCaptor.forClass(Map.class);
+        verify(catalog).createStream(eq(id), any(), any(), any(), properties.capture());
+        assertEquals("0", properties.getValue().get(KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY));
     }
 
     private static UrsaStorageState newState(StreamCatalog catalog) {

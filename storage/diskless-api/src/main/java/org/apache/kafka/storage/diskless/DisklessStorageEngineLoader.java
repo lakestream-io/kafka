@@ -23,6 +23,7 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 import java.util.Map;
 import java.util.OptionalInt;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 /** Loads the broker data-plane engine from the isolated diskless storage runtime. */
 public final class DisklessStorageEngineLoader {
@@ -37,7 +38,8 @@ public final class DisklessStorageEngineLoader {
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier,
-            Function<String, OptionalInt> partitionCountSupplier) {
+            Function<String, OptionalInt> partitionCountSupplier,
+            LongSupplier imageOffsetSupplier) {
         DisklessStorageProvider.StorageEngineContext context =
                 new DisklessStorageProvider.StorageEngineContext(
                         time,
@@ -46,7 +48,8 @@ public final class DisklessStorageEngineLoader {
                         brokerTopicStats,
                         logConfigDefaults,
                         topicConfigSupplier,
-                        partitionCountSupplier);
+                        partitionCountSupplier,
+                        imageOffsetSupplier);
         return DisklessStorageProviderLoader.load(
                 ursaConfig,
                 "storage engine",

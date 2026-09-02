@@ -51,6 +51,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import io.lakestream.api.Log;
@@ -83,6 +84,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final Map<String, Object> logConfigDefaults;
     private final Function<String, Map<String, String>> topicConfigSupplier;
     private final Function<String, OptionalInt> partitionCountSupplier;
+    /** The last metadata offset this broker applied; stamped on streams it provisions. */
+    private final LongSupplier imageOffsetSupplier;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object lifecycleLock = new Object();
     private final Object shutdownLock = new Object();
@@ -103,7 +106,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this(time, brokerId, config, brokerTopicStats,
             (Map<String, Object>) null,
             (Function<String, Map<String, String>>) null,
-            topic -> OptionalInt.empty());
+            topic -> OptionalInt.empty(),
+            () -> 0L);
     }
 
     public UrsaStorageState(
@@ -113,7 +117,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier,
-            Function<String, OptionalInt> partitionCountSupplier) {
+            Function<String, OptionalInt> partitionCountSupplier,
+            LongSupplier imageOffsetSupplier) {
         this.time = time;
         this.brokerId = brokerId;
         this.config = config;
@@ -123,6 +128,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.partitionCountSupplier = partitionCountSupplier != null
                 ? partitionCountSupplier
                 : topic -> OptionalInt.empty();
+        this.imageOffsetSupplier = imageOffsetSupplier != null ? imageOffsetSupplier : () -> 0L;
         this.producerStateScheduler = new ScheduledThreadPoolExecutor(1, runnable -> {
             Thread thread = new Thread(runnable, "producer-state-manager");
             thread.setDaemon(true);
@@ -173,6 +179,20 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             LakestreamStorageHolder lakestreamStorageHolder,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier) {
+        this(time, brokerId, config, brokerTopicStats, lakestreamStorageHolder, logConfigDefaults,
+                topicConfigSupplier, topic -> OptionalInt.empty(), () -> 0L);
+    }
+
+    UrsaStorageState(
+            Time time,
+            int brokerId,
+            UrsaStorageConfig config,
+            BrokerTopicStats brokerTopicStats,
+            LakestreamStorageHolder lakestreamStorageHolder,
+            Map<String, Object> logConfigDefaults,
+            Function<String, Map<String, String>> topicConfigSupplier,
+            Function<String, OptionalInt> partitionCountSupplier,
+            LongSupplier imageOffsetSupplier) {
         this.time = Objects.requireNonNull(time, "time must not be null");
         this.brokerId = brokerId;
         this.config = Objects.requireNonNull(config, "config must not be null");
@@ -184,7 +204,10 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.disklessTimer = newDaemonScheduler("diskless-timer-test");
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
-        this.partitionCountSupplier = topic -> OptionalInt.empty();
+        this.partitionCountSupplier = Objects.requireNonNull(
+                partitionCountSupplier, "partitionCountSupplier must not be null");
+        this.imageOffsetSupplier = Objects.requireNonNull(
+                imageOffsetSupplier, "imageOffsetSupplier must not be null");
         this.retentionTask = startRetentionChecks();
     }
 
@@ -609,7 +632,11 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         return lakestreamStorageHolder.openPartition(
                 tp,
                 partitionCountSupplier.apply(tp.topic()).orElse(tp.partition() + 1),
-                topicConfig == null ? Map.of() : topicConfig);
+                topicConfig == null ? Map.of() : topicConfig,
+                // An empty metadata image reports -1, which is not a usable source revision. A
+                // broker that has applied no metadata cannot know a diskless topic, so this clamp
+                // is defence in depth rather than a reachable case.
+                Math.max(imageOffsetSupplier.getAsLong(), 0L));
     }
 
 }

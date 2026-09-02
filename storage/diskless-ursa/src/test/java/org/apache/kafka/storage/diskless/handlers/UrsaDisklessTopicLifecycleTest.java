@@ -54,6 +54,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anySet;
@@ -459,6 +460,28 @@ class UrsaDisklessTopicLifecycleTest {
                 startsWith(ProducerStateSnapshotKeys.topicSnapshotPrefix(tooNew.toString())), anyString());
         verify(oxia, never()).put(
                 eq(ProducerStateSnapshotKeys.deletedTopicMarkerKey(tooNew.toString())), any(), anySet());
+    }
+
+    @Test
+    void testSweepKeepsABrokerCreatedStreamStampedAfterTheImage() throws Exception {
+        // A broker provisions a stream on first partition open and stamps it with the metadata
+        // offset it has applied, which is at or after the record that created the topic. A topic
+        // created after the sweep's image is therefore never mistaken for an orphan.
+        Uuid createdAfterImage = Uuid.randomUuid();
+        when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE))
+                .thenReturn(CompletableFuture.completedFuture(List.of(
+                        managedEntry("new-orders", createdAfterImage, 51L))));
+        when(oxia.list(anyString(), anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(List.of(
+                        ProducerStateSnapshotKeys.snapshotKey(createdAfterImage.toString(), 0))));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            lifecycle.sweepOrphans(Set.of(), 50L).get();
+        }
+
+        verify(catalog, never()).dropStream(any(), anyBoolean());
+        verify(oxia, never()).put(anyString(), any(), anySet());
+        verify(oxia, never()).deleteRange(anyString(), anyString());
     }
 
     @Test

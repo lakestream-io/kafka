@@ -51,6 +51,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 /**
  * Support class for integrating Ursa storage with ReplicaManager.
@@ -90,6 +91,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
      * @param topicConfigSupplier function to get topic configuration
      * @param topicIdSupplier function to get topic ID
      * @param partitionCountSupplier function to get the current partition count of a topic
+     * @param imageOffsetSupplier function to get the last metadata offset this broker has applied
      * @param aliveBrokerNodesSupplier function to get alive brokers for a listener
      * @param ownerSelectionListener listener used for canonical diskless owner selection
      */
@@ -102,6 +104,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
             Function<String, Map<String, String>> topicConfigSupplier,
             Function<String, Uuid> topicIdSupplier,
             Function<String, OptionalInt> partitionCountSupplier,
+            LongSupplier imageOffsetSupplier,
             Function<ListenerName, Iterable<Node>> aliveBrokerNodesSupplier,
             ListenerName ownerSelectionListener) {
 
@@ -120,6 +123,7 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
                 aliveBrokerNodesSupplier,
                 topicIdSupplier,
                 partitionCountSupplier,
+                imageOffsetSupplier,
                 true
         );
         this.brokerId = brokerId;
@@ -133,7 +137,8 @@ public class DisklessStorageReplicaManagerSupport implements Closeable {
                 brokerTopicStats,
                 logConfigDefaults,
                 topicConfigSupplier,
-                partitionCountSupplier
+                partitionCountSupplier,
+                imageOffsetSupplier
         );
 
         log.info("Diskless support initialized with Lakestream, oxia URLs: {} {}",

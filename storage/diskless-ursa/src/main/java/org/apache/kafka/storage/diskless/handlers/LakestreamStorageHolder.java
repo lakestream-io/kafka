@@ -113,6 +113,11 @@ final class LakestreamStorageHolder implements Closeable {
      * (Kafka identity plus {@code topicConfig} properties) when it does not exist yet, or growing it
      * when the partition is not part of the committed layout yet.
      *
+     * <p>A stream this broker creates is stamped with {@code sourceRevision}, the last metadata
+     * offset this broker applied. That offset is at or after the record that created the topic, so
+     * the active controller's orphan sweep, which only deletes state at or below the offset of its
+     * own image, cannot delete a topic created after the image it is sweeping against.
+     *
      * <p>The returned future fails with {@link StreamPermanentlyDeletedException} for a tombstoned
      * topic incarnation, which must never be recreated, and with
      * {@link NotLeaderOrFollowerException} for a topic this broker has already seen deleted.
@@ -120,13 +125,14 @@ final class LakestreamStorageHolder implements Closeable {
     CompletableFuture<Log> openPartition(
             TopicIdPartition tp,
             int partitionCount,
-            Map<String, String> topicConfig) {
+            Map<String, String> topicConfig,
+            long sourceRevision) {
         if (isTopicDeleted(tp.topicId())) {
             return CompletableFuture.failedFuture(
                     new NotLeaderOrFollowerException("Topic " + tp.topic() + " was deleted"));
         }
         StreamIdentifier id = KafkaStreamIdentity.streamIdentifier(tp.topic(), tp.topicId());
-        return openOrProvision(id, tp, partitionCount, topicConfig, OPEN_ATTEMPTS);
+        return openOrProvision(id, tp, partitionCount, topicConfig, sourceRevision, OPEN_ATTEMPTS);
     }
 
     /** Fences further opens of {@code topicId} on this broker. */
@@ -150,6 +156,7 @@ final class LakestreamStorageHolder implements Closeable {
             TopicIdPartition tp,
             int partitionCount,
             Map<String, String> topicConfig,
+            long sourceRevision,
             int attemptsLeft) {
         return openLog(id, tp.partition()).handle((openedLog, error) -> {
             if (error == null) {
@@ -164,14 +171,14 @@ final class LakestreamStorageHolder implements Closeable {
             }
             CompletableFuture<?> provision;
             if (cause instanceof NoSuchStreamException) {
-                provision = createStream(id, tp, partitionCount, topicConfig);
+                provision = createStream(id, tp, partitionCount, topicConfig, sourceRevision);
             } else if (cause instanceof IllegalArgumentException && partitionCount > tp.partition()) {
                 provision = catalog.increasePartitions(id, partitionCount);
             } else {
                 return CompletableFuture.<Log>failedFuture(cause);
             }
             return provision.thenCompose(ignored ->
-                    openOrProvision(id, tp, partitionCount, topicConfig, attemptsLeft - 1));
+                    openOrProvision(id, tp, partitionCount, topicConfig, sourceRevision, attemptsLeft - 1));
         }).thenCompose(future -> future);
     }
 
@@ -198,12 +205,13 @@ final class LakestreamStorageHolder implements Closeable {
             StreamIdentifier id,
             TopicIdPartition tp,
             int partitionCount,
-            Map<String, String> topicConfig) {
+            Map<String, String> topicConfig,
+            long sourceRevision) {
         Partitioning partitioning = new Partitioning(
                 PartitioningStrategy.INDEXED,
                 Map.of("numPartitions", String.valueOf(Math.max(partitionCount, tp.partition() + 1))));
-        Map<String, String> properties =
-                KafkaStreamIdentity.streamProperties(tp.topic(), tp.topicId(), topicConfig, 0L);
+        Map<String, String> properties = KafkaStreamIdentity.streamProperties(
+                tp.topic(), tp.topicId(), topicConfig, sourceRevision);
         return catalog.createStream(id, new StreamConfig(), partitioning, new SchemaConfig(), properties)
                 .handle((metadata, error) -> {
                     if (error == null) {

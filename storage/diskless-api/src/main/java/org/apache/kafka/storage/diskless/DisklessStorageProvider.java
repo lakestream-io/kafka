@@ -23,6 +23,7 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 import java.util.Map;
 import java.util.OptionalInt;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 /**
  * Entry point implemented by an isolated diskless-storage runtime.
@@ -47,6 +48,7 @@ public interface DisklessStorageProvider {
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier,
-            Function<String, OptionalInt> partitionCountSupplier) {
+            Function<String, OptionalInt> partitionCountSupplier,
+            LongSupplier imageOffsetSupplier) {
     }
 }

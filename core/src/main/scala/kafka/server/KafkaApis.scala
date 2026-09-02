@@ -60,7 +60,7 @@ import org.apache.kafka.common.{Node, TopicIdPartition, TopicPartition, Uuid}
 import org.apache.kafka.coordinator.group.modern.share.ShareGroupConfigProvider
 import org.apache.kafka.coordinator.group.{Group, GroupConfig, GroupConfigManager, GroupCoordinator}
 import org.apache.kafka.coordinator.share.ShareCoordinator
-import org.apache.kafka.metadata.{ConfigRepository, MetadataCache}
+import org.apache.kafka.metadata.{ConfigRepository, KRaftMetadataCache, MetadataCache}
 import org.apache.kafka.security.DelegationTokenManager
 import org.apache.kafka.server.{ApiVersionManager, ClientMetricsManager, FetchManager, ProcessRole}
 import org.apache.kafka.server.authorizer._
@@ -136,6 +136,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         (topic: String) => {
           val numPartitions = metadataCache.numPartitions(topic)
           if (numPartitions.isPresent) OptionalInt.of(numPartitions.get) else OptionalInt.empty()
+        },
+        // This view only reads metadata; nothing it serves provisions storage stamped with the
+        // offset. It is still reported when the cache exposes an image, so the two views agree.
+        metadataCache match {
+          case kraftMetadataCache: KRaftMetadataCache =>
+            () => kraftMetadataCache.currentImage().offset()
+          case _ => () => 0L
         },
         true
       ))

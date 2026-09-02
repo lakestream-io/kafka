@@ -35,6 +35,7 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 public class UrsaStorageEngineImpl implements DisklessStorageEngine {
 
@@ -49,7 +50,8 @@ public class UrsaStorageEngineImpl implements DisklessStorageEngine {
             BrokerTopicStats brokerTopicStats,
             Map<String, Object> logConfigDefaults,
             Function<String, Map<String, String>> topicConfigSupplier,
-            Function<String, OptionalInt> partitionCountSupplier) {
+            Function<String, OptionalInt> partitionCountSupplier,
+            LongSupplier imageOffsetSupplier) {
         this.state = new UrsaStorageState(
                 time,
                 brokerId,
@@ -57,7 +59,8 @@ public class UrsaStorageEngineImpl implements DisklessStorageEngine {
                 brokerTopicStats,
                 logConfigDefaults,
                 topicConfigSupplier,
-                partitionCountSupplier
+                partitionCountSupplier,
+                imageOffsetSupplier
         );
         this.writer = new UrsaLakestreamWriter(state);
         this.reader = new UrsaLakestreamReader(state);

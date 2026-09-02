@@ -123,11 +123,44 @@ class MetadataCacheDisklessStorageViewTest {
                 listener -> Collections.emptyList(),
                 topic -> null,
                 topic -> null,
+                null,
                 true
         );
 
         assertEquals(Uuid.ZERO_UUID, view.getTopicId("test-topic"));
         assertEquals(OptionalInt.empty(), view.partitionCount("test-topic"));
+        assertEquals(0L, view.imageOffset());
+    }
+
+    @Test
+    void testImageOffsetComesFromTheSupplier() {
+        MetadataCacheDisklessStorageView view = new MetadataCacheDisklessStorageView(
+                topic -> Map.of(),
+                listener -> Collections.emptyList(),
+                topic -> Uuid.ZERO_UUID,
+                topic -> OptionalInt.empty(),
+                () -> 4242L,
+                true
+        );
+
+        assertEquals(4242L, view.imageOffset());
+        // Diskless storage is off in the disabled view, so nothing is created against its offset.
+        assertEquals(0L, DisklessStorageMetadataView.DISABLED.imageOffset());
+        assertEquals(0L, new MetadataCacheDisklessStorageView(topic -> Map.of(), true).imageOffset());
+    }
+
+    @Test
+    void testImageOffsetOfAnEmptyMetadataImageIsReportedAsZero() {
+        MetadataCacheDisklessStorageView view = new MetadataCacheDisklessStorageView(
+                topic -> Map.of(),
+                listener -> Collections.emptyList(),
+                topic -> Uuid.ZERO_UUID,
+                topic -> OptionalInt.empty(),
+                () -> -1L,
+                true
+        );
+
+        assertEquals(0L, view.imageOffset());
     }
 
     @Test
@@ -137,9 +170,11 @@ class MetadataCacheDisklessStorageViewTest {
                 listener -> Collections.emptyList(),
                 topic -> Uuid.ZERO_UUID,
                 topic -> "orders".equals(topic) ? OptionalInt.of(7) : OptionalInt.empty(),
+                () -> 42L,
                 true
         );
 
+        assertEquals(42L, view.imageOffset());
         assertEquals(OptionalInt.of(7), view.partitionCount("orders"));
         assertEquals(OptionalInt.empty(), view.partitionCount("other"));
         assertEquals(OptionalInt.empty(), DisklessStorageMetadataView.DISABLED.partitionCount("orders"));

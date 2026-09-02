@@ -24,6 +24,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.OptionalInt;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 public class MetadataCacheDisklessStorageView implements DisklessStorageMetadataView {
 
@@ -31,6 +32,7 @@ public class MetadataCacheDisklessStorageView implements DisklessStorageMetadata
     private final Function<ListenerName, Iterable<Node>> aliveBrokerNodesSupplier;
     private final Function<String, Uuid> topicIdSupplier;
     private final Function<String, OptionalInt> partitionCountSupplier;
+    private final LongSupplier imageOffsetSupplier;
     private final boolean disklessStorageSystemEnabled;
 
     public MetadataCacheDisklessStorageView(
@@ -41,6 +43,7 @@ public class MetadataCacheDisklessStorageView implements DisklessStorageMetadata
                 ln -> Collections.emptyList(),
                 t -> Uuid.ZERO_UUID,
                 t -> OptionalInt.empty(),
+                () -> 0L,
                 disklessStorageSystemEnabled);
     }
 
@@ -49,11 +52,13 @@ public class MetadataCacheDisklessStorageView implements DisklessStorageMetadata
             Function<ListenerName, Iterable<Node>> aliveBrokerNodesSupplier,
             Function<String, Uuid> topicIdSupplier,
             Function<String, OptionalInt> partitionCountSupplier,
+            LongSupplier imageOffsetSupplier,
             boolean disklessStorageSystemEnabled) {
         this.topicConfigSupplier = topicConfigSupplier;
         this.aliveBrokerNodesSupplier = aliveBrokerNodesSupplier;
         this.topicIdSupplier = topicIdSupplier;
         this.partitionCountSupplier = partitionCountSupplier;
+        this.imageOffsetSupplier = imageOffsetSupplier;
         this.disklessStorageSystemEnabled = disklessStorageSystemEnabled;
     }
 
@@ -84,5 +89,12 @@ public class MetadataCacheDisklessStorageView implements DisklessStorageMetadata
     public OptionalInt partitionCount(String topic) {
         OptionalInt partitionCount = partitionCountSupplier.apply(topic);
         return partitionCount != null ? partitionCount : OptionalInt.empty();
+    }
+
+    @Override
+    public long imageOffset() {
+        // An empty metadata image reports -1; before any metadata is applied nothing is created,
+        // so 0 is reported instead of a revision no consumer accepts.
+        return imageOffsetSupplier != null ? Math.max(imageOffsetSupplier.getAsLong(), 0L) : 0L;
     }
 }

@@ -68,7 +68,8 @@ class DisklessStorageProviderLoaderTest {
         UrsaStorageConfig config = ursaConfig();
 
         DisklessStorageEngine engine = DisklessStorageEngineLoader.load(
-                null, 1, config, null, Map.of(), ignored -> Map.of(), ignored -> OptionalInt.empty());
+                null, 1, config, null, Map.of(), ignored -> Map.of(), ignored -> OptionalInt.empty(),
+                () -> 0L);
         DisklessTopicLifecycle topicLifecycle = DisklessTopicLifecycleLoader.load(config);
 
         assertEquals(2, RecordingProvider.CREATED_COMPONENTS.get());

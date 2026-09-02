@@ -100,7 +100,8 @@ class DisklessTopicLifecycleLoaderTest {
         UrsaStorageConfig config = ursaConfig();
 
         DisklessStorageEngine engine = DisklessStorageEngineLoader.load(
-                null, 0, config, null, Map.of(), topic -> Map.of(), topic -> OptionalInt.empty());
+                null, 0, config, null, Map.of(), topic -> Map.of(), topic -> OptionalInt.empty(),
+                () -> 0L);
         DisklessTopicLifecycle lifecycle = DisklessTopicLifecycleLoader.load(config);
         ClassLoader sharedLoader = RecordingLifecycle.classLoader;
 

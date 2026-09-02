@@ -73,7 +73,7 @@ class LakestreamStorageHolderTest {
             .thenReturn(completedFuture(mock(StreamMetadata.class)));
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, mock(AsyncOxiaClient.class));
 
-        assertSame(log, holder.openPartition(tp("orders", 1), 3, Map.of("retention.ms", "1")).get());
+        assertSame(log, holder.openPartition(tp("orders", 1), 3, Map.of("retention.ms", "1"), 77L).get());
 
         ArgumentCaptor<Partitioning> partitioning = ArgumentCaptor.forClass(Partitioning.class);
         ArgumentCaptor<Map<String, String>> properties = ArgumentCaptor.forClass(Map.class);
@@ -82,6 +82,9 @@ class LakestreamStorageHolderTest {
         assertEquals("true", properties.getValue().get(KafkaStreamIdentity.KAFKA_MANAGED_PROPERTY));
         assertEquals("orders", properties.getValue().get(KafkaStreamIdentity.KAFKA_TOPIC_NAME_PROPERTY));
         assertEquals("1", properties.getValue().get("retention.ms"));
+        // The broker's own metadata offset, not 0, so the controller's sweep cannot treat a topic
+        // created after its image as an orphan.
+        assertEquals("77", properties.getValue().get(KafkaStreamIdentity.KAFKA_SOURCE_REVISION_PROPERTY));
     }
 
     @Test
@@ -95,7 +98,7 @@ class LakestreamStorageHolderTest {
         when(catalog.increasePartitions(id, 6)).thenReturn(completedFuture(mock(StreamMetadata.class)));
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, mock(AsyncOxiaClient.class));
 
-        assertSame(log, holder.openPartition(tp("orders", 5), 6, Map.of()).get());
+        assertSame(log, holder.openPartition(tp("orders", 5), 6, Map.of(), 12L).get());
         verify(catalog, never()).createStream(any(), any(), any(), any(), anyMap());
     }
 
@@ -111,7 +114,7 @@ class LakestreamStorageHolderTest {
             .thenReturn(failedFuture(new AlreadyExistsException("exists")));
         LakestreamStorageHolder holder = new LakestreamStorageHolder(catalog, mock(AsyncOxiaClient.class));
 
-        assertSame(log, holder.openPartition(tp("orders", 0), 1, Map.of()).get());
+        assertSame(log, holder.openPartition(tp("orders", 0), 1, Map.of(), 12L).get());
     }
 
     @Test
@@ -123,7 +126,7 @@ class LakestreamStorageHolderTest {
 
         ExecutionException failure = assertThrows(
             ExecutionException.class,
-            () -> holder.openPartition(tp("orders", 0), 1, Map.of()).get());
+            () -> holder.openPartition(tp("orders", 0), 1, Map.of(), 12L).get());
 
         assertInstanceOf(StreamPermanentlyDeletedException.class, failure.getCause());
         verify(catalog, never()).createStream(any(), any(), any(), any(), anyMap());
@@ -155,7 +158,7 @@ class LakestreamStorageHolderTest {
 
         ExecutionException failure = assertThrows(
             ExecutionException.class,
-            () -> holder.openPartition(tp("orders", 0), 1, Map.of()).get());
+            () -> holder.openPartition(tp("orders", 0), 1, Map.of(), 12L).get());
 
         assertInstanceOf(NotLeaderOrFollowerException.class, failure.getCause());
         verify(catalog, never()).openLog(any(), anyInt());

@@ -199,7 +199,8 @@ class DisklessStorageEngineLoaderTest {
                 null,
                 Map.of(),
                 topic -> Map.of(),
-                topic -> OptionalInt.empty())) {
+                topic -> OptionalInt.empty(),
+                () -> 0L)) {
             engine.write(Map.of(), "").get();
             engine.fetch(null, Map.of()).get();
             engine.listOffsets(Map.of()).get();

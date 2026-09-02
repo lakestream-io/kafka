@@ -37,6 +37,15 @@ public interface DisklessStorageMetadataView {
     /** Returns the current partition count for the topic, or empty when it is unknown. */
     OptionalInt partitionCount(String topic);
 
+    /**
+     * The last metadata offset this broker has applied.
+     *
+     * <p>Storage this broker provisions is stamped with it, so the active controller's orphan sweep
+     * can tell state created from an image newer than its own from state it may delete. Never
+     * negative: a broker that has applied no metadata yet reports 0.
+     */
+    long imageOffset();
+
     DisklessStorageMetadataView DISABLED = new DisklessStorageMetadataView() {
         @Override
         public boolean isDisklessStorageTopic(String topic) {
@@ -61,6 +70,12 @@ public interface DisklessStorageMetadataView {
         @Override
         public OptionalInt partitionCount(String topic) {
             return OptionalInt.empty();
+        }
+
+        @Override
+        public long imageOffset() {
+            // Diskless storage is off here, so nothing is ever created against this offset.
+            return 0L;
         }
     };
 }
