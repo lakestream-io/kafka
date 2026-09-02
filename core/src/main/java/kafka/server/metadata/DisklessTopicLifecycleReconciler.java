@@ -64,6 +64,10 @@ import java.util.function.BiConsumer;
  *
  * <p>Concurrency rules:
  * <ul>
+ *   <li>Lifecycle operations are never started on the thread that delivered the metadata update:
+ *       that thread records the desired state and posts a drain to this reconciler's executor, so
+ *       a lifecycle implementation that is slow to hand back its future cannot stall the
+ *       controller's metadata pipeline.</li>
  *   <li>At most one operation is in flight per topic; a desired-state change that arrives while an
  *       operation runs is applied when that operation completes. An attempt that exceeds
  *       {@code operationTimeoutMs} is cancelled best effort and retried, so it may still be running
@@ -269,8 +273,9 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
         // for this reconcile, so everything still desired was just remembered from this image.
         // Storage for topics that vanished while this node was not the active controller is retired
         // by the sweep below -- against the image just reconciled rather than whatever arrives next,
-        // so the offset handed to the storage layer is never newer than the state it came from.
-        startSweep(image);
+        // so the offset handed to the storage layer is never newer than the state it came from. It
+        // is posted like every other lifecycle call, because this runs on the metadata thread.
+        schedule(() -> startSweep(image), 0);
     }
 
     private void rememberPresent(MetadataImage image, Uuid id, long sourceRevision) {
@@ -291,14 +296,18 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
      * reconciles it from scratch. Its storage is retired by the periodic sweep rather than by
      * {@code deleteTopic}, which may only be used once the topic has left Kafka metadata for good.
      */
-    private synchronized void forget(Uuid id) {
-        if (desired.remove(id) == null) {
-            return;
-        }
-        Runner runner = runners.get(id);
-        if (runner != null) {
+    private void forget(Uuid id) {
+        synchronized (this) {
+            if (desired.remove(id) == null) {
+                return;
+            }
+            Runner runner = runners.get(id);
+            if (runner == null) {
+                return;
+            }
             runner.wake();      // startNextLocked drops a runner that has no desired state left
         }
+        postDrain();
     }
 
     /** Records {@code next} as the topic's desired state and, if it changed anything, drives it. */
@@ -309,6 +318,19 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
             }
             desired.put(next.id(), next);
             runners.computeIfAbsent(next.id(), Runner::new).wake();
+        }
+        postDrain();
+    }
+
+    /** Hands the next drain to {@link #executor}: the caller may be the metadata-loader thread. */
+    private void postDrain() {
+        schedule(this::drain, 0);
+    }
+
+    /** Starts whatever work is queued. Always runs on {@link #executor}. */
+    private void drain() {
+        synchronized (this) {
+            startNextLocked();
         }
     }
 
@@ -327,6 +349,8 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
 
         /**
          * Queues this runner for a permit unless it already holds one. Called with the monitor held.
+         * Queueing only: the caller drains, either inline when it already runs on {@link #executor}
+         * or by posting one.
          *
          * <p>Every caller has just changed this topic's desired state, so a backoff still waiting to
          * retry the previous one no longer applies and is cancelled: the new state runs now. Repeated
@@ -342,14 +366,14 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
             }
             queued = true;
             waitingForPermit.add(this);
-            startNextLocked();
         }
     }
 
     /**
-     * Starts queued operations while permits remain. Called with the monitor held: the lifecycle
-     * call must return a future promptly, and its completion is always handed to {@link #executor}
-     * so that an already-completed future cannot re-enter this method on the same thread.
+     * Starts queued operations while permits remain. Called with the monitor held and always on
+     * {@link #executor}, so the lifecycle call runs there rather than on the metadata-loader
+     * thread; its completion is handed back to the executor so that an already-completed future
+     * cannot re-enter this method on the same thread.
      */
     private void startNextLocked() {
         while (inFlight < maxConcurrentOperations && !waitingForPermit.isEmpty()) {
@@ -443,9 +467,15 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
         MetadataImage image;
         synchronized (this) {
             sweepTask = null;
-            if (!active || closed || sweepInFlight || latestImage == null) {
+            if (!active || closed || sweepInFlight) {
                 // Either a sweep is already running -- and will reschedule the next one when it
                 // finishes -- or this node stopped being the active controller.
+                return;
+            }
+            if (latestImage == null) {
+                // No image to sweep against yet. Keep the periodic chain alive rather than ending
+                // it here, which would leave this controller with no sweep at all.
+                sweepTask = schedule(this::sweep, sweepIntervalMs);
                 return;
             }
             image = latestImage;
@@ -471,12 +501,10 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
             sweepGeneration = generation;
         }
         long imageOffset = image.highestOffsetAndEpoch().offset();
-        Set<Uuid> liveTopicIds = new HashSet<>();
-        for (TopicImage topic : image.topics().topicsById().values()) {
-            if (DisklessTopics.isDiskless(topic.name(), topicConfigs(image, topic.name()))) {
-                liveTopicIds.add(topic.id());
-            }
-        }
+        // Every topic in the image, diskless or not: the sweep deletes storage permanently, so a
+        // topic id that Kafka metadata still knows must never be swept, whatever its configuration
+        // says now or said when this image was built.
+        Set<Uuid> liveTopicIds = new HashSet<>(image.topics().topicsById().keySet());
         log.debug("Sweeping diskless storage for topics missing from metadata image at offset {}", imageOffset);
         CompletableFuture<Void> result;
         try {

@@ -46,14 +46,17 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.concurrent.CompletableFuture.failedFuture;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -115,11 +118,13 @@ class DisklessTopicLifecycleReconcilerTest {
             reconciler.onMetadataUpdate(delta(image(offset, disklessTopic("a", A, 1))), image(offset, disklessTopic("a", A, 1)), manifest());
         }
         sweep.complete(null);
-        verify(lifecycle, times(1)).sweepOrphans(Set.of(A), 10L);
+        verify(lifecycle, timeout(5000).times(1)).sweepOrphans(Set.of(A), 10L);
         // Matching any revision is what makes this catch a dedupe regression: an extra ensureTopic
         // at revision 11..19 would not be counted by a matcher pinned to eq(10L).
-        verify(lifecycle, times(1)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), anyLong());
+        verify(lifecycle, timeout(5000).times(1)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), anyLong());
         verify(lifecycle).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), eq(10L));
+        TestUtils.waitForCondition(() -> reconciler.pendingOperationsForTesting() == 0,
+            "the reconciled topic should have been retired from the pending set");
         verifyNoMoreInteractions(lifecycle);
     }
 
@@ -161,7 +166,10 @@ class DisklessTopicLifecycleReconcilerTest {
         MetadataImage image = image(9L, disklessTopic("a", A, 1), disklessTopic("b", B, 1), disklessTopic("c", C, 1));
         reconciler.onMetadataUpdate(delta(image), image, manifest());
         reconciler.onControllerChange(leader(NODE_ID));
-        assertEquals(2, inFlight.size());
+        TestUtils.waitForCondition(() -> inFlight.size() == 2,
+            "the concurrency limit should have started exactly two operations");
+        // Nothing else may start while both permits are held.
+        verify(lifecycle, times(2)).ensureTopic(any(), any(), anyInt(), anyMap(), anyLong());
         inFlight.get(0).complete(null);
         verify(lifecycle, timeout(5000).times(3)).ensureTopic(any(), any(), anyInt(), anyMap(), anyLong());
     }
@@ -169,12 +177,21 @@ class DisklessTopicLifecycleReconcilerTest {
     @Test
     void losingLeadershipCancelsRetriesAndSweeps() throws Exception {
         when(lifecycle.ensureTopic(any(), any(), anyInt(), anyMap(), anyLong())).thenReturn(failedFuture(new IOException("x")));
+        // A backoff far longer than this test, so the attempt below stays pending on its retry
+        // until losing leadership is what removes it.
+        reconciler = newReconciler(SWEEP_INTERVAL_MS, MAX_CONCURRENT_OPERATIONS, OPERATION_TIMEOUT_MS,
+            120_000L, 120_000L);
         activateWithEmptyImage();
         reconciler.onMetadataUpdate(delta(image(5L, disklessTopic("a", A, 1))), image(5L, disklessTopic("a", A, 1)), manifest());
+        verify(lifecycle, timeout(5000).times(1)).ensureTopic(any(), any(), anyInt(), anyMap(), anyLong());
+
         reconciler.onControllerChange(leader(NODE_ID + 1));
-        Thread.sleep(200);
+
+        // Dropping the runner is what cancels its retry: a retry that still fired would find no
+        // runner of its own generation and return without calling the lifecycle.
+        TestUtils.waitForCondition(() -> reconciler.pendingOperationsForTesting() == 0,
+            "losing leadership should have dropped every pending operation");
         verify(lifecycle, times(1)).ensureTopic(any(), any(), anyInt(), anyMap(), anyLong());
-        assertEquals(0, reconciler.pendingOperationsForTesting());
     }
 
     @Test
@@ -236,6 +253,45 @@ class DisklessTopicLifecycleReconcilerTest {
         reconciler.onMetadataUpdate(delta(grown), grown, manifest());
 
         verify(lifecycle, timeout(5000)).ensureTopic(eq("a"), eq(A), eq(3), anyMap(), eq(6L));
+    }
+
+    @Test
+    void aBlockingLifecycleCallDoesNotBlockTheMetadataThread() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        when(lifecycle.ensureTopic(any(), any(), anyInt(), anyMap(), anyLong())).thenAnswer(invocation -> {
+            started.countDown();
+            // A lifecycle implementation that is slow to hand its future back. Running it on the
+            // metadata-loader thread would stall the controller's whole metadata pipeline.
+            Thread.sleep(500L);
+            return completedFuture(null);
+        });
+        activateWithEmptyImage();
+
+        MetadataImage created = image(5L, disklessTopic("a", A, 1));
+        long startNs = System.nanoTime();
+        reconciler.onMetadataUpdate(delta(created), created, manifest());
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
+
+        assertTrue(started.await(5, TimeUnit.SECONDS), "the lifecycle call should have been started");
+        assertTrue(elapsedMs < 250L, "onMetadataUpdate blocked for " + elapsedMs + " ms");
+        verify(lifecycle, timeout(5000)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), eq(5L));
+    }
+
+    @Test
+    void sweepProtectsEveryTopicInTheImageIncludingClassicOnes() throws Exception {
+        MetadataImage image = new MetadataDelta.Builder().setImage(MetadataImage.EMPTY).build()
+            .apply(new MetadataProvenance(0L, 0, 0, true));
+        MetadataDelta delta = new MetadataDelta.Builder().setImage(image).build();
+        replayCreation(delta, disklessTopic("a", A, 1));
+        replayCreation(delta, disklessTopic("b", B, 1));
+        delta.replay(disklessConfigRecord("b", "false"));
+        MetadataImage mixed = delta.apply(new MetadataProvenance(12L, 0, 0, true));
+
+        reconciler.onMetadataUpdate(delta, mixed, manifest());
+        reconciler.onControllerChange(leader(NODE_ID));
+
+        // The classic topic is still in Kafka metadata, and sweeping deletes storage permanently.
+        verify(lifecycle, timeout(5000)).sweepOrphans(Set.of(A, B), 12L);
     }
 
     @Test
