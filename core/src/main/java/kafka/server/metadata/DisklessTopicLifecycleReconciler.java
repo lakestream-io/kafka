@@ -51,6 +51,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 
 /**
@@ -65,7 +66,10 @@ import java.util.function.BiConsumer;
  * <p>Concurrency rules:
  * <ul>
  *   <li>At most one operation is in flight per topic; a desired-state change that arrives while an
- *       operation runs is applied when that operation completes.</li>
+ *       operation runs is applied when that operation completes. An attempt that exceeds
+ *       {@code operationTimeoutMs} is cancelled best effort and retried, so it may still be running
+ *       inside the storage layer when the next attempt starts -- which is why every lifecycle
+ *       operation must be idempotent.</li>
  *   <li>At most {@code maxConcurrentOperations} operations are in flight across all topics.</li>
  *   <li>Leadership changes bump a generation counter. Results of operations started in an earlier
  *       generation are discarded without touching any state, and every retry and sweep scheduled by
@@ -368,7 +372,7 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
             } catch (Throwable t) {
                 operation = CompletableFuture.failedFuture(t);
             }
-            operation.orTimeout(operationTimeoutMs, TimeUnit.MILLISECONDS)
+            withTimeout(operation)
                 .whenComplete((ignored, error) -> schedule(() -> complete(runner, target, error), 0));
         }
     }
@@ -475,7 +479,7 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
         } catch (Throwable t) {
             result = CompletableFuture.failedFuture(t);
         }
-        result.orTimeout(operationTimeoutMs, TimeUnit.MILLISECONDS)
+        withTimeout(result)
             .whenComplete((ignored, error) -> completeSweep(sweepGeneration, error));
     }
 
@@ -529,6 +533,28 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
         metricsGroup.removeMetric(PENDING_OPERATIONS_METRIC);
         metricsGroup.removeMetric(FAILED_OPERATIONS_METRIC);
         metricsGroup.removeMetric(ERRORS_METRIC);
+    }
+
+    /**
+     * A view of {@code operation} that fails with a {@link TimeoutException} after
+     * {@code operationTimeoutMs}.
+     *
+     * <p>{@link CompletableFuture#orTimeout} completes the future it is called on, so it is applied
+     * to a copy: the storage layer's own future is never force-completed behind its back, and its
+     * eventual result still reaches whatever the storage layer chained onto it. When the timeout
+     * fires the original is cancelled, but that is best effort -- a {@link CompletableFuture} cannot
+     * interrupt the work behind it, so the abandoned attempt may still complete inside the storage
+     * layer after the reconciler has released its permit and started the next one. Lifecycle
+     * operations are idempotent, which is what makes that safe.
+     */
+    private CompletableFuture<Void> withTimeout(CompletableFuture<Void> operation) {
+        CompletableFuture<Void> timed = operation.copy().orTimeout(operationTimeoutMs, TimeUnit.MILLISECONDS);
+        timed.whenComplete((ignored, error) -> {
+            if (DisklessFutures.unwrap(error) instanceof TimeoutException) {
+                operation.cancel(true);
+            }
+        });
+        return timed;
     }
 
     /** Runs {@code task} on {@link #executor} after {@code delayMs}, or not at all once closed. */

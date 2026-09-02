@@ -48,6 +48,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 
 import static java.util.concurrent.CompletableFuture.completedFuture;
@@ -65,6 +66,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 class DisklessTopicLifecycleReconcilerTest {
@@ -114,7 +116,11 @@ class DisklessTopicLifecycleReconcilerTest {
         }
         sweep.complete(null);
         verify(lifecycle, times(1)).sweepOrphans(Set.of(A), 10L);
-        verify(lifecycle, times(1)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), eq(10L));
+        // Matching any revision is what makes this catch a dedupe regression: an extra ensureTopic
+        // at revision 11..19 would not be counted by a matcher pinned to eq(10L).
+        verify(lifecycle, times(1)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), anyLong());
+        verify(lifecycle).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), eq(10L));
+        verifyNoMoreInteractions(lifecycle);
     }
 
     @Test
@@ -195,6 +201,20 @@ class DisklessTopicLifecycleReconcilerTest {
         verify(lifecycle, timeout(5000)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), eq(7L));
     }
 
+    @Test
+    void timedOutOperationIsRetriedAndOriginalFutureIsCancelled() throws Exception {
+        CompletableFuture<Void> stuck = new CompletableFuture<>();
+        when(lifecycle.ensureTopic(any(), any(), anyInt(), anyMap(), anyLong()))
+            .thenReturn(stuck)
+            .thenReturn(completedFuture(null));
+        reconciler = newReconciler(SWEEP_INTERVAL_MS, MAX_CONCURRENT_OPERATIONS, 50L);
+        activateWithEmptyImage();
+        reconciler.onMetadataUpdate(delta(image(5L, disklessTopic("a", A, 1))), image(5L, disklessTopic("a", A, 1)), manifest());
+        verify(lifecycle, timeout(5000).times(2)).ensureTopic(eq("a"), eq(A), eq(1), anyMap(), eq(5L));
+        verify(faultHandler, timeout(5000)).accept(contains("ensure diskless topic a"), any(TimeoutException.class));
+        TestUtils.waitForCondition(stuck::isCancelled, "the timed-out attempt should have been cancelled");
+    }
+
     private void activateWithEmptyImage() {
         MetadataImage empty = image(0L);
         reconciler.onMetadataUpdate(delta(empty), empty, manifest());
@@ -202,6 +222,11 @@ class DisklessTopicLifecycleReconcilerTest {
     }
 
     private DisklessTopicLifecycleReconciler newReconciler(long sweepIntervalMs, int maxConcurrentOperations) {
+        return newReconciler(sweepIntervalMs, maxConcurrentOperations, OPERATION_TIMEOUT_MS);
+    }
+
+    private DisklessTopicLifecycleReconciler newReconciler(long sweepIntervalMs, int maxConcurrentOperations,
+                                                           long operationTimeoutMs) {
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "diskless-lifecycle-reconciler-test");
             thread.setDaemon(true);
@@ -210,7 +235,7 @@ class DisklessTopicLifecycleReconcilerTest {
         executors.add(executor);
         DisklessTopicLifecycleReconciler created = new DisklessTopicLifecycleReconciler(
             NODE_ID, lifecycle, faultHandler, sweepIntervalMs,
-            INITIAL_RETRY_MS, MAX_RETRY_MS, OPERATION_TIMEOUT_MS, maxConcurrentOperations, executor);
+            INITIAL_RETRY_MS, MAX_RETRY_MS, operationTimeoutMs, maxConcurrentOperations, executor);
         reconcilers.add(created);
         return created;
     }
