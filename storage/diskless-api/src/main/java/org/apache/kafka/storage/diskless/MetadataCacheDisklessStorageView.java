@@ -18,8 +18,6 @@ package org.apache.kafka.storage.diskless;
 
 import org.apache.kafka.common.Node;
 import org.apache.kafka.common.Uuid;
-import org.apache.kafka.common.config.TopicConfig;
-import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.common.network.ListenerName;
 
 import java.util.Collections;
@@ -52,17 +50,7 @@ public class MetadataCacheDisklessStorageView implements DisklessStorageMetadata
 
     @Override
     public boolean isDisklessStorageTopic(String topic) {
-        if (!disklessStorageSystemEnabled) {
-            return false;
-        }
-
-        if (Topic.isInternal(topic)) {
-            return false;
-        }
-
-        Map<String, String> config = getTopicConfig(topic);
-        String disklessStorageEnabled = config.get(TopicConfig.URSA_STORAGE_ENABLE_CONFIG);
-        return Boolean.parseBoolean(disklessStorageEnabled);
+        return disklessStorageSystemEnabled && DisklessTopics.isDiskless(topic, getTopicConfig(topic));
     }
 
     @Override

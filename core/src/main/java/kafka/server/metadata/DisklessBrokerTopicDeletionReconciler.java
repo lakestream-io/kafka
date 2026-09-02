@@ -20,8 +20,6 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.ConfigResource;
-import org.apache.kafka.common.config.TopicConfig;
-import org.apache.kafka.common.internals.Topic;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.image.TopicImage;
@@ -113,12 +111,6 @@ public final class DisklessBrokerTopicDeletionReconciler implements MetadataPubl
     }
 
     private boolean isDisklessTopic(MetadataImage image, String topicName) {
-        if (Topic.isInternal(topicName)) {
-            return false;
-        }
-        ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, topicName);
-        Map<String, String> configs = image.configs().configMapForResource(resource);
-        String enabledValue = configs.get(TopicConfig.URSA_STORAGE_ENABLE_CONFIG);
-        return Boolean.parseBoolean(enabledValue);
+        return org.apache.kafka.storage.diskless.DisklessTopics.isDiskless(topicName, image.configs().configMapForResource(new ConfigResource(ConfigResource.Type.TOPIC, topicName)));
     }
 }
