@@ -660,7 +660,7 @@ For diskless topics:
 3. **RF=1 Only**: Multi-replica diskless topics not supported
 4. **No Internal Topics**: System topics use traditional storage
 5. **MAX_TIMESTAMP is approximate**: `ListOffsets(-3)` answers with the last entry's base offset and its write timestamp instead of scanning records for the true maximum create time. Entries are written in write-timestamp order, so this is exact whenever record timestamps follow write order; where they do not, the answer names the last entry rather than the record with the highest timestamp. The exact answer would cost one index lookup per record.
-6. **Timestamp lookups scan a bounded window**: `ListOffsets(t)` reads at most 256 entries past its binary search. Beyond that it answers with the first entry written at or after `t`, which is at or before the true offset and never past it.
+6. **Timestamp lookups scan a bounded window**: `ListOffsets(t)` reads at most 256 entries past its binary search. Beyond that it answers with the first entry written at or after `t`, which is at or before the true offset and never past it. If none of the scanned entries was written at or after `t`, the lookup reports no offset at all, even though a later entry past the window may hold one. That exhaustion answer's timestamp is always the entry's write time, not a record's create time.
 
 ### Future Enhancements
 

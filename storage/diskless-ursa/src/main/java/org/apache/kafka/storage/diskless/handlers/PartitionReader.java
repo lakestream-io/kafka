@@ -54,8 +54,8 @@ import io.lakestream.api.LogOffset;
  * whichever read releases first back into the empty cache keeps its cursor while the other is closed.
  *
  * <p>ListOffsets never opens a cursor. A timestamp lookup binary searches entry headers for the
- * first entry that can hold the answer and reads forward from there, over a bounded number of
- * entries; MAX_TIMESTAMP is answered from the last entry's header alone.
+ * last entry whose header predates the target and reads forward from there, over a bounded number
+ * of entries; MAX_TIMESTAMP is answered from the last entry's header alone.
  */
 final class PartitionReader implements AutoCloseable {
 

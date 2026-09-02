@@ -393,6 +393,35 @@ class PartitionReaderTest {
     }
 
     @Test
+    void timestampSearchStopsInsteadOfRecursingForeverWhenAnEntryNeverAdvances() throws Exception {
+        // A decoded entry's next offset is baseOffset + numberOfRecords (see probe()): a zero-record
+        // entry would leave the next offset equal to the very offset the scan just read from, making
+        // no forward progress at all. KafkaRecordsPayload.readableRecords rejects an actual
+        // zero-record payload outright, so this reproduces the same zero-progress shape by having
+        // every read hand back one entry whose own base offset never matches the offset requested --
+        // it always folds back to the same fixed offset. Before ForwardScan carried its own
+        // remaining-entries budget, nothing but reaching endOffsetExclusive stopped the scan, so an
+        // entry that never advances the offset would have made driveScan recurse (or loop) forever
+        // instead of terminating.
+        Log log = mock(Log.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(299L, 1, 400L)));
+        when(log.binarySearchOffset(eq(0L), eq(299L), any())).thenReturn(completedFuture(0L));
+        // A fresh entry per read: each one is a single-use resource that releases its payload on
+        // close(), so replaying one mock across reads would fail with a Netty reference-count error
+        // rather than exercising the scan bound this test targets.
+        when(log.readEntry(anyLong())).thenAnswer(invocation -> completedFuture(entry(0L, recordAt(10L), 100L)));
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10)) {
+            ListOffsetsPartitionResponse response =
+                    reader.listOffsets(listOffsetsRequest(1_000L)).get(10, TimeUnit.SECONDS);
+            assertEquals(-1L, response.offset());
+            assertEquals(-1L, response.timestamp());
+            verify(log, times(256)).readEntry(anyLong());
+        }
+    }
+
+    @Test
     void highWatermarkIsTheOffsetPastTheLastRecord() throws Exception {
         Log log = mock(Log.class);
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(10L, 5, 1L)));
