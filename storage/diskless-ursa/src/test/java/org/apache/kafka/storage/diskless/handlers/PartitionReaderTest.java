@@ -299,15 +299,17 @@ class PartitionReaderTest {
     }
 
     @Test
-    void timestampSearchStopsAfterOneFallbackEntry() throws Exception {
+    void timestampSearchReportsNoOffsetOnlyAfterTheRangeIsExhausted() throws Exception {
         Log log = mock(Log.class);
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(2L, 1, 300L)));
         when(log.binarySearchOffset(eq(0L), eq(2L), any())).thenReturn(completedFuture(0L));
         LogEntry first = entry(0L, records("a"));
         LogEntry second = entry(1L, records("b"));
+        LogEntry third = entry(2L, records("c"));
         when(log.readEntry(0L)).thenReturn(completedFuture(first));
         when(log.readEntry(1L)).thenReturn(completedFuture(second));
+        when(log.readEntry(2L)).thenReturn(completedFuture(third));
 
         try (PartitionReader reader = new PartitionReader(TP, log, 10)) {
             ListOffsetsPartitionResponse response = reader.listOffsets(listOffsetsRequest(Long.MAX_VALUE)).get();
@@ -315,7 +317,34 @@ class PartitionReaderTest {
             assertEquals(-1L, response.timestamp());
             verify(first).close();
             verify(second).close();
-            verify(log, times(2)).readEntry(anyLong());
+            verify(third).close();
+            verify(log, times(3)).readEntry(anyLong());
+        }
+    }
+
+    @Test
+    void timestampSearchFindsAMatchSeveralEntriesPastTheBinarySearch() throws Exception {
+        // A header carries the entry's write time and a record its create time, so a write path
+        // running behind the clock leaves a run of entries whose headers are already past the
+        // target while their records are not. Giving up after the entry that follows the binary
+        // search reported no offset for a timestamp the log does hold.
+        Log log = mock(Log.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(3L, 1, 400L)));
+        when(log.binarySearchOffset(eq(0L), eq(3L), any())).thenReturn(completedFuture(0L));
+        LogEntry stale = entry(0L, recordAt(100L));
+        LogEntry alsoStale = entry(1L, recordAt(150L));
+        LogEntry stillStale = entry(2L, recordAt(200L));
+        LogEntry match = entry(3L, recordAt(260L));
+        when(log.readEntry(0L)).thenReturn(completedFuture(stale));
+        when(log.readEntry(1L)).thenReturn(completedFuture(alsoStale));
+        when(log.readEntry(2L)).thenReturn(completedFuture(stillStale));
+        when(log.readEntry(3L)).thenReturn(completedFuture(match));
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10)) {
+            ListOffsetsPartitionResponse response = reader.listOffsets(listOffsetsRequest(250L)).get();
+            assertEquals(3L, response.offset());
+            assertEquals(260L, response.timestamp());
         }
     }
 
@@ -340,6 +369,11 @@ class PartitionReaderTest {
     private static MemoryRecords records(String value) {
         return MemoryRecords.withRecords(Compression.NONE,
                 new SimpleRecord(1L, value.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static MemoryRecords recordAt(long timestamp) {
+        return MemoryRecords.withRecords(Compression.NONE,
+                new SimpleRecord(timestamp, "v".getBytes(StandardCharsets.UTF_8)));
     }
 
     private static int count(Records records) {

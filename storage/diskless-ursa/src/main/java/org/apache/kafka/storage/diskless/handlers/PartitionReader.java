@@ -53,9 +53,9 @@ import io.lakestream.api.LogOffset;
  * seek. A concurrent second fetch never queues behind the first: it opens a throw-away cursor, and
  * whichever read releases first back into the empty cache keeps its cursor while the other is closed.
  *
- * <p>ListOffsets never opens a cursor and decodes at most two entries. A timestamp lookup binary
- * searches entry headers and then reads the one entry that can hold the answer; MAX_TIMESTAMP is
- * answered from the last entry's header alone.
+ * <p>ListOffsets never opens a cursor. A timestamp lookup binary searches entry headers for the
+ * first entry that can hold the answer and reads forward from there; MAX_TIMESTAMP is answered from
+ * the last entry's header alone.
  */
 final class PartitionReader implements AutoCloseable {
 
@@ -211,10 +211,15 @@ final class PartitionReader implements AutoCloseable {
     }
 
     /**
-     * Binary searches entry headers for the last entry written before {@code target}, then decodes that
-     * single entry. A header timestamp is the entry's write time while a record timestamp is its create
-     * time, so the first matching record can sit in the entry that follows; that one entry is read as a
-     * fallback before reporting no match.
+     * Binary searches entry headers for the first entry that can hold a record at or after
+     * {@code target}, then reads entries forward from it until one does.
+     *
+     * <p>A header timestamp is the entry's write time and a record timestamp is its create time, so
+     * a record is never newer than the header it was written under. An entry whose header predates
+     * {@code target} therefore holds no answer at all, which is what the binary search skips. Past
+     * that point the records still lag their headers by however far the write path is behind the
+     * clock, so the first record at or after {@code target} can sit any number of entries further
+     * on: stopping early reported no offset for a timestamp the log does hold.
      */
     private CompletableFuture<ListOffsetsPartitionResponse> firstAtOrAfter(Range range, long target) {
         return call(() -> logInstance.binarySearchOffset(
@@ -223,29 +228,21 @@ final class PartitionReader implements AutoCloseable {
                 .thenCompose(found -> searchEntryAt(
                         found == null || found < range.start() ? range.start() : found,
                         target,
-                        range.highWatermark(),
-                        true));
+                        range.highWatermark()));
     }
 
     private CompletableFuture<ListOffsetsPartitionResponse> searchEntryAt(
             long entryOffset,
             long target,
-            long endOffsetExclusive,
-            boolean readFollowingEntry) {
+            long endOffsetExclusive) {
         if (entryOffset < 0 || entryOffset >= endOffsetExclusive) {
             return CompletableFuture.completedFuture(notFound());
         }
         return call(() -> logInstance.readEntry(entryOffset), "Log.readEntry")
                 .thenApply(entry -> probe(entry, target))
-                .thenCompose(probe -> {
-                    if (probe.match() != null) {
-                        return CompletableFuture.completedFuture(probe.match());
-                    }
-                    if (!readFollowingEntry) {
-                        return CompletableFuture.completedFuture(notFound());
-                    }
-                    return searchEntryAt(probe.nextOffset(), target, endOffsetExclusive, false);
-                });
+                .thenCompose(probe -> probe.match() != null
+                        ? CompletableFuture.completedFuture(probe.match())
+                        : searchEntryAt(probe.nextOffset(), target, endOffsetExclusive));
     }
 
     /** Decodes one entry, always closing it, and reports the first record at or after {@code target}. */
