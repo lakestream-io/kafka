@@ -279,7 +279,6 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
      */
     private CompletableFuture<Void> deleteProducerState(Uuid topicId) {
         String id = topicId.toString();
-        String prefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(id);
         return producerStateClient.put(
                         ProducerStateSnapshotKeys.deletedTopicMarkerKey(id),
                         DELETED_TOPIC_MARKER,
@@ -296,7 +295,34 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
                     }
                     throw new CompletionException(cause);
                 })
-                .thenCompose(ignored -> producerStateClient.deleteRange(prefix, prefix + '\uffff'));
+                .thenCompose(ignored -> deleteSnapshots(id));
+    }
+
+    /**
+     * Removes every producer-state snapshot of one topic incarnation.
+     *
+     * <p>Oxia compares keys one path segment at a time, so a range whose bounds hold no separator
+     * past the prefix reaches the unzoned {@code <prefix><partition>} snapshots and nothing else: a
+     * zoned {@code <prefix><partition>/<zone>} key sorts after {@code <prefix>\uffff} because it
+     * carries a segment the bound does not, and a zone may hold any number of separators of its
+     * own, so no fixed bound covers every depth. The range therefore only retires snapshots written
+     * before the topic index existed, and the indexed ones -- every snapshot this code writes --
+     * are enumerated through that index and deleted by key.
+     */
+    private CompletableFuture<Void> deleteSnapshots(String topicId) {
+        String prefix = ProducerStateSnapshotKeys.topicSnapshotPrefix(topicId);
+        return producerStateClient.deleteRange(prefix, prefix + '\uffff')
+                .thenCompose(ignored -> producerStateClient.list(
+                        ProducerStateSnapshotKeys.topicIndexKey(topicId),
+                        ProducerStateSnapshotKeys.topicIndexEndExclusive(topicId),
+                        Set.of(ListOption.UseIndex(ProducerStateSnapshotKeys.topicIndexName()))))
+                .thenCompose(keys -> {
+                    List<CompletableFuture<Boolean>> deletes = new ArrayList<>(keys.size());
+                    for (String key : keys) {
+                        deletes.add(producerStateClient.delete(key));
+                    }
+                    return CompletableFuture.allOf(deletes.toArray(new CompletableFuture<?>[0]));
+                });
     }
 
     /** Distinct topic IDs that still have producer-state snapshots, from the secondary index. */

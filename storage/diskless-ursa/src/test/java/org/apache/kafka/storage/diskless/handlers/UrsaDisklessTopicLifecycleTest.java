@@ -46,6 +46,7 @@ import io.lakestream.api.exception.StreamPermanentlyDeletedException;
 import io.oxia.client.api.AsyncOxiaClient;
 import io.oxia.client.api.PutResult;
 import io.oxia.client.api.exceptions.KeyAlreadyExistsException;
+import io.oxia.client.api.options.ListOption;
 import io.oxia.client.api.options.PutOption;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -395,16 +396,27 @@ class UrsaDisklessTopicLifecycleTest {
                 .thenReturn(CompletableFuture.completedFuture(new PutResult(fenceKey, null)));
         when(oxia.deleteRange(anyString(), anyString()))
                 .thenReturn(CompletableFuture.completedFuture(null));
+        // Oxia compares keys one path segment at a time, so the range bound reaches the unzoned
+        // snapshots and no further. A zoned snapshot -- whose zone may itself carry separators --
+        // is only reachable through the key the topic index reports.
+        String zoned = ProducerStateSnapshotKeys.snapshotKey(topicId.toString(), 0, "rack/0");
+        when(oxia.list(
+                eq(ProducerStateSnapshotKeys.topicIndexKey(topicId.toString())),
+                eq(ProducerStateSnapshotKeys.topicIndexEndExclusive(topicId.toString())),
+                eq(Set.of(ListOption.UseIndex(ProducerStateSnapshotKeys.topicIndexName())))))
+                .thenReturn(CompletableFuture.completedFuture(List.of(zoned)));
+        when(oxia.delete(anyString())).thenReturn(CompletableFuture.completedFuture(true));
 
         try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             lifecycle.deleteTopic("orders", topicId).get();
         }
 
         // The fence must be durable before any snapshot is removed, so a broker that reads it
-        // afterwards can never recreate one behind the range delete.
+        // afterwards can never recreate one behind the delete.
         InOrder inOrder = inOrder(oxia);
         inOrder.verify(oxia).put(eq(fenceKey), any(), anySet());
         inOrder.verify(oxia).deleteRange(prefix, prefix + '\uffff');
+        inOrder.verify(oxia).delete(zoned);
         verify(catalog).dropStream(id, true);
     }
 
@@ -422,6 +434,8 @@ class UrsaDisklessTopicLifecycleTest {
         when(oxia.put(eq(fenceKey), any(), anySet())).thenReturn(firstFence, secondFence);
         when(oxia.deleteRange(anyString(), anyString()))
                 .thenReturn(CompletableFuture.completedFuture(null));
+        when(oxia.list(anyString(), anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
 
         try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
             // The reconciler only cancels a timed-out operation best effort, so a retry can overlap
@@ -452,10 +466,14 @@ class UrsaDisklessTopicLifecycleTest {
                         managedEntry("a", live, 10L),
                         managedEntry("b", orphan, 10L),
                         managedEntry("c", tooNew, 99L))));
+        // A per-topic index listing drives the delete of each swept topic's zoned snapshots.
+        when(oxia.list(anyString(), anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
         when(oxia.list(eq(ProducerStateSnapshotKeys.topicIndexKey("")), anyString(), anySet()))
                 .thenReturn(CompletableFuture.completedFuture(List.of(
                         ProducerStateSnapshotKeys.snapshotKey(live.toString(), 0),
                         ProducerStateSnapshotKeys.snapshotKey(staleSnapshotOnly.toString(), 0))));
+        when(oxia.delete(anyString())).thenReturn(CompletableFuture.completedFuture(true));
         when(catalog.dropStream(any(), eq(true))).thenReturn(CompletableFuture.completedFuture(true));
         when(oxia.put(anyString(), any(), anySet()))
                 .thenAnswer(invocation -> CompletableFuture.completedFuture(
