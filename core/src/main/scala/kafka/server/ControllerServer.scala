@@ -104,7 +104,6 @@ class ControllerServer(
   var controllerApis: ControllerApis = _
   var controllerApisHandlerPool: KafkaRequestHandlerPool = _
   var disklessTopicLifecycle: DisklessTopicLifecycle = _
-  private val disklessOrphanSweepIntervalMs = 600000L
   def kafkaYammerMetrics: KafkaYammerMetrics = KafkaYammerMetrics.INSTANCE
   val metadataPublishers: util.List[MetadataPublisher] = new util.ArrayList[MetadataPublisher]()
   @volatile var metadataCache : KRaftMetadataCache = _
@@ -348,7 +347,7 @@ class ControllerServer(
           config.nodeId,
           disklessTopicLifecycle,
           (msg: String, cause: Throwable) => sharedServer.metadataPublishingFaultHandler.handleFault(msg, cause),
-          disklessOrphanSweepIntervalMs,
+          config.disklessLifecycleSweepIntervalMs,
         ))
       }
 

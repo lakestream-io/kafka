@@ -438,6 +438,7 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _], enforceProv
 
   /** Diskless Storage Configurations **/
   val ursaStorageEnable: Boolean = getBoolean(ServerLogConfigs.URSA_STORAGE_ENABLE_CONFIG)
+  val disklessLifecycleSweepIntervalMs: Long = getLong(ServerLogConfigs.URSA_STORAGE_LIFECYCLE_SWEEP_INTERVAL_MS_CONFIG)
 
   override def addReconfigurable(reconfigurable: Reconfigurable): Unit = {
     dynamicConfig.addReconfigurable(reconfigurable)

@@ -249,6 +249,13 @@ public class ServerLogConfigs {
     public static final long URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE_DEFAULT = 256 * 1024 * 1024L;
     public static final String URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE_DOC = "The size in bytes for triggering a write buffer flush.";
 
+    public static final String URSA_STORAGE_LIFECYCLE_SWEEP_INTERVAL_MS_CONFIG =
+            "ursa.storage.lifecycle.sweep.interval.ms";
+    public static final long URSA_STORAGE_LIFECYCLE_SWEEP_INTERVAL_MS_DEFAULT = 600_000L;
+    public static final String URSA_STORAGE_LIFECYCLE_SWEEP_INTERVAL_MS_DOC =
+            "Interval between scans that delete diskless storage left behind by topics no longer in Kafka metadata. "
+                    + "Runs on the active controller.";
+
     public static final String URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_CONFIG =
             "ursa.storage.producer.state.snapshot.interval.ms";
     public static final long URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_DEFAULT = 30_000L;

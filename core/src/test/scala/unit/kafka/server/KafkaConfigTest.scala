@@ -955,6 +955,8 @@ class KafkaConfigTest {
         case ServerLogConfigs.LOG_MESSAGE_TIMESTAMP_BEFORE_MAX_MS_CONFIG => assertPropertyInvalid(baseProperties, name, "not_a_number")
         case ServerLogConfigs.LOG_MESSAGE_TIMESTAMP_AFTER_MAX_MS_CONFIG => assertPropertyInvalid(baseProperties, name, "not_a_number")
         case ServerLogConfigs.LOG_FLUSH_START_OFFSET_CHECKPOINT_INTERVAL_MS_CONFIG => assertPropertyInvalid(baseProperties, name, "not_a_number")
+        case ServerLogConfigs.URSA_STORAGE_LIFECYCLE_SWEEP_INTERVAL_MS_CONFIG =>
+          assertPropertyInvalid(baseProperties, name, "not_a_number", "999")
         case ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_INTERVAL_MS_CONFIG =>
           assertPropertyInvalid(baseProperties, name, "not_a_number")
         case ServerLogConfigs.URSA_STORAGE_PRODUCER_STATE_SNAPSHOT_RECORD_THRESHOLD_CONFIG =>

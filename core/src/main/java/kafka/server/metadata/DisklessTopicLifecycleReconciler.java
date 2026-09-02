@@ -16,37 +16,150 @@
  */
 package kafka.server.metadata;
 
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.utils.ExponentialBackoff;
+import org.apache.kafka.image.ConfigurationsDelta;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.image.TopicImage;
+import org.apache.kafka.image.TopicsDelta;
 import org.apache.kafka.image.loader.LoaderManifest;
 import org.apache.kafka.image.publisher.MetadataPublisher;
 import org.apache.kafka.raft.LeaderAndEpoch;
+import org.apache.kafka.server.metrics.KafkaMetricsGroup;
+import org.apache.kafka.storage.diskless.DisklessFutures;
 import org.apache.kafka.storage.diskless.DisklessTopicLifecycle;
+import org.apache.kafka.storage.diskless.DisklessTopics;
 
+import com.yammer.metrics.core.Meter;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 
 /**
- * Active-controller reconciler for post-commit diskless topic lifecycle operations.
+ * Drives diskless storage lifecycle operations from the active controller's metadata image.
  *
- * <p>This is a placeholder while the reconciler is rewritten against the collapsed
- * {@link DisklessTopicLifecycle} SPI: it publishes nothing and drives no lifecycle operation yet.
+ * <p>Every KRaft metadata update names a desired state for each diskless topic: present with a
+ * partition count and a configuration, or absent. The reconciler records that desired state,
+ * stamped with the metadata offset it came from, and drives {@link DisklessTopicLifecycle} towards
+ * it. Operations are idempotent, so a failure is simply retried with exponential backoff until it
+ * succeeds or the desired state changes underneath it.
+ *
+ * <p>Concurrency rules:
+ * <ul>
+ *   <li>At most one operation is in flight per topic; a desired-state change that arrives while an
+ *       operation runs is applied when that operation completes.</li>
+ *   <li>At most {@code maxConcurrentOperations} operations are in flight across all topics.</li>
+ *   <li>Leadership changes bump a generation counter. Results of operations started in an earlier
+ *       generation are discarded without touching any state, and every retry and sweep scheduled by
+ *       that generation is cancelled.</li>
+ *   <li>A periodic sweep deletes storage for topics that vanished from the metadata image while
+ *       this node was not the active controller.</li>
+ * </ul>
  */
 public final class DisklessTopicLifecycleReconciler implements MetadataPublisher {
 
-    private final int nodeId;
+    private static final Logger log = LoggerFactory.getLogger(DisklessTopicLifecycleReconciler.class);
 
-    public DisklessTopicLifecycleReconciler(
-            int nodeId,
-            DisklessTopicLifecycle lifecycle,
-            BiConsumer<String, Throwable> faultHandler,
-            long sweepIntervalMs) {
-        this.nodeId = nodeId;
-        Objects.requireNonNull(lifecycle, "lifecycle must not be null");
-        Objects.requireNonNull(faultHandler, "faultHandler must not be null");
-        if (sweepIntervalMs <= 0) {
-            throw new IllegalArgumentException("sweepIntervalMs must be positive");
+    private static final long DEFAULT_INITIAL_RETRY_MS = 1_000L;
+    private static final long DEFAULT_MAX_RETRY_MS = 30_000L;
+    private static final long DEFAULT_OPERATION_TIMEOUT_MS = 60_000L;
+    private static final int DEFAULT_MAX_CONCURRENT_OPERATIONS = 16;
+
+    private static final String PENDING_OPERATIONS_METRIC = "PendingOperations";
+    private static final String FAILED_OPERATIONS_METRIC = "FailedOperations";
+    private static final String ERRORS_METRIC = "LifecycleOperationErrorsPerSec";
+
+    /**
+     * The state one topic must reach, as of the metadata image that last changed it. {@link #remember}
+     * stores a new instance whenever the target changes and never mutates one. Reference identity
+     * therefore answers "is this still the state we set out to reach?".
+     */
+    private record Desired(String name, Uuid id, boolean present, int partitions,
+                           Map<String, String> configs, long sourceRevision) {
+
+        /** True when {@code other} asks for the same end state, ignoring where each came from. */
+        boolean sameTargetAs(Desired other) {
+            return other != null
+                && present == other.present
+                && partitions == other.partitions
+                && name.equals(other.name)
+                && configs.equals(other.configs);
         }
+    }
+
+    private final int nodeId;
+    private final DisklessTopicLifecycle lifecycle;
+    private final BiConsumer<String, Throwable> faultHandler;
+    private final long sweepIntervalMs;
+    private final long operationTimeoutMs;
+    private final int maxConcurrentOperations;
+    private final ExponentialBackoff backoff;
+    private final ScheduledExecutorService executor;
+    private final KafkaMetricsGroup metricsGroup =
+        new KafkaMetricsGroup("kafka.server", "DisklessTopicLifecycleReconciler");
+    private final Meter errors = metricsGroup.newMeter(ERRORS_METRIC, "errors", TimeUnit.SECONDS);
+
+    // All mutable state below is guarded by this.
+    private final Map<Uuid, Desired> desired = new HashMap<>();
+    private final Map<Uuid, Runner> runners = new HashMap<>();
+    private final Deque<Runner> waitingForPermit = new ArrayDeque<>();
+    private MetadataImage latestImage;
+    private boolean active;
+    private boolean closed;
+    private boolean fullReconcilePending;
+    private long generation;
+    private int inFlight;
+    private ScheduledFuture<?> sweepTask;
+    private boolean sweepInFlight;
+
+    public DisklessTopicLifecycleReconciler(int nodeId, DisklessTopicLifecycle lifecycle,
+                                            BiConsumer<String, Throwable> faultHandler, long sweepIntervalMs) {
+        this(nodeId, lifecycle, faultHandler, sweepIntervalMs, DEFAULT_INITIAL_RETRY_MS, DEFAULT_MAX_RETRY_MS,
+            DEFAULT_OPERATION_TIMEOUT_MS, DEFAULT_MAX_CONCURRENT_OPERATIONS,
+            Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "diskless-lifecycle-reconciler-" + nodeId);
+                thread.setDaemon(true);
+                return thread;
+            }));
+    }
+
+    // Visible for testing.
+    DisklessTopicLifecycleReconciler(int nodeId, DisklessTopicLifecycle lifecycle,
+                                     BiConsumer<String, Throwable> faultHandler, long sweepIntervalMs,
+                                     long initialRetryMs, long maxRetryMs, long operationTimeoutMs,
+                                     int maxConcurrentOperations, ScheduledExecutorService executor) {
+        this.nodeId = nodeId;
+        this.lifecycle = Objects.requireNonNull(lifecycle, "lifecycle must not be null");
+        this.faultHandler = Objects.requireNonNull(faultHandler, "faultHandler must not be null");
+        this.executor = Objects.requireNonNull(executor, "executor must not be null");
+        if (sweepIntervalMs <= 0 || operationTimeoutMs <= 0 || maxConcurrentOperations <= 0) {
+            throw new IllegalArgumentException("the sweep interval, operation timeout and concurrency limit "
+                + "must all be positive");
+        }
+        this.sweepIntervalMs = sweepIntervalMs;
+        this.operationTimeoutMs = operationTimeoutMs;
+        this.maxConcurrentOperations = maxConcurrentOperations;
+        this.backoff = new ExponentialBackoff(initialRetryMs, 2, maxRetryMs, 0.2);
+        metricsGroup.newGauge(PENDING_OPERATIONS_METRIC, this::pendingOperations);
+        metricsGroup.newGauge(FAILED_OPERATIONS_METRIC, this::failedOperations);
     }
 
     @Override
@@ -55,14 +168,393 @@ public final class DisklessTopicLifecycleReconciler implements MetadataPublisher
     }
 
     @Override
-    public void onMetadataUpdate(MetadataDelta delta, MetadataImage newImage, LoaderManifest manifest) {
+    public void onControllerChange(LeaderAndEpoch newLeaderAndEpoch) {
+        MetadataImage image;
+        boolean nowActive;
+        synchronized (this) {
+            generation++;
+            cancelAllLocked();
+            active = !closed && newLeaderAndEpoch.isLeader(nodeId);
+            fullReconcilePending = active;
+            nowActive = active;
+            image = latestImage;
+        }
+        if (nowActive && image != null) {
+            reconcileFullImage(image);
+        }
     }
 
     @Override
-    public void onControllerChange(LeaderAndEpoch newLeaderAndEpoch) {
+    public void onMetadataUpdate(MetadataDelta delta, MetadataImage newImage, LoaderManifest manifest) {
+        boolean full;
+        synchronized (this) {
+            latestImage = newImage;
+            if (!active) {
+                return;
+            }
+            full = fullReconcilePending;
+        }
+        if (full) {
+            reconcileFullImage(newImage);
+            return;
+        }
+        long sourceRevision = newImage.highestOffsetAndEpoch().offset();
+        if (delta.topicsDelta() != null) {
+            applyTopicsDelta(delta.topicsDelta(), delta.image(), newImage, sourceRevision);
+        }
+        if (delta.configsDelta() != null) {
+            applyConfigsDelta(delta.configsDelta(), newImage, sourceRevision);
+        }
+    }
+
+    /** Records the desired state of every topic this delta created, deleted or repartitioned. */
+    private void applyTopicsDelta(TopicsDelta topics, MetadataImage oldImage, MetadataImage newImage,
+                                  long sourceRevision) {
+        for (Uuid id : topics.deletedTopicIds()) {
+            // The deleted topic is only in the image the delta was built from, and so is its config.
+            TopicImage old = oldImage.topics().getTopic(id);
+            if (old != null && DisklessTopics.isDiskless(old.name(), topicConfigs(oldImage, old.name()))) {
+                remember(new Desired(old.name(), id, false, 0, Map.of(), sourceRevision));
+            }
+        }
+        for (Uuid id : topics.createdTopicIds()) {
+            rememberPresent(newImage, id, sourceRevision);
+        }
+        for (Uuid id : topics.changedTopics().keySet()) {
+            TopicImage old = oldImage.topics().getTopic(id);
+            TopicImage current = newImage.topics().getTopic(id);
+            if (old != null && current != null && old.partitions().size() != current.partitions().size()) {
+                rememberPresent(newImage, id, sourceRevision);
+            }
+        }
+    }
+
+    /**
+     * Records the desired state of every topic whose configuration changed, which also covers a
+     * topic that just became -- or stopped being -- diskless.
+     */
+    private void applyConfigsDelta(ConfigurationsDelta configs, MetadataImage newImage, long sourceRevision) {
+        for (ConfigResource resource : configs.changes().keySet()) {
+            if (resource.type() != ConfigResource.Type.TOPIC) {
+                continue;
+            }
+            TopicImage topic = newImage.topics().getTopic(resource.name());
+            if (topic != null) {
+                rememberPresent(newImage, topic.id(), sourceRevision);
+            }
+        }
+    }
+
+    /**
+     * Reconciles every diskless topic in {@code image}, then sweeps storage this controller no
+     * longer recognises. Called once per leadership acquisition, so it must not assume that any
+     * earlier desired state survived.
+     */
+    private void reconcileFullImage(MetadataImage image) {
+        long sourceRevision = image.highestOffsetAndEpoch().offset();
+        Set<Uuid> live = new HashSet<>();
+        for (TopicImage topic : image.topics().topicsById().values()) {
+            Map<String, String> configs = topicConfigs(image, topic.name());
+            if (DisklessTopics.isDiskless(topic.name(), configs)) {
+                live.add(topic.id());
+                remember(new Desired(topic.name(), topic.id(), true, topic.partitions().size(),
+                    configs, sourceRevision));
+            }
+        }
+        List<Desired> vanished;
+        synchronized (this) {
+            fullReconcilePending = false;
+            vanished = desired.values().stream()
+                .filter(d -> d.present() && !live.contains(d.id()))
+                .toList();
+        }
+        for (Desired gone : vanished) {
+            remember(new Desired(gone.name(), gone.id(), false, 0, Map.of(), sourceRevision));
+        }
+        // Sweep against the image we just reconciled rather than whatever arrives next, so the
+        // offset handed to the storage layer can never be newer than the state it was derived from.
+        startSweep(image);
+    }
+
+    private void rememberPresent(MetadataImage image, Uuid id, long sourceRevision) {
+        TopicImage topic = image.topics().getTopic(id);
+        if (topic == null) {
+            return;
+        }
+        Map<String, String> configs = topicConfigs(image, topic.name());
+        if (DisklessTopics.isDiskless(topic.name(), configs)) {
+            remember(new Desired(topic.name(), id, true, topic.partitions().size(), configs, sourceRevision));
+        } else {
+            forget(id);
+        }
+    }
+
+    /**
+     * Stops tracking a topic that is no longer diskless, so that turning the config back on
+     * reconciles it from scratch. Its storage is retired by the periodic sweep rather than by
+     * {@code deleteTopic}, which may only be used once the topic has left Kafka metadata for good.
+     */
+    private synchronized void forget(Uuid id) {
+        if (desired.remove(id) == null) {
+            return;
+        }
+        Runner runner = runners.get(id);
+        if (runner != null) {
+            runner.wake();      // startNextLocked drops a runner that has no desired state left
+        }
+    }
+
+    /** Records {@code next} as the topic's desired state and, if it changed anything, drives it. */
+    private void remember(Desired next) {
+        synchronized (this) {
+            if (!active || closed || next.sameTargetAs(desired.get(next.id()))) {
+                return;
+            }
+            desired.put(next.id(), next);
+            runners.computeIfAbsent(next.id(), Runner::new).wake();
+        }
+    }
+
+    /** Serializes operations for one topic; at most one attempt is in flight per topic. */
+    private final class Runner {
+        private final Uuid id;
+        private long attempt;
+        private long generationSeen;
+        private boolean running;
+        private boolean queued;
+        private ScheduledFuture<?> retry;
+
+        Runner(Uuid id) {
+            this.id = id;
+        }
+
+        /** Queues this runner for a permit unless it already holds one. Called with the monitor held. */
+        void wake() {
+            if (running || queued || retry != null) {
+                return;
+            }
+            queued = true;
+            waitingForPermit.add(this);
+            startNextLocked();
+        }
+    }
+
+    /**
+     * Starts queued operations while permits remain. Called with the monitor held: the lifecycle
+     * call must return a future promptly, and its completion is always handed to {@link #executor}
+     * so that an already-completed future cannot re-enter this method on the same thread.
+     */
+    private void startNextLocked() {
+        while (inFlight < maxConcurrentOperations && !waitingForPermit.isEmpty()) {
+            Runner runner = waitingForPermit.poll();
+            runner.queued = false;
+            Desired target = desired.get(runner.id);
+            if (target == null) {
+                runners.remove(runner.id, runner);
+                continue;
+            }
+            runner.running = true;
+            runner.generationSeen = generation;
+            inFlight++;
+            CompletableFuture<Void> operation;
+            try {
+                operation = target.present()
+                    ? lifecycle.ensureTopic(target.name(), target.id(), target.partitions(),
+                        target.configs(), target.sourceRevision())
+                    : lifecycle.deleteTopic(target.name(), target.id());
+                if (operation == null) {
+                    throw new IllegalStateException("the diskless topic lifecycle returned a null future");
+                }
+            } catch (Throwable t) {
+                operation = CompletableFuture.failedFuture(t);
+            }
+            operation.orTimeout(operationTimeoutMs, TimeUnit.MILLISECONDS)
+                .whenComplete((ignored, error) -> schedule(() -> complete(runner, target, error), 0));
+        }
+    }
+
+    /** Applies the outcome of one operation. Always runs on {@link #executor}. */
+    private void complete(Runner runner, Desired target, Throwable error) {
+        long delay = -1;
+        long attempt = 0;
+        synchronized (this) {
+            if (runner.generationSeen != generation || closed || !active) {
+                // A leadership change already discarded this runner and reset the permit count;
+                // touching any shared state here would corrupt the generation that replaced it.
+                return;
+            }
+            inFlight--;
+            runner.running = false;
+            if (error == null) {
+                runner.attempt = 0;
+                Desired latest = desired.get(runner.id);
+                if (latest == target) {
+                    if (!latest.present()) {
+                        desired.remove(runner.id);          // deletion is terminal for this topic id
+                    }
+                    runners.remove(runner.id, runner);
+                } else {
+                    runner.wake();                          // the desired state moved on meanwhile
+                }
+            } else {
+                runner.attempt++;
+                attempt = runner.attempt;
+                delay = backoff.backoff(attempt - 1);
+                runner.retry = schedule(() -> retry(runner), delay);
+            }
+            startNextLocked();
+        }
+        if (error != null) {
+            errors.mark();
+            String description = (target.present() ? "ensure diskless topic " : "delete diskless topic ")
+                + target.name() + " (" + target.id() + ")";
+            faultHandler.accept("Failed to " + description
+                + " (attempt " + attempt + ", retrying in " + delay + " ms)", DisklessFutures.unwrap(error));
+        }
+    }
+
+    /** Re-queues a runner whose backoff elapsed. Always runs on {@link #executor}. */
+    private void retry(Runner runner) {
+        synchronized (this) {
+            runner.retry = null;
+            if (!active || closed || runner.generationSeen != generation || runners.get(runner.id) != runner) {
+                return;
+            }
+            runner.queued = true;
+            waitingForPermit.add(runner);
+            startNextLocked();
+        }
+    }
+
+    /** The periodic sweep entry point. Always runs on {@link #executor}. */
+    private void sweep() {
+        MetadataImage image;
+        synchronized (this) {
+            sweepTask = null;
+            if (!active || closed || sweepInFlight || latestImage == null) {
+                // Either a sweep is already running -- and will reschedule the next one when it
+                // finishes -- or this node stopped being the active controller.
+                return;
+            }
+            image = latestImage;
+        }
+        startSweep(image);
+    }
+
+    /**
+     * Deletes storage for every managed topic missing from {@code image}. At most one sweep runs at
+     * a time, and each one reschedules the next when it finishes.
+     */
+    private void startSweep(MetadataImage image) {
+        long sweepGeneration;
+        synchronized (this) {
+            if (!active || closed || sweepInFlight) {
+                return;
+            }
+            if (sweepTask != null) {
+                sweepTask.cancel(false);
+                sweepTask = null;
+            }
+            sweepInFlight = true;
+            sweepGeneration = generation;
+        }
+        long imageOffset = image.highestOffsetAndEpoch().offset();
+        Set<Uuid> liveTopicIds = new HashSet<>();
+        for (TopicImage topic : image.topics().topicsById().values()) {
+            if (DisklessTopics.isDiskless(topic.name(), topicConfigs(image, topic.name()))) {
+                liveTopicIds.add(topic.id());
+            }
+        }
+        log.debug("Sweeping diskless storage for topics missing from metadata image at offset {}", imageOffset);
+        CompletableFuture<Void> result;
+        try {
+            result = lifecycle.sweepOrphans(liveTopicIds, imageOffset);
+            if (result == null) {
+                throw new IllegalStateException("the diskless topic lifecycle returned a null future");
+            }
+        } catch (Throwable t) {
+            result = CompletableFuture.failedFuture(t);
+        }
+        result.orTimeout(operationTimeoutMs, TimeUnit.MILLISECONDS)
+            .whenComplete((ignored, error) -> completeSweep(sweepGeneration, error));
+    }
+
+    private void completeSweep(long sweepGeneration, Throwable error) {
+        synchronized (this) {
+            if (sweepGeneration != generation || closed || !active) {
+                // A newer generation already reset sweepInFlight and may have started its own sweep.
+                return;
+            }
+            sweepInFlight = false;
+            sweepTask = schedule(this::sweep, sweepIntervalMs);
+        }
+        if (error != null) {
+            errors.mark();
+            faultHandler.accept("Failed to sweep orphaned diskless topic storage", DisklessFutures.unwrap(error));
+        }
+    }
+
+    /** Drops every runner, retry and sweep of the generation that just ended. Monitor held. */
+    private void cancelAllLocked() {
+        for (Runner runner : runners.values()) {
+            if (runner.retry != null) {
+                runner.retry.cancel(false);
+            }
+        }
+        runners.clear();
+        waitingForPermit.clear();
+        desired.clear();
+        // Operations still running for the old generation return through complete(), which discards
+        // them without decrementing, so the permit count belongs entirely to the new generation.
+        inFlight = 0;
+        if (sweepTask != null) {
+            sweepTask.cancel(false);
+            sweepTask = null;
+        }
+        sweepInFlight = false;
     }
 
     @Override
     public void close() {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            active = false;
+            generation++;
+            cancelAllLocked();
+        }
+        executor.shutdownNow();
+        metricsGroup.removeMetric(PENDING_OPERATIONS_METRIC);
+        metricsGroup.removeMetric(FAILED_OPERATIONS_METRIC);
+        metricsGroup.removeMetric(ERRORS_METRIC);
+    }
+
+    /** Runs {@code task} on {@link #executor} after {@code delayMs}, or not at all once closed. */
+    private ScheduledFuture<?> schedule(Runnable task, long delayMs) {
+        try {
+            return executor.schedule(task, delayMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            log.debug("Dropping a diskless lifecycle task; the reconciler is shutting down", e);
+            return null;
+        }
+    }
+
+    private static Map<String, String> topicConfigs(MetadataImage image, String topicName) {
+        return Map.copyOf(image.configs().configMapForResource(new ConfigResource(ConfigResource.Type.TOPIC, topicName)));
+    }
+
+    private synchronized int pendingOperations() {
+        return runners.size();
+    }
+
+    private synchronized int failedOperations() {
+        return (int) runners.values().stream().filter(runner -> runner.attempt > 0).count();
+    }
+
+    // Visible for testing.
+    int pendingOperationsForTesting() {
+        return pendingOperations();
     }
 }
