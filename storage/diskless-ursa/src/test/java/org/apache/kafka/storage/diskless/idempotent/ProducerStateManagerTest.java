@@ -426,6 +426,39 @@ class ProducerStateManagerTest {
     }
 
     @Test
+    void testFailedDeletionFenceReadDoesNotCostSnapshotOwnership() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        String topicId = tp.topicId().toString();
+        String snapshotKey = ProducerStateSnapshotKeys.snapshotKey(topicId, tp.partition());
+        String deletedTopicMarkerKey = ProducerStateSnapshotKeys.deletedTopicMarkerKey(topicId);
+        RuntimeException fenceReadFailure = new RuntimeException("fence read unavailable");
+        InMemorySnapshotStore snapshotStore = new InMemorySnapshotStore();
+
+        ProducerStateManager manager = newManager(tp, snapshotStore::client, emptyLogSupplier());
+        try {
+            ProducerStateManager.PendingAppend pendingAppend = ready(manager.prepareAppend(List.of(
+                    batch(1L, (short) 0, 0, 0, 1, 1000L)
+            )).get());
+            manager.completeAppend(pendingAppend, 0L, 1000L);
+
+            snapshotStore.queueGet(deletedTopicMarkerKey, CompletableFuture.failedFuture(fenceReadFailure));
+            ExecutionException error = assertThrows(
+                    ExecutionException.class, () -> manager.takeSnapshot("fence-read-failure").get());
+            assertSame(fenceReadFailure, error.getCause());
+            // The failed read stopped the write, so the claim's empty snapshot still stands.
+            assertTrue(ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).isEmpty());
+
+            // The read told us nothing about the deletion fence, so ownership is untouched and the
+            // next attempt writes normally.
+            manager.takeSnapshot("retry").get();
+            assertEquals(1, ProducerStateSerDes.deserialize(snapshotStore.data().get(snapshotKey)).size());
+            manager.cleanup(true).get();
+        } finally {
+            manager.close();
+        }
+    }
+
+    @Test
     void testSnapshotIsNotWrittenWhenTopicIsFenced() throws Exception {
         TopicIdPartition tp = testTopicPartition();
         String topicId = tp.topicId().toString();
@@ -460,7 +493,6 @@ class ProducerStateManagerTest {
             manager.close();
         }
     }
-
 
     @Test
     void testPeriodicSnapshotStartsOnlyAfterRecoveryClaimCompletes() throws Exception {
@@ -837,7 +869,6 @@ class ProducerStateManagerTest {
             manager.close();
         }
     }
-
 
     @Test
     void testReplayFailureClosesEntireEntryBatch() throws Exception {

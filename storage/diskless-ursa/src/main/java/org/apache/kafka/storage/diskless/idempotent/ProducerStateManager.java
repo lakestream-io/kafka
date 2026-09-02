@@ -150,8 +150,7 @@ public class ProducerStateManager implements Closeable {
     }
 
     private enum ReplayEntryResult {
-        HAS_PRODUCER_BATCH,
-        NO_PRODUCER_BATCH,
+        CONTINUE,
         MANAGER_CLOSED
     }
 
@@ -1138,14 +1137,12 @@ public class ProducerStateManager implements Closeable {
         }
         long baseOffset = entry.offset();
         long nextOffset = Math.addExact(baseOffset, entry.numberOfRecords());
-        boolean hasProducerBatch = false;
         try {
             MemoryRecords records = KafkaRecordsPayload.readableRecords(
                     entry.payload(), baseOffset, entry.numberOfRecords());
             // Header-only: individual records are never decoded during replay.
             for (RecordBatch batch : records.batches()) {
                 if (batch.hasProducerId()) {
-                    hasProducerBatch = true;
                     synchronized (this) {
                         if (closed.get()) {
                             return ReplayEntryResult.MANAGER_CLOSED;
@@ -1172,7 +1169,7 @@ public class ProducerStateManager implements Closeable {
                 }
             }
         }
-        return hasProducerBatch ? ReplayEntryResult.HAS_PRODUCER_BATCH : ReplayEntryResult.NO_PRODUCER_BATCH;
+        return ReplayEntryResult.CONTINUE;
     }
 
     // Visible for testing: how far producer-state replay has advanced.
