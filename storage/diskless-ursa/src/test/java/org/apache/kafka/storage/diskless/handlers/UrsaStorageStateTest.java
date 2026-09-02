@@ -33,6 +33,7 @@ import org.apache.kafka.storage.log.metrics.BrokerTopicStats;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -41,6 +42,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.lakestream.api.Log;
@@ -167,6 +169,33 @@ class UrsaStorageStateTest {
         verify(catalog).close();
         verify(oxiaClient).close();
         assertTrue(state.timer().isShutdown());
+        assertTrue(state.producerStateScheduler().isShutdown());
+    }
+
+    @Test
+    void testFailedOpenCleansProducerStateBeforeFailingTheInitFuture() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("failed-open-topic", 0));
+        CompletableFuture<Log> open = new CompletableFuture<>();
+        StreamCatalog catalog = mock(StreamCatalog.class);
+        when(catalog.openLog(any(), anyInt())).thenReturn(open);
+
+        try (UrsaStorageState state = newState(catalog)) {
+            UrsaPartitionLog partitionLog = state.getOrCreatePartitionLog(tp);
+            AtomicBoolean initAlreadyFailed = new AtomicBoolean(true);
+            ProducerStateManager producerStateManager = mock(ProducerStateManager.class);
+            when(producerStateManager.cleanup(false)).thenAnswer(invocation -> {
+                initAlreadyFailed.set(partitionLog.initializationFailed());
+                return CompletableFuture.completedFuture(null);
+            });
+            partitionLog.installProducerStateManager(DisklessClientZone.NO_ZONE, producerStateManager);
+
+            open.completeExceptionally(new IOException("open failed"));
+
+            verify(producerStateManager, timeout(5000)).cleanup(false);
+            // The failed init future is what releases queued writes, and a draining produce would
+            // recreate a ProducerStateManager if the cleanup had not already run.
+            assertFalse(initAlreadyFailed.get());
+        }
     }
 
     @Test

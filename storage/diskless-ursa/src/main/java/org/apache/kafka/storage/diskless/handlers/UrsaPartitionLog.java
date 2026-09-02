@@ -257,8 +257,10 @@ final class UrsaPartitionLog {
                 // The writer stays open on purpose: this partition log was never leased, so a
                 // request that still reaches it must report the open failure rather than a lost
                 // leadership. Every in-flight write drains through the failed init future below.
-                initialized.completeExceptionally(error);
+                // Cleanup runs first: the failed init future releases queued writes, and a
+                // draining produce must not recreate a ProducerStateManager after the cleanup.
                 cleanupProducerStates(false);
+                initialized.completeExceptionally(error);
                 // An already-failed future invokes this callback inside the map's mapping function,
                 // where removing the same key is a recursive update. In that case
                 // getOrCreatePartitionLog evicts the failed value right after it is published.

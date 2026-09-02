@@ -224,6 +224,11 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         return disklessTimer;
     }
 
+    /** The scheduler behind producer-state snapshots. */
+    ScheduledExecutorService producerStateScheduler() {
+        return producerStateScheduler;
+    }
+
     /**
      * The effective {@code message.timestamp.type} of a partition, resolved on every call so that a
      * topic config update takes effect on the next produce request.

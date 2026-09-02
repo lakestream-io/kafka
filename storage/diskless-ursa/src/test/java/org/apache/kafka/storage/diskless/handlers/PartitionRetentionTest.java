@@ -170,6 +170,26 @@ class PartitionRetentionTest {
     }
 
     @Test
+    void aRunFencedAfterCloseStillReachesTheFenceCallback() throws Exception {
+        Log log = mock(Log.class);
+        AtomicReference<Throwable> fenced = new AtomicReference<>();
+        CompletableFuture<LogOffset> lastOffset = new CompletableFuture<>();
+        when(log.getLastOffset()).thenReturn(lastOffset);
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), fenced::set);
+
+        retention.request(120_000L, -1L);
+        CompletableFuture<Void> closeFuture = retention.close();
+        assertFalse(closeFuture.isDone(), "close must not complete while a run is in flight");
+
+        // A run that loses its race with close() is not warned about, but a fence still has to
+        // reach the callback: it is how the partition log learns it lost ownership.
+        lastOffset.completeExceptionally(new LogFencedException("fenced"));
+
+        closeFuture.get(5, TimeUnit.SECONDS);
+        assertInstanceOf(LogFencedException.class, fenced.get());
+    }
+
+    @Test
     void closeWaitsForTheInFlightTrimAndDropsLaterTrims() throws Exception {
         Log log = mock(Log.class);
         CompletableFuture<Long> trimOffset = new CompletableFuture<>();

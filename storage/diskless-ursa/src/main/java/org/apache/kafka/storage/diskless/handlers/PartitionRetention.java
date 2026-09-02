@@ -123,7 +123,9 @@ final class PartitionRetention {
         Throwable cause = DisklessFutures.unwrap(error);
         if (UrsaPartitionLog.hasCause(cause, LogFencedException.class)) {
             onFenced.accept(cause);
-        } else {
+        } else if (!closed.get()) {
+            // A run that loses its race with close() fails against a retired handle; that is the
+            // expected outcome of closing, not something to warn about.
             log.warn("Failed to apply retention for {}", topicIdPartition, error);
         }
     }
