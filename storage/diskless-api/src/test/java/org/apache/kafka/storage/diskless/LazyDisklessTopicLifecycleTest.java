@@ -26,9 +26,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -57,8 +60,10 @@ class LazyDisklessTopicLifecycleTest {
     }
 
     @Test
-    void closeBeforeLoadCompletesClosesTheLoadedDelegate() throws Exception {
+    void closeBeforeLoadCompletesClosesTheLoadedDelegateAndRejectsThePendingCall() throws Exception {
         DisklessTopicLifecycle real = mock(DisklessTopicLifecycle.class);
+        // Stubbed so the pending call would succeed if the post-load closed check were missing.
+        when(real.listManagedTopics()).thenReturn(CompletableFuture.completedFuture(List.of()));
         CountDownLatch release = new CountDownLatch(1);
         LazyDisklessTopicLifecycle lazy = new LazyDisklessTopicLifecycle(() -> {
             try {
@@ -72,7 +77,28 @@ class LazyDisklessTopicLifecycleTest {
         CompletableFuture<List<DisklessTopicLifecycle.ManagedTopic>> pending = lazy.listManagedTopics();
         lazy.close();
         release.countDown();
-        assertThrows(ExecutionException.class, () -> pending.get(10, TimeUnit.SECONDS));
+        ExecutionException failure = assertThrows(
+                ExecutionException.class,
+                () -> pending.get(10, TimeUnit.SECONDS));
+        assertInstanceOf(IllegalStateException.class, failure.getCause());
         verify(real, timeout(10_000)).close();
+        verify(real, never()).listManagedTopics();
+    }
+
+    @Test
+    void rejectsCallsMadeAfterClose() throws Exception {
+        DisklessTopicLifecycle real = mock(DisklessTopicLifecycle.class);
+        when(real.listManagedTopics()).thenReturn(CompletableFuture.completedFuture(List.of()));
+        LazyDisklessTopicLifecycle lazy = new LazyDisklessTopicLifecycle(() -> real);
+
+        assertEquals(List.of(), lazy.listManagedTopics().get(10, TimeUnit.SECONDS));
+        lazy.close();
+        verify(real).close();
+
+        ExecutionException failure = assertThrows(
+                ExecutionException.class,
+                () -> lazy.listManagedTopics().get(10, TimeUnit.SECONDS));
+        assertInstanceOf(IllegalStateException.class, failure.getCause());
+        verify(real, times(1)).listManagedTopics();
     }
 }

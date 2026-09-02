@@ -89,11 +89,25 @@ final class LazyDisklessTopicLifecycle implements DisklessTopicLifecycle {
                             thread.start();
                         });
                 loading = started;
+                // A load that already failed completes this callback inline, which clears the
+                // memoized future, so this call must keep using the future it started.
+                current = started;
                 started.whenComplete((loaded, error) -> onLoaded(started, loaded, error));
+            } else {
+                current = loading;
             }
-            current = loading;
         }
-        return current.thenCompose(operation);
+        return current.thenCompose(lifecycle -> {
+            synchronized (lock) {
+                // close() may have run while the provider was loading, or between two operations:
+                // the delegate is then already closed and its lease released.
+                if (closed) {
+                    return CompletableFuture.<R>failedFuture(
+                            new IllegalStateException("diskless topic lifecycle is closed"));
+                }
+            }
+            return operation.apply(lifecycle);
+        });
     }
 
     private void onLoaded(
