@@ -27,11 +27,11 @@ import org.apache.kafka.image.TopicsDelta;
 import org.apache.kafka.image.loader.LoaderManifest;
 import org.apache.kafka.image.publisher.MetadataPublisher;
 import org.apache.kafka.storage.diskless.DisklessStorageReplicaManagerSupport;
+import org.apache.kafka.storage.diskless.DisklessTopics;
 
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -111,6 +111,6 @@ public final class DisklessBrokerTopicDeletionReconciler implements MetadataPubl
     }
 
     private boolean isDisklessTopic(MetadataImage image, String topicName) {
-        return org.apache.kafka.storage.diskless.DisklessTopics.isDiskless(topicName, image.configs().configMapForResource(new ConfigResource(ConfigResource.Type.TOPIC, topicName)));
+        return DisklessTopics.isDiskless(topicName, image.configs().configMapForResource(new ConfigResource(ConfigResource.Type.TOPIC, topicName)));
     }
 }
