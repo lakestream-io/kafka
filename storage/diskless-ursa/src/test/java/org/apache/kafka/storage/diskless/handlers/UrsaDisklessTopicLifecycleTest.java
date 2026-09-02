@@ -24,12 +24,15 @@ import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import io.lakestream.api.LifecycleState;
 import io.lakestream.api.Partitioning;
@@ -54,6 +57,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -501,6 +505,78 @@ class UrsaDisklessTopicLifecycleTest {
                 startsWith(ProducerStateSnapshotKeys.topicSnapshotPrefix(tooNew.toString())), anyString());
         verify(oxia, never()).put(
                 eq(ProducerStateSnapshotKeys.deletedTopicMarkerKey(tooNew.toString())), any(), anySet());
+    }
+
+    @Test
+    void testSweepKeepsAtMostEightDeletionsInFlight() throws Exception {
+        List<StreamCatalogEntry> orphans = new ArrayList<>();
+        for (int index = 0; index < 20; index++) {
+            orphans.add(managedEntry("orphan-" + index, Uuid.randomUuid(), 10L));
+        }
+        when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE))
+                .thenReturn(CompletableFuture.completedFuture(orphans));
+        when(oxia.list(anyString(), anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+        when(oxia.put(anyString(), any(), anySet()))
+                .thenAnswer(invocation -> CompletableFuture.completedFuture(
+                        new PutResult(invocation.getArgument(0), null)));
+        when(oxia.deleteRange(anyString(), anyString()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+
+        // Every deletion hangs on its drop until this test releases it, one at a time.
+        List<CompletableFuture<Boolean>> drops = new CopyOnWriteArrayList<>();
+        AtomicInteger inFlight = new AtomicInteger();
+        AtomicInteger peakInFlight = new AtomicInteger();
+        when(catalog.dropStream(any(), eq(true))).thenAnswer(invocation -> {
+            peakInFlight.accumulateAndGet(inFlight.incrementAndGet(), Math::max);
+            CompletableFuture<Boolean> drop = new CompletableFuture<>();
+            drops.add(drop);
+            return drop;
+        });
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            CompletableFuture<Void> sweep = lifecycle.sweepOrphans(Set.of(), 50L);
+
+            assertEquals(8, drops.size(), "a sweep must not start every deletion at once");
+            for (int index = 0; index < orphans.size(); index++) {
+                assertTrue(drops.size() > index, "each completed deletion should start the next one");
+                inFlight.decrementAndGet();
+                drops.get(index).complete(true);
+            }
+            sweep.get(5, TimeUnit.SECONDS);
+        }
+
+        assertEquals(orphans.size(), drops.size(), "every orphan must still be deleted");
+        assertEquals(8, peakInFlight.get(), "at most eight deletions may be in flight at once");
+    }
+
+    @Test
+    void testSweepReportsADeletionFailureAfterFinishingTheRest() throws Exception {
+        Uuid failing = Uuid.randomUuid();
+        when(catalog.listStreamEntries(KafkaStreamIdentity.NAMESPACE))
+                .thenReturn(CompletableFuture.completedFuture(List.of(
+                        managedEntry("a", failing, 10L),
+                        managedEntry("b", Uuid.randomUuid(), 10L))));
+        when(oxia.list(anyString(), anyString(), anySet()))
+                .thenReturn(CompletableFuture.completedFuture(List.of()));
+        when(oxia.put(anyString(), any(), anySet()))
+                .thenAnswer(invocation -> CompletableFuture.completedFuture(
+                        new PutResult(invocation.getArgument(0), null)));
+        when(oxia.deleteRange(anyString(), anyString()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        IOException dropFailure = new IOException("catalog unavailable");
+        when(catalog.dropStream(any(), eq(true)))
+                .thenReturn(CompletableFuture.failedFuture(dropFailure))
+                .thenReturn(CompletableFuture.completedFuture(true));
+
+        try (UrsaDisklessTopicLifecycle lifecycle = lifecycle()) {
+            ExecutionException thrown = assertThrows(
+                    ExecutionException.class, () -> lifecycle.sweepOrphans(Set.of(), 50L).get());
+            assertSame(dropFailure, thrown.getCause());
+        }
+
+        // The failure is reported, but not before every other deletion has had its turn.
+        verify(catalog, times(2)).dropStream(any(), eq(true));
     }
 
     @Test

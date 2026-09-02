@@ -32,7 +32,10 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import io.lakestream.api.Partitioning;
@@ -64,6 +67,8 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
     private static final Logger log = LoggerFactory.getLogger(UrsaDisklessTopicLifecycle.class);
     /** The deleted-topic fence is a marker: only its existence is read. */
     private static final byte[] DELETED_TOPIC_MARKER = new byte[0];
+    /** How many topic deletions one sweep may have in flight at once. */
+    private static final int MAX_CONCURRENT_SWEEP_DELETIONS = 8;
 
     private final StreamCatalog catalog;
     private final AsyncOxiaClient producerStateClient;
@@ -150,25 +155,31 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
         Set<Uuid> catalogIds = managed.stream()
                 .map(ManagedTopic::topicId)
                 .collect(Collectors.toSet());
-        List<CompletableFuture<Void>> work = new ArrayList<>();
+        List<Supplier<CompletableFuture<Void>>> work = new ArrayList<>();
         for (ManagedTopic topic : managed) {
             // State created from a newer image than the caller has seen must survive the sweep.
             if (!liveTopicIds.contains(topic.topicId()) && topic.sourceRevision() <= imageOffset) {
-                log.info("Deleting diskless storage of topic {} ({}), which is missing from the "
-                        + "metadata image at offset {}", topic.topicName(), topic.topicId(), imageOffset);
-                work.add(deleteTopic(topic.topicName(), topic.topicId()));
+                work.add(() -> {
+                    log.info("Deleting diskless storage of topic {} ({}), which is missing from the "
+                            + "metadata image at offset {}", topic.topicName(), topic.topicId(), imageOffset);
+                    return deleteTopic(topic.topicName(), topic.topicId());
+                });
             }
         }
         for (Uuid topicId : snapshotTopicIds) {
             // A broker's recovery claim can recreate a snapshot inside its own fence-read window,
             // so producer state outlives the stream it belonged to until it is swept here.
             if (!liveTopicIds.contains(topicId) && !catalogIds.contains(topicId)) {
-                log.info("Deleting diskless producer state of topic {}, which no longer has a stream",
-                        topicId);
-                work.add(deleteProducerState(topicId));
+                work.add(() -> {
+                    log.info("Deleting diskless producer state of topic {}, which no longer has a stream",
+                            topicId);
+                    return deleteProducerState(topicId);
+                });
             }
         }
-        return CompletableFuture.allOf(work.toArray(new CompletableFuture<?>[0]));
+        // A controller that has been away for a while can come back to thousands of orphans; every
+        // deletion is several catalog and Oxia round trips, so they run a few at a time.
+        return BoundedFanOut.run(work, MAX_CONCURRENT_SWEEP_DELETIONS);
     }
 
     /**
@@ -335,6 +346,99 @@ public final class UrsaDisklessTopicLifecycle implements DisklessTopicLifecycle 
                         .map(ProducerStateSnapshotKeys::topicIdOfSnapshotKey)
                         .flatMap(Optional::stream)
                         .collect(Collectors.toSet()));
+    }
+
+    /**
+     * Runs a list of operations with a fixed number of them in flight: the first {@code limit}
+     * start together, and every completion starts the next one.
+     *
+     * <p>The result completes once the last operation has, carrying the first failure if any of
+     * them failed. Failing early would leave the remaining orphans unstarted, and the sweep is
+     * retried as a whole -- so every operation gets its turn even when one of them has failed.
+     */
+    private static final class BoundedFanOut {
+
+        private final List<Supplier<CompletableFuture<Void>>> work;
+        private final CompletableFuture<Void> done = new CompletableFuture<>();
+        private final AtomicInteger next = new AtomicInteger();
+        private final AtomicInteger remaining;
+        private final AtomicReference<Throwable> firstFailure = new AtomicReference<>();
+
+        private BoundedFanOut(List<Supplier<CompletableFuture<Void>>> work) {
+            this.work = work;
+            this.remaining = new AtomicInteger(work.size());
+        }
+
+        static CompletableFuture<Void> run(List<Supplier<CompletableFuture<Void>>> work, int limit) {
+            if (work.isEmpty()) {
+                return CompletableFuture.completedFuture(null);
+            }
+            BoundedFanOut fanOut = new BoundedFanOut(work);
+            for (int slot = Math.min(limit, work.size()); slot > 0; slot--) {
+                fanOut.startNext();
+            }
+            return fanOut.done;
+        }
+
+        /**
+         * Starts operations until one of them is still running. An operation that is already
+         * complete continues this loop instead of nesting another frame, so a batch that fails
+         * synchronously cannot grow the stack with its own size.
+         */
+        private void startNext() {
+            while (true) {
+                int index = next.getAndIncrement();
+                if (index >= work.size()) {
+                    return;
+                }
+                CompletableFuture<Void> operation;
+                try {
+                    operation = work.get(index).get();
+                    if (operation == null) {
+                        throw new IllegalStateException("a sweep deletion returned a null future");
+                    }
+                } catch (Throwable startError) {
+                    operation = CompletableFuture.failedFuture(startError);
+                }
+                if (!operation.isDone()) {
+                    operation.whenComplete((ignored, error) -> {
+                        if (settle(error)) {
+                            startNext();
+                        }
+                    });
+                    return;
+                }
+                if (!settle(failureOf(operation))) {
+                    return;
+                }
+            }
+        }
+
+        /** Records one completion; false once it was the last one and {@link #done} is settled. */
+        private boolean settle(Throwable error) {
+            if (error != null) {
+                firstFailure.compareAndSet(null, DisklessFutures.unwrap(error));
+            }
+            if (remaining.decrementAndGet() > 0) {
+                return true;
+            }
+            Throwable failure = firstFailure.get();
+            if (failure != null) {
+                done.completeExceptionally(failure);
+            } else {
+                done.complete(null);
+            }
+            return false;
+        }
+
+        private static Throwable failureOf(CompletableFuture<Void> completed) {
+            try {
+                completed.join();
+                return null;
+            } catch (Throwable error) {
+                return error;
+            }
+        }
     }
 
     private static ManagedTopic managedTopic(
