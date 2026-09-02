@@ -269,7 +269,10 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         return brokerTopicStats;
     }
 
-    /** Current partition count of the topic as seen by the broker metadata cache, when known. */
+    /**
+     * Resolves a topic name to its current partition count as seen by the broker metadata cache,
+     * or empty when the cache does not know the topic.
+     */
     public Function<String, OptionalInt> partitionCountSupplier() {
         return partitionCountSupplier;
     }

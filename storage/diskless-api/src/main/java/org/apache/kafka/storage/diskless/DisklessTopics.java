@@ -20,9 +20,21 @@ import org.apache.kafka.common.config.TopicConfig;
 import org.apache.kafka.common.internals.Topic;
 
 import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
 
 public final class DisklessTopics {
     private DisklessTopics() { }
+
+    /**
+     * Adapts a Kafka metadata cache partition count to the {@link OptionalInt} the diskless SPI
+     * takes, so every broker-side supplier converts it the same way.
+     */
+    public static OptionalInt partitionCount(Optional<Integer> numPartitions) {
+        return numPartitions == null || numPartitions.isEmpty()
+                ? OptionalInt.empty()
+                : OptionalInt.of(numPartitions.get());
+    }
 
     public static boolean isDiskless(String topic, Map<String, String> configs) {
         if (topic == null || Topic.isInternal(topic) || configs == null) {

@@ -123,7 +123,7 @@ class DisklessStorageProviderLoaderTest {
 
     @Test
     void testProviderErrorPropagatesAndReleasesClassLoaderLease() throws Exception {
-        writeProviders(FailingProvider.class);
+        writeProviders(ThrowingProvider.class);
         URL[] urls = DisklessStorageProviderLoader.classPathUrls(tempDir.toString());
         ClassLoader parent = DisklessStorageProviderLoader.class.getClassLoader();
         DisklessClassLoaderRegistry.Lease retainedLease = DisklessClassLoaderRegistry.acquire(urls, parent);
@@ -201,7 +201,7 @@ class DisklessStorageProviderLoaderTest {
         }
     }
 
-    public static final class FailingProvider implements DisklessStorageProvider {
+    public static final class ThrowingProvider implements DisklessStorageProvider {
         @Override
         public DisklessStorageEngine createStorageEngine(StorageEngineContext context) {
             throw new ExceptionInInitializerError("boom");

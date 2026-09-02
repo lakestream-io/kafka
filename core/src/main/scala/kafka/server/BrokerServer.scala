@@ -57,14 +57,14 @@ import org.apache.kafka.server.util.timer.{SystemTimer, SystemTimerReaper}
 import org.apache.kafka.server.util.{Deadline, FutureUtils, KafkaScheduler, NetworkPartitionMetadataClient, PartitionMetadataClient}
 import org.apache.kafka.server.{AssignmentsManager, BrokerFeatures, BrokerLifecycleManager, ClientMetricsManager, DefaultApiVersionManager, DelayedActionQueue, FetchManager, FetchSessionCacheShard, KRaftTopicCreator, NodeToControllerChannelManagerImpl, ProcessRole, RaftControllerNodeProvider}
 import org.apache.kafka.server.transaction.AddPartitionsToTxnManager
-import org.apache.kafka.storage.diskless.DisklessStorageReplicaManagerSupport
+import org.apache.kafka.storage.diskless.{DisklessStorageReplicaManagerSupport, DisklessTopics}
 import org.apache.kafka.storage.internals.log.LogDirFailureChannel
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
 import org.apache.kafka.storage.diskless.handlers.UrsaStorageConfig
 
 import java.time.Duration
 import java.util
-import java.util.{Optional, OptionalInt}
+import java.util.Optional
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import java.util.concurrent.{CompletableFuture, ExecutionException, TimeUnit, TimeoutException}
 import scala.collection.Map
@@ -360,10 +360,7 @@ class BrokerServer(
           result
         },
         (topic: String) => metadataCache.getTopicId(topic),
-        (topic: String) => {
-          val numPartitions = metadataCache.numPartitions(topic)
-          if (numPartitions.isPresent) OptionalInt.of(numPartitions.get) else OptionalInt.empty()
-        },
+        (topic: String) => DisklessTopics.partitionCount(metadataCache.numPartitions(topic)),
         // Streams this broker provisions are stamped with the metadata offset it has applied, so
         // the controller's orphan sweep can tell them from state it may delete.
         () => metadataCache.currentImage().offset(),

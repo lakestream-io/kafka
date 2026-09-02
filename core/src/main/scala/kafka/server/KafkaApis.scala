@@ -72,13 +72,13 @@ import org.apache.kafka.server.storage.log.{FetchIsolation, FetchParams, FetchPa
 import org.apache.kafka.server.transaction.AddPartitionsToTxnManager
 import org.apache.kafka.storage.internals.log.{AppendOrigin, RecordValidationStats}
 import org.apache.kafka.storage.log.metrics.BrokerTopicStats
-import org.apache.kafka.storage.diskless.{DisklessBrokerSelector, DisklessTopicMetadataTransformer, MetadataCacheDisklessStorageView}
+import org.apache.kafka.storage.diskless.{DisklessBrokerSelector, DisklessTopicMetadataTransformer, DisklessTopics, MetadataCacheDisklessStorageView}
 
 import java.util
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.{CompletableFuture, ConcurrentHashMap}
 import java.util.stream.Collectors
-import java.util.{Collections, Optional, OptionalInt}
+import java.util.{Collections, Optional}
 import scala.annotation.nowarn
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.{Map, Seq, Set, mutable}
@@ -133,10 +133,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         },
         (listenerName: ListenerName) => metadataCache.getAliveBrokerNodes(listenerName),
         (topic: String) => metadataCache.getTopicId(topic),
-        (topic: String) => {
-          val numPartitions = metadataCache.numPartitions(topic)
-          if (numPartitions.isPresent) OptionalInt.of(numPartitions.get) else OptionalInt.empty()
-        },
+        (topic: String) => DisklessTopics.partitionCount(metadataCache.numPartitions(topic)),
         // This view only reads metadata; nothing it serves provisions storage stamped with the
         // offset. It is still reported when the cache exposes an image, so the two views agree.
         metadataCache match {

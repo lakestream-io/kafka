@@ -21,6 +21,7 @@ import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
+import org.apache.kafka.storage.diskless.DisklessFutures;
 import org.apache.kafka.storage.diskless.LogEntryUtils;
 import org.apache.kafka.storage.diskless.handlers.KafkaRecordsPayload;
 
@@ -435,7 +436,7 @@ public class ProducerStateManager implements Closeable {
         if (error == null) {
             completedWrite.complete(null);
         } else {
-            completedWrite.completeExceptionally(unwrapCompletionException(error));
+            completedWrite.completeExceptionally(DisklessFutures.unwrap(error));
         }
     }
 
@@ -460,7 +461,7 @@ public class ProducerStateManager implements Closeable {
                     .handle((putResult, putError) -> {
                         if (putError != null) {
                             loseSnapshotOwnership(expectedVersionId);
-                            throw new CompletionException(unwrapCompletionException(putError));
+                            throw new CompletionException(DisklessFutures.unwrap(putError));
                         }
                         return requireVersionId(putResult);
                     })
@@ -538,14 +539,6 @@ public class ProducerStateManager implements Closeable {
             periodicSnapshotTask.cancel(false);
             periodicSnapshotTask = null;
         }
-    }
-
-    private static Throwable unwrapCompletionException(Throwable error) {
-        Throwable result = error;
-        while (result instanceof CompletionException && result.getCause() != null) {
-            result = result.getCause();
-        }
-        return result;
     }
 
     public CompletableFuture<Void> cleanup(boolean deleteSnapshot) {
@@ -672,7 +665,7 @@ public class ProducerStateManager implements Closeable {
     ) {
         Throwable failure = recoveryError == null
                 ? replayClosedException()
-                : unwrapCompletionException(recoveryError);
+                : DisklessFutures.unwrap(recoveryError);
         if (recoveryError != null && !managerClosed) {
             log.warn("[{}] Failed to recover producer state", topicIdPartition, failure);
         }
@@ -805,7 +798,7 @@ public class ProducerStateManager implements Closeable {
             Throwable putError
     ) {
         if (putError != null) {
-            Throwable failure = unwrapCompletionException(putError);
+            Throwable failure = DisklessFutures.unwrap(putError);
             if (isDefinitiveClaimConflict(failure)) {
                 if (attemptsRemaining > 1) {
                     return readAndClaimSnapshot(
@@ -1410,7 +1403,7 @@ public class ProducerStateManager implements Closeable {
         return deleteOwnedSnapshotVersion(client, snapshotKey(), ownedVersionId)
             .handle((ignored, error) -> {
                 if (error != null
-                        && !(unwrapCompletionException(error) instanceof UnexpectedVersionIdException)) {
+                        && !(DisklessFutures.unwrap(error) instanceof UnexpectedVersionIdException)) {
                     log.warn("[{}] Failed to delete producer snapshot", topicIdPartition, error);
                 }
                 return null;
