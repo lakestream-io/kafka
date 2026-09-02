@@ -19,7 +19,10 @@ package org.apache.kafka.storage.diskless;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -33,5 +36,11 @@ class DisklessTopicsTest {
         assertTrue(DisklessTopics.isDiskless("orders", Map.of("ursa.storage.enable", "true")));
         assertFalse(DisklessTopics.isDiskless("orders", Map.of("ursa.storage.enable", "false")));
         assertFalse(DisklessTopics.isDiskless("orders", Map.of()));
+    }
+    @Test
+    void partitionCountAdaptsAMissingMetadataCacheAnswer() {
+        assertEquals(OptionalInt.of(3), DisklessTopics.partitionCount(Optional.of(3)));
+        assertEquals(OptionalInt.empty(), DisklessTopics.partitionCount(Optional.empty()));
+        assertEquals(OptionalInt.empty(), DisklessTopics.partitionCount(null));
     }
 }
