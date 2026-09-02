@@ -54,8 +54,8 @@ import io.lakestream.api.LogOffset;
  * whichever read releases first back into the empty cache keeps its cursor while the other is closed.
  *
  * <p>ListOffsets never opens a cursor. A timestamp lookup binary searches entry headers for the
- * first entry that can hold the answer and reads forward from there; MAX_TIMESTAMP is answered from
- * the last entry's header alone.
+ * first entry that can hold the answer and reads forward from there, over a bounded number of
+ * entries; MAX_TIMESTAMP is answered from the last entry's header alone.
  */
 final class PartitionReader implements AutoCloseable {
 
@@ -63,6 +63,8 @@ final class PartitionReader implements AutoCloseable {
 
     private static final long UNKNOWN_TIMESTAMP = -1L;
     private static final long NOT_FOUND_OFFSET = -1L;
+    /** How many entries one timestamp lookup may read past its binary search before answering. */
+    private static final int MAX_TIMESTAMP_SCAN_ENTRIES = 256;
 
     private final TopicIdPartition topicIdPartition;
     private final Log logInstance;
@@ -211,38 +213,90 @@ final class PartitionReader implements AutoCloseable {
     }
 
     /**
-     * Binary searches entry headers for the first entry that can hold a record at or after
-     * {@code target}, then reads entries forward from it until one does.
+     * Binary searches entry headers for the last entry whose header predates {@code target}, then
+     * reads entries forward from it until one holds a record at or after {@code target}.
      *
-     * <p>A header timestamp is the entry's write time and a record timestamp is its create time, so
-     * a record is never newer than the header it was written under. An entry whose header predates
-     * {@code target} therefore holds no answer at all, which is what the binary search skips. Past
-     * that point the records still lag their headers by however far the write path is behind the
-     * clock, so the first record at or after {@code target} can sit any number of entries further
-     * on: stopping early reported no offset for a timestamp the log does hold.
+     * <p>A header timestamp is the entry's write time and a record timestamp is its create time.
+     * The search assumes a record is never newer than the header it was written under, so an entry
+     * whose header predates {@code target} holds no answer at all -- which is what the binary
+     * search skips. It reports the last such entry, so the scan starts one entry before the first
+     * candidate.
+     *
+     * <p>Past that point the records still lag their headers by however far the write path is
+     * behind the clock, so the first record at or after {@code target} can sit any number of
+     * entries further on. The scan is therefore bounded at {@link #MAX_TIMESTAMP_SCAN_ENTRIES}
+     * entries: exhausting it answers with the base offset and write time of the earliest scanned
+     * entry that was written at or after {@code target}, which is at or before the record the
+     * caller asked for and never past it, so a consumer seeking there re-reads a little rather than
+     * skipping records.
      */
     private CompletableFuture<ListOffsetsPartitionResponse> firstAtOrAfter(Range range, long target) {
         return call(() -> logInstance.binarySearchOffset(
                         range.start(), range.lastEntryOffset(), header -> header.timestamp() < target),
                 "Log.binarySearchOffset")
-                .thenCompose(found -> searchEntryAt(
+                .thenCompose(found -> scanForward(new ForwardScan(
                         found == null || found < range.start() ? range.start() : found,
                         target,
-                        range.highWatermark()));
+                        range.highWatermark())));
     }
 
-    private CompletableFuture<ListOffsetsPartitionResponse> searchEntryAt(
-            long entryOffset,
-            long target,
-            long endOffsetExclusive) {
-        if (entryOffset < 0 || entryOffset >= endOffsetExclusive) {
-            return CompletableFuture.completedFuture(notFound());
+    private CompletableFuture<ListOffsetsPartitionResponse> scanForward(ForwardScan scan) {
+        CompletableFuture<ListOffsetsPartitionResponse> answer = new CompletableFuture<>();
+        driveScan(scan, answer);
+        return answer;
+    }
+
+    /**
+     * Drives the forward scan as a loop rather than as a chain of nested completions: a read that
+     * is already complete continues this loop, so a storage layer answering synchronously cannot
+     * grow the stack by a frame per entry, and one that answers later resumes the loop from its own
+     * completion instead of nesting inside it.
+     */
+    private void driveScan(ForwardScan scan, CompletableFuture<ListOffsetsPartitionResponse> answer) {
+        while (scan.hasMoreToRead()) {
+            CompletableFuture<LogEntry> read =
+                    call(() -> logInstance.readEntry(scan.entryOffset()), "Log.readEntry");
+            if (!read.isDone()) {
+                read.whenComplete((entry, error) -> {
+                    if (error != null) {
+                        answer.completeExceptionally(DisklessFutures.unwrap(error));
+                    } else if (accept(scan, entry, answer)) {
+                        driveScan(scan, answer);
+                    }
+                });
+                return;
+            }
+            LogEntry entry;
+            try {
+                entry = read.join();
+            } catch (Throwable readError) {
+                answer.completeExceptionally(DisklessFutures.unwrap(readError));
+                return;
+            }
+            if (!accept(scan, entry, answer)) {
+                return;
+            }
         }
-        return call(() -> logInstance.readEntry(entryOffset), "Log.readEntry")
-                .thenApply(entry -> probe(entry, target))
-                .thenCompose(probe -> probe.match() != null
-                        ? CompletableFuture.completedFuture(probe.match())
-                        : searchEntryAt(probe.nextOffset(), target, endOffsetExclusive));
+        answer.complete(scan.exhaustedAnswer());
+    }
+
+    /** Folds one entry into {@code scan}; false once {@code answer} is settled and the scan is over. */
+    private boolean accept(
+            ForwardScan scan,
+            LogEntry entry,
+            CompletableFuture<ListOffsetsPartitionResponse> answer) {
+        ListOffsetsPartitionResponse match;
+        try {
+            match = scan.accept(probe(entry, scan.target()));
+        } catch (Throwable decodeError) {
+            answer.completeExceptionally(DisklessFutures.unwrap(decodeError));
+            return false;
+        }
+        if (match != null) {
+            answer.complete(match);
+            return false;
+        }
+        return true;
     }
 
     /** Decodes one entry, always closing it, and reports the first record at or after {@code target}. */
@@ -252,12 +306,16 @@ final class PartitionReader implements AutoCloseable {
                     new IllegalStateException("Log.readEntry returned a null entry for " + topicIdPartition));
         }
         ListOffsetsPartitionResponse match = null;
+        long baseOffset = NOT_FOUND_OFFSET;
+        long headerTimestamp = UNKNOWN_TIMESTAMP;
         long nextOffset = NOT_FOUND_OFFSET;
         Throwable failure = null;
         try {
+            baseOffset = entry.offset();
+            headerTimestamp = entry.timestamp();
             MemoryRecords records = KafkaRecordsPayload.readableRecords(
-                    entry.payload(), entry.offset(), entry.numberOfRecords());
-            nextOffset = entry.offset() + entry.numberOfRecords();
+                    entry.payload(), baseOffset, entry.numberOfRecords());
+            nextOffset = baseOffset + entry.numberOfRecords();
             for (Record record : records.records()) {
                 if (record.timestamp() >= target) {
                     match = success(record.offset(), record.timestamp());
@@ -272,7 +330,7 @@ final class PartitionReader implements AutoCloseable {
         if (failure != null) {
             throw new CompletionException(failure);
         }
-        return new EntryProbe(match, nextOffset);
+        return new EntryProbe(match, baseOffset, headerTimestamp, nextOffset);
     }
 
     private CompletableFuture<Range> range() {
@@ -378,7 +436,69 @@ final class PartitionReader implements AutoCloseable {
         }
     }
 
-    /** The outcome of decoding one entry: a matching record, or the offset of the next entry. */
-    private record EntryProbe(ListOffsetsPartitionResponse match, long nextOffset) {
+    /**
+     * The outcome of decoding one entry: a matching record when the entry held one, plus the
+     * entry's own header and the offset of the entry that follows it.
+     */
+    private record EntryProbe(
+            ListOffsetsPartitionResponse match,
+            long baseOffset,
+            long headerTimestamp,
+            long nextOffset) {
+    }
+
+    /**
+     * One timestamp lookup's forward scan: where to read next, how much of its budget is left, and
+     * the answer to fall back on when the budget runs out before the record turns up.
+     */
+    private final class ForwardScan {
+
+        private final long target;
+        private final long endOffsetExclusive;
+        private long entryOffset;
+        private int remaining = MAX_TIMESTAMP_SCAN_ENTRIES;
+        private ListOffsetsPartitionResponse firstEntryAtOrAfterTarget;
+
+        private ForwardScan(long entryOffset, long target, long endOffsetExclusive) {
+            this.entryOffset = entryOffset;
+            this.target = target;
+            this.endOffsetExclusive = endOffsetExclusive;
+        }
+
+        private long target() {
+            return target;
+        }
+
+        private long entryOffset() {
+            return entryOffset;
+        }
+
+        private boolean hasMoreToRead() {
+            return remaining > 0 && entryOffset >= 0 && entryOffset < endOffsetExclusive;
+        }
+
+        /** Folds one decoded entry in, and reports the record this entry held, if any. */
+        private ListOffsetsPartitionResponse accept(EntryProbe probe) {
+            remaining--;
+            entryOffset = probe.nextOffset();
+            if (probe.match() != null) {
+                return probe.match();
+            }
+            if (firstEntryAtOrAfterTarget == null && probe.headerTimestamp() >= target) {
+                firstEntryAtOrAfterTarget = success(probe.baseOffset(), probe.headerTimestamp());
+            }
+            return null;
+        }
+
+        /** The answer once the scan stops without having found the record itself. */
+        private ListOffsetsPartitionResponse exhaustedAnswer() {
+            if (entryOffset < 0 || entryOffset >= endOffsetExclusive) {
+                // Every entry that could hold the answer was read: the log has no such record.
+                return notFound();
+            }
+            // The budget ran out first, so answer with the earliest entry written at or after the
+            // target rather than reporting an offset the log does hold as missing.
+            return firstEntryAtOrAfterTarget != null ? firstEntryAtOrAfterTarget : notFound();
+        }
     }
 }

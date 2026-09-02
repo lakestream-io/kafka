@@ -349,6 +349,50 @@ class PartitionReaderTest {
     }
 
     @Test
+    void timestampSearchStopsAtTheScanBoundAndAnswersWithTheFirstEntryPastTheTarget() throws Exception {
+        // Every entry after the first was written past the target while its records still lag far
+        // behind it, so the exact record sits beyond the bound. The answer is then the earliest
+        // entry written at or after the target: at or before the true offset, never past it.
+        Log log = mock(Log.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(299L, 1, 6_000L)));
+        when(log.binarySearchOffset(eq(0L), eq(299L), any())).thenReturn(completedFuture(0L));
+        for (long offset = 0; offset < 300; offset++) {
+            long headerTimestamp = offset == 0 ? 100L : 5_000L + offset;
+            LogEntry scanned = entry(offset, recordAt(10L), headerTimestamp);
+            when(log.readEntry(offset)).thenReturn(completedFuture(scanned));
+        }
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10)) {
+            ListOffsetsPartitionResponse response = reader.listOffsets(listOffsetsRequest(1_000L)).get();
+            assertEquals(1L, response.offset());
+            assertEquals(5_001L, response.timestamp());
+            verify(log, times(256)).readEntry(anyLong());
+        }
+    }
+
+    @Test
+    void timestampSearchReportsNoOffsetWhenTheBoundIsReachedWithNothingPastTheTarget() throws Exception {
+        // No scanned entry was even written at or after the target, so there is nothing to answer
+        // with: reporting an offset here would name one the caller never asked for.
+        Log log = mock(Log.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(299L, 1, 400L)));
+        when(log.binarySearchOffset(eq(0L), eq(299L), any())).thenReturn(completedFuture(0L));
+        for (long offset = 0; offset < 300; offset++) {
+            LogEntry scanned = entry(offset, recordAt(10L), 100L);
+            when(log.readEntry(offset)).thenReturn(completedFuture(scanned));
+        }
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10)) {
+            ListOffsetsPartitionResponse response = reader.listOffsets(listOffsetsRequest(1_000L)).get();
+            assertEquals(-1L, response.offset());
+            assertEquals(-1L, response.timestamp());
+            verify(log, times(256)).readEntry(anyLong());
+        }
+    }
+
+    @Test
     void highWatermarkIsTheOffsetPastTheLastRecord() throws Exception {
         Log log = mock(Log.class);
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(10L, 5, 1L)));
@@ -386,6 +430,11 @@ class PartitionReaderTest {
 
     /** Mocks a storage entry whose payload is read-only, exactly as the Lakestream implementation returns it. */
     private static LogEntry entry(long offset, MemoryRecords records) {
+        return entry(offset, records, 0L);
+    }
+
+    /** As {@link #entry(long, MemoryRecords)}, with the entry's write time in its header. */
+    private static LogEntry entry(long offset, MemoryRecords records, long headerTimestamp) {
         int numberOfRecords = count(records);
         ByteBuf payload = Unpooled.buffer(records.buffer().remaining());
         payload.writeBytes(records.buffer().duplicate());
@@ -394,6 +443,7 @@ class PartitionReaderTest {
         AtomicBoolean closed = new AtomicBoolean();
         when(entry.offset()).thenReturn(offset);
         when(entry.numberOfRecords()).thenReturn(numberOfRecords);
+        when(entry.timestamp()).thenReturn(headerTimestamp);
         when(entry.size()).thenReturn(payload.readableBytes());
         when(entry.payload()).thenReturn(payload.asReadOnly());
         doAnswer(invocation -> {
