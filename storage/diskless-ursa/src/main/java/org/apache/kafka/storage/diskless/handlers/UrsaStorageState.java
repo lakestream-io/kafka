@@ -20,6 +20,7 @@ import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.config.ServerLogConfigs;
 import org.apache.kafka.storage.diskless.DisklessStorageStateOperations;
@@ -79,8 +80,8 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
     private final StreamCatalog catalog;
     private final Supplier<AsyncOxiaClient> oxiaClientSupplier;
     private final ScheduledExecutorService producerStateScheduler;
-    private final ScheduledExecutorService retentionScheduler;
-    private final ScheduledExecutorService retiredLogCloseScheduler;
+    /** One timer for every periodic and delayed task: retention checks, long polls, retired-log close retries. */
+    private final ScheduledExecutorService disklessTimer;
     private final ScheduledFuture<?> retentionTask;
     private final Map<String, Object> logConfigDefaults;
     private final Function<String, Map<String, String>> topicConfigSupplier;
@@ -133,7 +134,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             thread.setDaemon(true);
             return thread;
         });
-        this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close");
+        this.disklessTimer = newDaemonScheduler("diskless-timer");
 
         LakestreamStorageHolder holder;
         try {
@@ -145,7 +146,6 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.lakestreamStorageHolder = holder;
         this.catalog = holder.catalog();
         this.oxiaClientSupplier = holder::oxiaClient;
-        this.retentionScheduler = newDaemonScheduler("diskless-retention");
         this.retentionTask = startRetentionChecks();
     }
 
@@ -174,8 +174,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.catalog = Objects.requireNonNull(catalog, "catalog must not be null");
         this.oxiaClientSupplier = () -> null;
         this.producerStateScheduler = newDaemonScheduler("producer-state-manager-test");
-        this.retentionScheduler = newDaemonScheduler("diskless-retention-test");
-        this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close-test");
+        this.disklessTimer = newDaemonScheduler("diskless-timer-test");
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
         this.partitionCountSupplier = topic -> OptionalInt.empty();
@@ -199,8 +198,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
         this.catalog = lakestreamStorageHolder.catalog();
         this.oxiaClientSupplier = lakestreamStorageHolder::oxiaClient;
         this.producerStateScheduler = newDaemonScheduler("producer-state-manager-test");
-        this.retentionScheduler = newDaemonScheduler("diskless-retention-test");
-        this.retiredLogCloseScheduler = newDaemonScheduler("diskless-retired-log-close-test");
+        this.disklessTimer = newDaemonScheduler("diskless-timer-test");
         this.logConfigDefaults = logConfigDefaults != null ? logConfigDefaults : Collections.emptyMap();
         this.topicConfigSupplier = topicConfigSupplier;
         this.partitionCountSupplier = topic -> OptionalInt.empty();
@@ -213,6 +211,48 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
 
     public int brokerId() {
         return brokerId;
+    }
+
+    /** The shared timer behind retention checks, long-poll timeouts and retired-log close retries. */
+    ScheduledExecutorService timer() {
+        return disklessTimer;
+    }
+
+    /**
+     * The effective {@code message.timestamp.type} of a partition, resolved on every call so that a
+     * topic config update takes effect on the next produce request.
+     */
+    Supplier<TimestampType> timestampTypeSupplier(TopicIdPartition tp) {
+        return () -> timestampType(tp.topic());
+    }
+
+    private TimestampType timestampType(String topic) {
+        String configured = null;
+        if (topicConfigSupplier != null) {
+            Map<String, String> topicConfig = topicConfigSupplier.apply(topic);
+            if (topicConfig != null) {
+                configured = topicConfig.get(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG);
+            }
+        }
+        if (configured == null || configured.isBlank()) {
+            configured = defaultTimestampType();
+        }
+        try {
+            return TimestampType.forName(configured);
+        } catch (RuntimeException unknownType) {
+            log.warn("Unknown message timestamp type {} for topic {}, using {}",
+                    configured, topic, TimestampType.CREATE_TIME.name, unknownType);
+            return TimestampType.CREATE_TIME;
+        }
+    }
+
+    /** The broker default, which the log config map may carry under either the server or the topic name. */
+    private String defaultTimestampType() {
+        Object serverDefault = logConfigDefaults.get(ServerLogConfigs.LOG_MESSAGE_TIMESTAMP_TYPE_CONFIG);
+        if (serverDefault == null) {
+            serverDefault = logConfigDefaults.get(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG);
+        }
+        return serverDefault == null ? TimestampType.CREATE_TIME.name : String.valueOf(serverDefault);
     }
 
     public UrsaStorageConfig config() {
@@ -350,7 +390,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
                 return;
             }
             try {
-                retiredLogCloseScheduler.schedule(
+                disklessTimer.schedule(
                         () -> retryRetiredPartitionLog(partitionLog, closeAttempt),
                         RETIRED_LOG_CLOSE_RETRY_MS,
                         TimeUnit.MILLISECONDS);
@@ -391,7 +431,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
                 } catch (Throwable error) {
                     throw new java.util.concurrent.CompletionException(error);
                 }
-            }, retiredLogCloseScheduler);
+            }, disklessTimer);
         } catch (RuntimeException scheduleError) {
             return CompletableFuture.failedFuture(scheduleError);
         }
@@ -577,7 +617,7 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
             throw new IllegalArgumentException(
                     ServerLogConfigs.LOG_CLEANUP_INTERVAL_MS_CONFIG + " must be greater than zero");
         }
-        return retentionScheduler.scheduleWithFixedDelay(
+        return disklessTimer.scheduleWithFixedDelay(
                 this::triggerPeriodicRetention,
                 retentionCheckMs,
                 retentionCheckMs,
@@ -675,9 +715,9 @@ public class UrsaStorageState implements DisklessStorageStateOperations {
                 }
             }
 
-            shutdownScheduler(retentionScheduler, deadlineNanos, "retention scheduler");
             shutdownScheduler(producerStateScheduler, deadlineNanos, "producer-state scheduler");
-            shutdownScheduler(retiredLogCloseScheduler, deadlineNanos, "retired-resource scheduler");
+            // Last: the timer also runs the retired-resource closes awaited above.
+            shutdownScheduler(disklessTimer, deadlineNanos, "diskless timer");
             retiredPartitionLogs.clear();
             resourcesClosed = true;
         }

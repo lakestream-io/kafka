@@ -55,7 +55,7 @@ public class UrsaLakestreamReader implements Reader {
         List<CompletableFuture<AbstractMap.SimpleEntry<TopicIdPartition, FetchPartitionData>>> futures =
                 fetchInfos.entrySet().stream()
                         .map(entry -> state.getOrCreatePartitionLog(entry.getKey())
-                                .fetch(entry.getValue())
+                                .fetch(entry.getValue(), params.maxWaitMs)
                                 .thenApply(response -> new AbstractMap.SimpleEntry<>(entry.getKey(), response)))
                         .toList();
 

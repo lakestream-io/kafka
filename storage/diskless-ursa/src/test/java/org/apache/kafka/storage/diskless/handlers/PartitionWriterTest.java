@@ -1,0 +1,248 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.kafka.storage.diskless.handlers;
+
+import org.apache.kafka.common.TopicIdPartition;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.compress.Compression;
+import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
+import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.RecordBatch;
+import org.apache.kafka.common.record.internal.SimpleRecord;
+import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
+import org.apache.kafka.common.utils.MockTime;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.storage.diskless.DisklessClientZone;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import io.lakestream.api.Log;
+import io.lakestream.api.LogEntryHeader;
+import io.netty.buffer.ByteBuf;
+
+import static java.util.concurrent.CompletableFuture.completedFuture;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+class PartitionWriterTest {
+
+    private static final TopicIdPartition TP =
+            new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
+    private static final String NO_ZONE = DisklessClientZone.NO_ZONE;
+
+    private ScheduledExecutorService timer;
+
+    @BeforeEach
+    void setUp() {
+        timer = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "partition-writer-test-timer");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    @AfterEach
+    void tearDown() {
+        timer.shutdownNow();
+    }
+
+    @Test
+    void createTimeTopicReportsNoLogAppendTime() throws Exception {
+        Log log = mock(Log.class);
+        LogEntryHeader header = header(7L, 1, 1000L);
+        when(log.append(eq(1), any())).thenReturn(completedFuture(header));
+        PartitionWriter writer = writer(log, TimestampType.CREATE_TIME);
+
+        PartitionResponse response = writer
+                .write(records(new SimpleRecord(5L, "a".getBytes(StandardCharsets.UTF_8))), NO_ZONE)
+                .get(5, TimeUnit.SECONDS);
+
+        assertEquals(Errors.NONE, response.error);
+        assertEquals(7L, response.baseOffset);
+        assertEquals(RecordBatch.NO_TIMESTAMP, response.logAppendTime);
+    }
+
+    @Test
+    void logAppendTimeTopicRewritesBatchTimestampBeforeAppend() throws Exception {
+        Log log = mock(Log.class);
+        // The payload is released as soon as the append future completes, so decode it inside the answer.
+        AtomicReference<MemoryRecords> stored = new AtomicReference<>();
+        when(log.append(eq(1), any())).thenAnswer(invocation -> {
+            stored.set(copyOf(invocation.getArgument(1)));
+            return completedFuture(header(0L, 1, 1000L));
+        });
+        MockTime time = new MockTime(0L, 5000L, 0L);
+        PartitionWriter writer = writer(log, TimestampType.LOG_APPEND_TIME, time);
+
+        PartitionResponse response = writer
+                .write(records(new SimpleRecord(5L, "a".getBytes(StandardCharsets.UTF_8))), NO_ZONE)
+                .get(5, TimeUnit.SECONDS);
+
+        assertEquals(Errors.NONE, response.error);
+        assertEquals(5000L, response.logAppendTime);
+        RecordBatch appended = stored.get().batches().iterator().next();
+        assertEquals(5000L, appended.maxTimestamp());
+        assertEquals(TimestampType.LOG_APPEND_TIME, appended.timestampType());
+        assertTrue(appended.isValid());
+    }
+
+    @Test
+    void awaitAppendCompletesWhenAnAppendLands() throws Exception {
+        Log log = mock(Log.class);
+        CompletableFuture<LogEntryHeader> pending = new CompletableFuture<>();
+        when(log.append(eq(1), any())).thenReturn(pending);
+        PartitionWriter writer = writer(log, TimestampType.CREATE_TIME);
+
+        CompletableFuture<Void> waiter = writer.awaitAppend(60_000L);
+        CompletableFuture<PartitionResponse> write =
+                writer.write(records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))), NO_ZONE);
+        assertFalse(waiter.isDone());
+
+        pending.complete(header(0L, 1, 1L));
+
+        assertNull(waiter.get(5, TimeUnit.SECONDS));
+        assertEquals(Errors.NONE, write.get(5, TimeUnit.SECONDS).error);
+    }
+
+    @Test
+    void awaitAppendTimesOutQuietly() throws Exception {
+        PartitionWriter writer = writer(mock(Log.class), TimestampType.CREATE_TIME);
+
+        CompletableFuture<Void> waiter = writer.awaitAppend(50L);
+
+        assertNull(waiter.get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void awaitAppendIsNotCompletedByAFailedAppend() throws Exception {
+        Log log = mock(Log.class);
+        CompletableFuture<LogEntryHeader> pending = new CompletableFuture<>();
+        when(log.append(eq(1), any())).thenReturn(pending);
+        PartitionWriter writer = writer(log, TimestampType.CREATE_TIME);
+
+        CompletableFuture<Void> waiter = writer.awaitAppend(60_000L);
+        CompletableFuture<PartitionResponse> write =
+                writer.write(records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))), NO_ZONE);
+        pending.completeExceptionally(new IllegalStateException("append failed"));
+
+        assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS));
+        assertFalse(waiter.isDone(), "A failed append must not wake a long-poll waiter");
+        writer.close();
+        assertNull(waiter.get(5, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void closeCompletesWaitersAndReleasesPendingPayloads() throws Exception {
+        CompletableFuture<Log> logFuture = new CompletableFuture<>();
+        PartitionWriter writer = new PartitionWriter(
+                TP,
+                () -> logFuture,
+                zone -> {
+                    throw new IllegalStateException("no producer state expected for " + zone);
+                },
+                () -> TimestampType.CREATE_TIME,
+                new MockTime(0L, 1000L, 0L),
+                timer);
+
+        CompletableFuture<PartitionResponse> write =
+                writer.write(records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))), NO_ZONE);
+        CompletableFuture<Void> waiter = writer.awaitAppend(60_000L);
+        assertEquals(1, writer.ownedWritePayloadCount());
+        assertFalse(write.isDone());
+
+        writer.close();
+
+        assertNull(waiter.get(5, TimeUnit.SECONDS));
+        assertEquals(0, writer.ownedWritePayloadCount());
+        assertNull(writer.awaitAppend(60_000L).get(5, TimeUnit.SECONDS));
+        PartitionResponse afterClose = writer
+                .write(records(new SimpleRecord("b".getBytes(StandardCharsets.UTF_8))), NO_ZONE)
+                .get(5, TimeUnit.SECONDS);
+        assertEquals(Errors.NOT_LEADER_OR_FOLLOWER, afterClose.error);
+    }
+
+    @Test
+    void invalidRecordsAreRejectedWithoutAppending() throws Exception {
+        Log log = mock(Log.class);
+        PartitionWriter writer = writer(log, TimestampType.CREATE_TIME);
+        MemoryRecords valid = records(new SimpleRecord("a".getBytes(StandardCharsets.UTF_8)));
+        ByteBuffer malformed = ByteBuffer.allocate(valid.buffer().remaining() + 1);
+        malformed.put(valid.buffer()).put((byte) 1).flip();
+
+        PartitionResponse response = writer
+                .write(MemoryRecords.readableRecords(malformed), NO_ZONE)
+                .get(5, TimeUnit.SECONDS);
+
+        assertEquals(Errors.INVALID_RECORD, response.error);
+        assertEquals(0, writer.ownedWritePayloadCount());
+    }
+
+    private PartitionWriter writer(Log log, TimestampType timestampType) {
+        return writer(log, timestampType, new MockTime(0L, 1000L, 0L));
+    }
+
+    private PartitionWriter writer(Log log, TimestampType timestampType, Time time) {
+        return new PartitionWriter(
+                TP,
+                () -> completedFuture(log),
+                zone -> {
+                    throw new IllegalStateException("no producer state expected for " + zone);
+                },
+                () -> timestampType,
+                time,
+                timer);
+    }
+
+    private static MemoryRecords records(SimpleRecord... records) {
+        return MemoryRecords.withRecords(Compression.NONE, records);
+    }
+
+    private static MemoryRecords copyOf(ByteBuf payload) {
+        ByteBuffer copy = ByteBuffer.allocate(payload.readableBytes());
+        payload.getBytes(payload.readerIndex(), copy);
+        copy.flip();
+        return MemoryRecords.readableRecords(copy);
+    }
+
+    private static LogEntryHeader header(long offset, int numberOfRecords, long timestamp) {
+        LogEntryHeader header = mock(LogEntryHeader.class);
+        when(header.offset()).thenReturn(offset);
+        when(header.numberOfRecords()).thenReturn(numberOfRecords);
+        when(header.timestamp()).thenReturn(timestamp);
+        return header;
+    }
+}

@@ -19,6 +19,8 @@ package org.apache.kafka.storage.diskless.handlers;
 import org.apache.kafka.common.TopicIdPartition;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.metrics.KafkaMetricsGroup;
 import org.apache.kafka.server.metrics.KafkaYammerMetrics;
@@ -31,6 +33,7 @@ import org.apache.kafka.test.TestUtils;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
@@ -624,6 +627,32 @@ class UrsaStorageStateTest {
             state.applyTopicConfigAsync(tp.topic(), tp.topicId(), latestConfig).get();
 
             verifyNoInteractions(catalog);
+        }
+    }
+
+    @Test
+    void testTimestampTypeResolvesTopicConfigThenBrokerDefault() throws Exception {
+        TopicIdPartition tp = new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("timestamp-topic", 0));
+        Map<String, String> topicConfig = new HashMap<>();
+        try (UrsaStorageState state = new UrsaStorageState(
+                Time.SYSTEM,
+                1,
+                mock(UrsaStorageConfig.class),
+                mock(BrokerTopicStats.class),
+                mock(StreamCatalog.class),
+                Map.of(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, TimestampType.LOG_APPEND_TIME.name),
+                ignored -> topicConfig)) {
+            assertEquals(TimestampType.LOG_APPEND_TIME, state.timestampTypeSupplier(tp).get());
+
+            topicConfig.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, TimestampType.CREATE_TIME.name);
+            assertEquals(TimestampType.CREATE_TIME, state.timestampTypeSupplier(tp).get());
+
+            topicConfig.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, "NotATimestampType");
+            assertEquals(TimestampType.CREATE_TIME, state.timestampTypeSupplier(tp).get());
+        }
+
+        try (UrsaStorageState withoutConfigs = newState(mock(StreamCatalog.class))) {
+            assertEquals(TimestampType.CREATE_TIME, withoutConfigs.timestampTypeSupplier(tp).get());
         }
     }
 

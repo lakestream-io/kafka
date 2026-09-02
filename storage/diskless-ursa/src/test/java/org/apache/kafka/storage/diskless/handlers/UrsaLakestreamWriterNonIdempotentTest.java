@@ -21,14 +21,18 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.record.internal.SimpleRecord;
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
+import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.test.TestUtils;
 
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -39,6 +43,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -66,6 +71,22 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class UrsaLakestreamWriterNonIdempotentTest {
+
+    private static ScheduledExecutorService timer;
+
+    @BeforeAll
+    static void startTimer() {
+        timer = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "diskless-timer-test");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    @AfterAll
+    static void stopTimer() {
+        timer.shutdownNow();
+    }
 
     @Test
     void testNewPartitionLogCloseOnlyClosesLeasedHandle() throws Exception {
@@ -228,6 +249,7 @@ class UrsaLakestreamWriterNonIdempotentTest {
             PartitionResponse response = writeFuture.get(5, TimeUnit.SECONDS).get(tp);
             assertEquals(Errors.NONE, response.error);
             assertEquals(0L, response.baseOffset);
+            assertEquals(RecordBatch.NO_TIMESTAMP, response.logAppendTime);
             assertEquals(0, appendedBuffer.get().refCnt());
         } finally {
             writer.close();
@@ -484,6 +506,44 @@ class UrsaLakestreamWriterNonIdempotentTest {
         }
     }
 
+    @Test
+    void testLogAppendTimeTopicStampsRecordsAndReportsTheAppendTime() throws Exception {
+        TopicIdPartition tp = testTopicPartition();
+        Log logInstance = mock(Log.class);
+        AtomicReference<MemoryRecords> appendedRecords = new AtomicReference<>();
+        when(logInstance.append(anyInt(), any(ByteBuf.class))).thenAnswer(invocation -> {
+            appendedRecords.set(decodeKafkaRecords(invocation.getArgument(1)));
+            return CompletableFuture.completedFuture(mockLogEntryHeader(0L));
+        });
+
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        UrsaPartitionLog partitionLog = newPartitionLog(
+                state,
+                tp,
+                CompletableFuture.completedFuture(logInstance),
+                new MockTime(0L, 7_000L, 0L),
+                TimestampType.LOG_APPEND_TIME);
+        when(state.getOrCreatePartitionLog(tp)).thenReturn(partitionLog);
+        UrsaLakestreamWriter writer = new UrsaLakestreamWriter(state);
+        MemoryRecords records = MemoryRecords.withRecords(
+                Compression.NONE,
+                new SimpleRecord(5L, "a".getBytes(StandardCharsets.UTF_8)));
+
+        try {
+            PartitionResponse response = writer.write(Map.of(tp, records), DisklessClientZone.NO_ZONE)
+                    .get(5, TimeUnit.SECONDS).get(tp);
+
+            assertEquals(Errors.NONE, response.error);
+            assertEquals(7_000L, response.logAppendTime);
+            RecordBatch batch = appendedRecords.get().batches().iterator().next();
+            assertEquals(7_000L, batch.maxTimestamp());
+            assertEquals(TimestampType.LOG_APPEND_TIME, batch.timestampType());
+            assertTrue(batch.isValid());
+        } finally {
+            writer.close();
+        }
+    }
+
     private static UrsaStorageState newWriterState(TopicIdPartition tp, Log logInstance) {
         UrsaStorageState state = mock(UrsaStorageState.class);
         attachPartitionLog(state, tp, logInstance);
@@ -502,7 +562,6 @@ class UrsaLakestreamWriterNonIdempotentTest {
             UrsaStorageState state,
             TopicIdPartition tp,
             Log logInstance) {
-        when(state.time()).thenReturn(Time.SYSTEM);
         UrsaPartitionLog partitionLog = newPartitionLog(
                 state,
                 tp,
@@ -515,6 +574,18 @@ class UrsaLakestreamWriterNonIdempotentTest {
             UrsaStorageState state,
             TopicIdPartition tp,
             CompletableFuture<Log> logFuture) {
+        return newPartitionLog(state, tp, logFuture, Time.SYSTEM, TimestampType.CREATE_TIME);
+    }
+
+    private static UrsaPartitionLog newPartitionLog(
+            UrsaStorageState state,
+            TopicIdPartition tp,
+            CompletableFuture<Log> logFuture,
+            Time time,
+            TimestampType timestampType) {
+        when(state.time()).thenReturn(time);
+        when(state.timer()).thenReturn(timer);
+        when(state.timestampTypeSupplier(tp)).thenReturn(() -> timestampType);
         return new UrsaPartitionLog(
                 tp,
                 state,

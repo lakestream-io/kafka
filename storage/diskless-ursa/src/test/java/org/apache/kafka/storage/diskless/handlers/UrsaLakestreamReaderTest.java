@@ -21,16 +21,23 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.record.internal.Record;
+import org.apache.kafka.common.record.internal.Records;
 import org.apache.kafka.common.record.internal.SimpleRecord;
 import org.apache.kafka.common.requests.FetchRequest;
+import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
+import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.server.storage.log.FetchIsolation;
 import org.apache.kafka.server.storage.log.FetchParams;
 import org.apache.kafka.server.storage.log.FetchPartitionData;
+import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionRequest;
 import org.apache.kafka.storage.diskless.ListOffsetsPartitionResponse;
 
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -39,12 +46,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.lakestream.api.Log;
 import io.lakestream.api.LogCursor;
 import io.lakestream.api.LogEntry;
+import io.lakestream.api.LogEntryHeader;
 import io.lakestream.api.LogOffset;
 import io.lakestream.api.StreamIdentifier;
 import io.lakestream.api.exception.NoSuchStreamException;
@@ -52,6 +63,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -71,6 +83,22 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class UrsaLakestreamReaderTest {
+
+    private static ScheduledExecutorService timer;
+
+    @BeforeAll
+    static void startTimer() {
+        timer = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "diskless-timer-test");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    @AfterAll
+    static void stopTimer() {
+        timer.shutdownNow();
+    }
 
     @Test
     void testListOffsetsEarliestUsesLogBoundaries() throws Exception {
@@ -133,7 +161,7 @@ class UrsaLakestreamReaderTest {
         FetchRequest.PartitionData partitionData = fetchPartitionData(15L);
 
         FetchPartitionData response = reader.fetch(
-                createFetchParams(), Map.of(tp, partitionData)).get().get(tp);
+                createFetchParams(0L), Map.of(tp, partitionData)).get().get(tp);
 
         assertNotNull(response);
         assertEquals(Errors.NONE, response.error);
@@ -506,10 +534,14 @@ class UrsaLakestreamReaderTest {
     }
 
     private static FetchParams createFetchParams() {
+        return createFetchParams(500L);
+    }
+
+    private static FetchParams createFetchParams(long maxWaitMs) {
         return new FetchParams(
                 -1,
                 -1,
-                500,
+                maxWaitMs,
                 1,
                 1024 * 1024,
                 FetchIsolation.HIGH_WATERMARK,
@@ -567,10 +599,70 @@ class UrsaLakestreamReaderTest {
         return entry;
     }
 
+    @Test
+    void testCaughtUpFetchWaitsForTheNextAppend() throws Exception {
+        TopicIdPartition tp = createTestPartition();
+        UrsaStorageState state = mock(UrsaStorageState.class);
+        Log logInstance = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        AtomicReference<LogOffset> lastOffset = new AtomicReference<>(logOffset(-1L, 0));
+        when(logInstance.getFirstOffset()).thenAnswer(
+                invocation -> CompletableFuture.completedFuture(lastOffset.get()));
+        when(logInstance.getLastOffset()).thenAnswer(
+                invocation -> CompletableFuture.completedFuture(lastOffset.get()));
+        when(logInstance.openEphemeralCursor(anyString(), eq(0L)))
+                .thenReturn(CompletableFuture.completedFuture(cursor));
+        when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(1L))).thenAnswer(
+                invocation -> CompletableFuture.completedFuture(
+                        List.of(createKafkaRecordsEntry(0L, new long[]{1000L}))));
+        when(logInstance.append(anyInt(), any(ByteBuf.class))).thenAnswer(invocation -> {
+            lastOffset.set(logOffset(0L, 1));
+            LogEntryHeader header = mock(LogEntryHeader.class);
+            when(header.offset()).thenReturn(0L);
+            return CompletableFuture.completedFuture(header);
+        });
+        UrsaPartitionLog partitionLog = attachReaderPartitionLog(state, tp, logInstance);
+
+        try {
+            // Every mocked storage future is already complete, so the first read runs inline and the
+            // long-poll waiter is registered by the time fetch() returns.
+            CompletableFuture<FetchPartitionData> fetchFuture =
+                    partitionLog.fetch(fetchPartitionData(0L), 30_000L);
+            assertFalse(fetchFuture.isDone(), "An empty caught-up fetch must wait for an append");
+
+            PartitionResponse write = partitionLog.write(
+                    MemoryRecords.withRecords(
+                            Compression.NONE,
+                            new SimpleRecord("a".getBytes(StandardCharsets.UTF_8))),
+                    DisklessClientZone.NO_ZONE,
+                    "test").get(5, TimeUnit.SECONDS);
+            assertEquals(Errors.NONE, write.error);
+
+            FetchPartitionData response = fetchFuture.get(5, TimeUnit.SECONDS);
+            assertEquals(Errors.NONE, response.error);
+            assertEquals(1L, response.highWatermark);
+            assertEquals(1, countRecords(response.records));
+        } finally {
+            partitionLog.close();
+        }
+    }
+
+    private static int countRecords(Records records) {
+        int count = 0;
+        for (Record record : records.records()) {
+            assertNotNull(record);
+            count++;
+        }
+        return count;
+    }
+
     private static UrsaPartitionLog attachReaderPartitionLog(
             UrsaStorageState state,
             TopicIdPartition tp,
             Log logInstance) {
+        when(state.time()).thenReturn(Time.SYSTEM);
+        when(state.timer()).thenReturn(timer);
+        when(state.timestampTypeSupplier(tp)).thenReturn(() -> TimestampType.CREATE_TIME);
         UrsaPartitionLog partitionLog = new UrsaPartitionLog(
                 tp,
                 state,

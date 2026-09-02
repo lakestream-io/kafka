@@ -22,7 +22,9 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.compress.Compression;
 import org.apache.kafka.common.errors.NotLeaderOrFollowerException;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.record.internal.MemoryRecords;
+import org.apache.kafka.common.record.internal.RecordBatch;
 import org.apache.kafka.common.record.internal.SimpleRecord;
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse;
 import org.apache.kafka.common.utils.Time;
@@ -30,6 +32,8 @@ import org.apache.kafka.storage.diskless.DisklessClientZone;
 import org.apache.kafka.storage.diskless.idempotent.ProducerStateManager;
 import org.apache.kafka.test.TestUtils;
 
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -41,6 +45,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -64,6 +69,22 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class UrsaLakestreamWriterIdempotentTest {
+
+    private static ScheduledExecutorService timer;
+
+    @BeforeAll
+    static void startTimer() {
+        timer = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "diskless-timer-test");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    @AfterAll
+    static void stopTimer() {
+        timer.shutdownNow();
+    }
 
     @Test
     void testProducerSnapshotOwnershipLossInvalidatesPartition() throws Exception {
@@ -370,6 +391,8 @@ class UrsaLakestreamWriterIdempotentTest {
             assertEquals(Errors.NONE, second.error);
             assertEquals(200L, first.baseOffset);
             assertEquals(200L, second.baseOffset);
+            assertEquals(RecordBatch.NO_TIMESTAMP, first.logAppendTime);
+            assertEquals(RecordBatch.NO_TIMESTAMP, second.logAppendTime, "a duplicate reports no create-time");
         } finally {
             producerStateManager.close();
             writer.close();
@@ -470,6 +493,8 @@ class UrsaLakestreamWriterIdempotentTest {
             TopicIdPartition tp,
             Log logInstance) {
         when(state.time()).thenReturn(Time.SYSTEM);
+        when(state.timer()).thenReturn(timer);
+        when(state.timestampTypeSupplier(tp)).thenReturn(() -> TimestampType.CREATE_TIME);
         UrsaPartitionLog partitionLog = new UrsaPartitionLog(
                 tp,
                 state,
