@@ -95,12 +95,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Tests are organized into nested classes by functionality for better isolation
  * and parallel execution capability.
+ *
+ * <p><strong>Ordering is load-bearing.</strong> Every nested class shares one cluster, and the
+ * bulk-deletion case in the storage-lifecycle group churns a thousand partitions, leaving the
+ * brokers releasing write leases long after its own assertions pass. Anything that runs after it
+ * starves waiting for stream creation. A nested class with no {@code @Order} sorts after every
+ * annotated one, and so does an un-annotated method inside an ordered class -- which puts it
+ * squarely behind that churn. New tests therefore carry an {@code @Order} of their own, below the
+ * bulk case's.
  */
 @Timeout(value = 180, unit = TimeUnit.SECONDS)
 @Tag("integration")
-// Every nested class shares one cluster, so the order they run in is part of the contract: the
-// storage-lifecycle group churns a thousand partitions and leaves the brokers releasing write
-// leases long after its own assertions pass, which stalls the next group's stream creation.
 @TestClassOrder(ClassOrderer.OrderAnnotation.class)
 public class UrsaStorageE2ETest extends UrsaStorageE2ETestBase {
     @TempDir

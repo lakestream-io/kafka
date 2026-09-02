@@ -212,6 +212,10 @@ final class UrsaPartitionLog {
                 logFuture.whenComplete((logInstance, openError) -> {
                     if (logInstance != null) {
                         try {
+                            // Assumes the Ursa LeasedLog overrides closeAsync() with a close that
+                            // returns immediately and retries itself. The interface default runs
+                            // the blocking close() on the calling thread, which here is whichever
+                            // thread completed the producer-state and trim drains.
                             logInstance.closeAsync();
                         } catch (Throwable closeError) {
                             log.warn("Failed to request the close of the log for partition {}",
