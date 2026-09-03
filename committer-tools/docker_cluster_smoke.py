@@ -103,6 +103,7 @@ def build_kafka_image(project_dir: str, tarball: str, image_tag: str) -> None:
 # `down` only removes containers for services in the enabled profiles, so the
 # cleanup has to name every profile the compose file defines.
 ALL_PROFILES = [
+    "--profile", "lakehouse",
     "--profile", "demo",
     "--profile", "share-demo",
     "--profile", "lakehouse-demo",

@@ -3,7 +3,7 @@ Diskless Storage Docker Setup
 
 This directory contains the Docker Compose stack for running Kafka with **Diskless/Ursa Storage**. For enabled topics, Ursa is the primary storage layer rather than a tier that sits behind Kafka's local log.
 
-Everything lives in a single `docker-compose.yml`. The default `docker compose up` starts the complete stack; every demo workload sits behind a profile and never starts on its own.
+Everything lives in a single `docker-compose.yml`. The default `docker compose up` starts the core cluster — Oxia, MinIO and three brokers — which needs only the Kafka image. The compaction and Iceberg services sit behind the `lakehouse` profile, and every demo workload behind a profile of its own, so none of them start on their own.
 
 ## Architecture
 
@@ -35,12 +35,17 @@ Everything lives in a single `docker-compose.yml`. The default `docker compose u
                                           └─────────┘
 ```
 
+Core cluster (started by default):
+
 - **Oxia**: Lakestream catalog, WAL indexes, compaction tasks, and producer state
 - **MinIO**: S3-compatible object storage for the Ursa WAL, the managed compacted objects, and the Iceberg warehouse
 - **Kafka brokers**: 3-node KRaft cluster with diskless storage enabled
+
+`lakehouse` profile (opt in):
+
 - **Ursa compactor**: standalone container that publishes compaction tasks, decodes the Kafka `MemoryRecords` in the WAL, and writes both the managed compacted objects and an external Iceberg table
 - **Polaris**: Iceberg REST catalog
-- **DuckDB**: on-demand SQL engine used for queries and for the end-to-end assertion
+- **DuckDB** (`tools` profile): on-demand SQL engine used for queries and for the end-to-end assertion
 
 ```text
 Kafka producer -> Kafka broker -> Ursa WAL (MinIO)
@@ -97,7 +102,7 @@ SKIP_URSA_BUILD=true ./build-images.sh   # reuse the existing compactor package
 ## Quick start
 
 ```bash
-# Start the full stack: Oxia, MinIO, Polaris, compactor, and 3 brokers
+# Start the core cluster: Oxia, MinIO, and 3 brokers
 make up
 
 # Create a diskless topic
@@ -113,10 +118,10 @@ make down
 make destroy
 ```
 
-The default stack includes the compactor, so `lakestream/compactor:latest` must exist locally. To run Kafka on Ursa storage without compaction, start just the core services:
+The core cluster needs only `lakestream/kafka:latest`. To add compaction and the Iceberg catalog, enable the `lakehouse` profile — that pulls in Polaris and the locally built `lakestream/compactor:latest`:
 
 ```bash
-docker compose up -d oxia minio minio-init kafka-1 kafka-2 kafka-3
+docker compose --profile lakehouse up -d
 ```
 
 ## Demos
@@ -125,9 +130,10 @@ Each demo is a Compose profile of one-shot containers. They never run during a p
 
 | Profile | Services | What it does |
 |---------|----------|--------------|
+| `lakehouse` | `polaris`, `polaris-setup`, `compactor` | Adds compaction and the Iceberg REST catalog to the core cluster (long-running, not one-shot) |
 | `demo` | `kafka-ready`, `create-topic`, `producer-1`, `producer-2`, `consumer` | Creates `test-diskless` with 64 partitions and runs two producers plus a consumer perf test |
 | `share-demo` | `kafka-ready`, `create-share-topic`, `configure-share-group`, `share-producer`, `share-consumer`, `describe-share-group` | Share-group consumption on a single-partition diskless topic |
-| `lakehouse-demo` | `kafka-ready`, `lakehouse-create-topic`, `raw-producer`, `kafka-consumer-check`, `wait-for-parquet`, `duckdb-query-check` | Kafka -> Ursa WAL -> compaction -> Iceberg -> DuckDB assertions |
+| `lakehouse-demo` | `kafka-ready`, `lakehouse-create-topic`, `raw-producer`, `kafka-consumer-check`, `wait-for-parquet`, `duckdb-query-check` | Kafka -> Ursa WAL -> compaction -> Iceberg -> DuckDB assertions (combine with `lakehouse`) |
 | `tools` | `duckdb` | On-demand SQL shell against the local Polaris catalog |
 
 ```bash
@@ -138,9 +144,11 @@ make duckdb           # DuckDB shell
 
 # Or drive the profiles directly
 docker compose --profile demo up
-docker compose --profile lakehouse-demo up
-docker compose --profile tools run --rm duckdb
+docker compose --profile lakehouse --profile lakehouse-demo up
+docker compose --profile lakehouse --profile tools run --rm duckdb
 ```
+
+`make lakehouse-demo`, `make duckdb` and `make compaction-logs` enable the `lakehouse` profile for you.
 
 ### Lakehouse end-to-end
 
@@ -203,9 +211,9 @@ make console-consumer
 |---------|-------------|
 | `make help` | List the available targets |
 | `make build-images` | Build the Kafka and Ursa compactor images |
-| `make up` | Start the full stack |
-| `make down` | Stop all services |
-| `make destroy` | Stop all services and remove volumes |
+| `make up` | Start the core cluster |
+| `make down` | Stop all services, every profile included |
+| `make destroy` | Stop all services and remove volumes, every profile included |
 | `make logs` | Follow kafka-1 logs |
 | `make compaction-logs` | Follow compactor logs |
 | `make ps` | Show running services |
@@ -331,13 +339,14 @@ docker compose logs oxia
 docker compose logs minio
 ```
 
-### The compactor container is missing or restarting
+### There is no compactor container
 
-`lakestream/compactor:latest` is built locally:
+It is not part of the default stack. Enable the `lakehouse` profile and make sure the locally built image exists:
 
 ```bash
 URSA_STORAGE_DIR=/path/to/ursa-storage ./build-images.sh
-docker compose logs compactor
+docker compose --profile lakehouse up -d
+make compaction-logs
 ```
 
 ### Connection refused errors

@@ -15,13 +15,16 @@
 
 # The single Compose stack for Kafka with diskless Ursa storage.
 #
-#   docker compose up -d                      # oxia, minio, polaris, compactor, kafka-1..3
+#   docker compose up -d                      # oxia, minio, minio-init, kafka-1..3
 #   docker compose --profile demo up          # + producer/consumer perf workload
 #   docker compose --profile share-demo up    # + share-group workload
-#   docker compose --profile lakehouse-demo up  # + Kafka -> Iceberg -> DuckDB assertions
-#   docker compose --profile tools run --rm duckdb
+#   docker compose --profile lakehouse up -d  # + polaris, polaris-setup, compactor
+#   docker compose --profile lakehouse --profile lakehouse-demo up
+#   docker compose --profile lakehouse --profile tools run --rm duckdb
 #
-# Profile services are one-shot workloads and never start by default.
+# The default stack is the core cluster, which needs only the Kafka image. The
+# `lakehouse` profile adds the compaction/Iceberg services (and the locally
+# built compactor image); every other profile holds one-shot workloads.
 
 ---
 name: kafka-ursa
@@ -73,9 +76,9 @@ x-kafka-service: &kafka-service
       - CMD-SHELL
       - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1
     interval: 5s
-    timeout: 10s
+    timeout: 30s
     retries: 30
-    start_period: 30s
+    start_period: 60s
 
 # One-shot workload containers share the broker image for its CLI tools.
 x-kafka-cli: &kafka-cli
@@ -130,6 +133,7 @@ services:
 
   polaris:
     image: ${POLARIS_IMAGE:-apache/polaris:1.7.0}
+    profiles: ["lakehouse"]
     hostname: polaris
     depends_on:
       minio-init:
@@ -159,6 +163,7 @@ services:
 
   polaris-setup:
     image: ${POLARIS_SETUP_IMAGE:-alpine/curl:8.21.0}
+    profiles: ["lakehouse"]
     depends_on:
       polaris:
         condition: service_healthy
@@ -178,6 +183,7 @@ services:
 
   compactor:
     image: ${COMPACTOR_IMAGE:-lakestream/compactor:latest}
+    profiles: ["lakehouse"]
     hostname: compactor
     restart: unless-stopped
     depends_on:
@@ -530,8 +536,11 @@ services:
     depends_on:
       wait-for-parquet:
         condition: service_completed_successfully
+      # `required: false` keeps the ordering when the lakehouse profile is on
+      # without making this service undefined when it is not.
       polaris-setup:
         condition: service_completed_successfully
+        required: false
     volumes:
       - ./lakehouse/duckdb-init.sql:/opt/ursa-demo/duckdb-init.sql:ro
       - duckdb-extensions:/root/.duckdb
@@ -572,6 +581,7 @@ services:
     depends_on:
       polaris-setup:
         condition: service_completed_successfully
+        required: false
     stdin_open: true
     tty: true
     volumes:

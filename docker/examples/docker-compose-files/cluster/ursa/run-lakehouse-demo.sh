@@ -24,16 +24,19 @@ compactor_image="${COMPACTOR_IMAGE:-lakestream/compactor:latest}"
 num_records="${NUM_RECORDS:-100}"
 passed=false
 
+# The compaction/Iceberg services live in the `lakehouse` profile and the demo
+# workload in `lakehouse-demo`; this verifier needs both.
 compose() {
   docker compose --project-name "$project" -f "$compose_file" \
-    --profile lakehouse-demo "$@"
+    --profile lakehouse --profile lakehouse-demo "$@"
 }
 
 # `ps`/`down` only see services in the enabled profiles, so the project guard and
 # the cleanup have to name every profile.
 compose_all() {
   docker compose --project-name "$project" -f "$compose_file" \
-    --profile demo --profile share-demo --profile lakehouse-demo --profile tools "$@"
+    --profile lakehouse --profile demo --profile share-demo \
+    --profile lakehouse-demo --profile tools "$@"
 }
 
 for image in "$kafka_image" "$compactor_image"; do

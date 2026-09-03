@@ -16,8 +16,11 @@
 DOCKER := docker
 COMPOSE := $(DOCKER) compose
 # `down` only touches services in the enabled profiles, so teardown has to name
-# every profile or one-shot demo containers survive it.
-ALL_PROFILES := --profile demo --profile share-demo --profile lakehouse-demo --profile tools
+# every profile or the lakehouse and one-shot demo containers survive it.
+ALL_PROFILES := --profile lakehouse --profile demo --profile share-demo --profile lakehouse-demo --profile tools
+# The compaction/Iceberg services (polaris, polaris-setup, compactor) are not
+# part of the default stack; they need the locally built compactor image.
+LAKEHOUSE_PROFILE := --profile lakehouse
 
 TOPIC ?= test-diskless
 PARTITIONS ?= 12
@@ -28,7 +31,7 @@ help:
 	@echo ""
 	@echo "  make build-images     - Build the Kafka and Ursa compactor images"
 	@echo "                          (URSA_STORAGE_DIR=/path/to/ursa-storage)"
-	@echo "  make up               - Start the full stack (Oxia, MinIO, Polaris, compactor, brokers)"
+	@echo "  make up               - Start the core cluster (Oxia, MinIO, 3 brokers)"
 	@echo "  make down             - Stop all services"
 	@echo "  make destroy          - Stop all services and remove volumes"
 	@echo "  make logs             - Follow kafka-1 logs"
@@ -40,6 +43,7 @@ help:
 	@echo "  make demo             - Producer/consumer perf demo, torn down on exit"
 	@echo "  make share-demo       - Share-group demo, torn down on exit"
 	@echo "  make lakehouse-demo   - Kafka -> Iceberg -> DuckDB end-to-end assertion"
+	@echo "                          (adds Polaris and the compactor)"
 	@echo "  make duckdb           - Open DuckDB against the local Polaris catalog"
 	@echo "  make compaction-logs  - Follow compactor logs"
 	@echo ""
@@ -56,6 +60,7 @@ up:
 	@$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:19092 --list 2>/dev/null || echo "Cluster still starting..."
 	@echo ""
 	@echo "Cluster started. Use 'make create-topic' to create a diskless topic."
+	@echo "For compaction and Iceberg, add: docker compose --profile lakehouse up -d"
 
 .PHONY: down
 down:
@@ -71,7 +76,7 @@ logs:
 
 .PHONY: compaction-logs
 compaction-logs:
-	$(COMPOSE) logs -f compactor
+	$(COMPOSE) $(LAKEHOUSE_PROFILE) logs -f compactor
 
 .PHONY: ps
 ps:
@@ -152,4 +157,4 @@ lakehouse-demo:
 
 .PHONY: duckdb
 duckdb:
-	$(COMPOSE) --profile tools run --rm duckdb
+	$(COMPOSE) $(LAKEHOUSE_PROFILE) --profile tools run --rm duckdb

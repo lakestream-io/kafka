@@ -163,19 +163,20 @@ The script reports jars missing from `LICENSE-binary` (need to add) and stale en
 
 ## Docker Demo
 
-A single `docker-compose.yml` holds the whole stack; demo workloads sit behind Compose profiles (`demo`, `share-demo`, `lakehouse-demo`, `tools`).
+A single `docker-compose.yml` holds everything. `docker compose up` starts the core cluster; the compaction/Iceberg services sit behind the `lakehouse` profile and the workloads behind `demo`, `share-demo`, `lakehouse-demo` and `tools`.
 
 ```bash
 cd docker/examples/docker-compose-files/cluster/ursa
 ./build-image.sh          # Build lakestream/kafka:latest
 URSA_STORAGE_DIR=/path/to/ursa-storage ./build-images.sh  # + lakestream/compactor:latest
-make up                   # Start the full stack
+make up                   # Core cluster: Oxia + MinIO + 3 brokers
 make create-topic         # Create diskless topic
 make demo                 # Profile `demo`: perf producers + consumer, torn down on exit
-make lakehouse-demo       # Profile `lakehouse-demo`: Kafka -> Iceberg -> DuckDB assertion
+make lakehouse-demo       # Profiles `lakehouse` + `lakehouse-demo`: Kafka -> Iceberg -> DuckDB
+make destroy              # Tear down every profile and remove volumes
 ```
 
-Architecture: 3 Kafka brokers + Oxia (metadata) + MinIO (S3 storage) + Polaris (Iceberg catalog) + the Ursa compactor. Ports (all bound to 127.0.0.1): kafka-1:29092, kafka-2:39092, kafka-3:49092, oxia:6648, minio:19000/19001, polaris:18181/18182.
+Architecture: 3 Kafka brokers + Oxia (metadata) + MinIO (S3 storage), plus Polaris (Iceberg catalog) and the Ursa compactor under the `lakehouse` profile. Only that profile needs the locally built compactor image. Ports (all bound to 127.0.0.1): kafka-1:29092, kafka-2:39092, kafka-3:49092, oxia:6648, minio:19000/19001, polaris:18181/18182.
 
 ## Upstream Compatibility
 
