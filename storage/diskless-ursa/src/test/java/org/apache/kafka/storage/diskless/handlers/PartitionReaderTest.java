@@ -72,8 +72,7 @@ class PartitionReaderTest {
 
     private static final TopicIdPartition TP =
             new TopicIdPartition(Uuid.randomUuid(), new TopicPartition("test-topic", 0));
-    /** Mirrors {@code PartitionReader.OFFSET_RANGE_REFRESH_MS}, which is deliberately not a config. */
-    private static final long OFFSET_RANGE_REFRESH_MS = 100L;
+    private static final long OFFSET_RANGE_REFRESH_MS = PartitionReader.OFFSET_RANGE_REFRESH_MS;
 
     @Test
     void fetchAssemblesEntriesAndReusesCursor() throws Exception {
@@ -572,20 +571,136 @@ class PartitionReaderTest {
     }
 
     @Test
-    void anEmptyFetchAtTheTailDropsTheCachedWindow() throws Exception {
+    void anEmptyFetchAtTheTailKeepsTheCachedWindowUntilItExpires() throws Exception {
         Log log = mock(Log.class);
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));   // hwm = 1
+        MockTime time = new MockTime(0L, 1_000L, 0L);
 
-        try (PartitionReader reader = new PartitionReader(TP, log, 10, new MockTime(0L, 1_000L, 0L))) {
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, time)) {
             FetchPartitionData atTheTail = reader.fetch(fetchRequest(1L)).get();
             assertEquals(Errors.NONE, atTheTail.error);
             assertEquals(0, atTheTail.records.sizeInBytes());
             verify(log, times(1)).getLastOffset();
 
-            // A consumer waiting at the tail is exactly who must see another owner's append, so
-            // its next fetch reads the window again even inside the refresh interval.
+            // A caught-up consumer long-polls for longer than the refresh interval before it reads
+            // again, so nothing is gained by making it read the window twice inside one interval.
             reader.fetch(fetchRequest(1L)).get();
+            verify(log, times(1)).getFirstOffset();
+            verify(log, times(1)).getLastOffset();
+
+            // Its re-read, after the wait, is what picks up another owner's append.
+            time.sleep(OFFSET_RANGE_REFRESH_MS);
+            reader.fetch(fetchRequest(1L)).get();
+            verify(log, times(2)).getFirstOffset();
+            verify(log, times(2)).getLastOffset();
+        }
+    }
+
+    @Test
+    void aReadIssuedBeforeTheFetchCannotReportOutOfRange() throws Exception {
+        Log log = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        CompletableFuture<LogOffset> readBeforeTheAppend = new CompletableFuture<>();
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));
+        when(log.getLastOffset())
+                .thenReturn(readBeforeTheAppend)                            // issued at T0
+                .thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));      // hwm = 6, after the append
+        when(log.openEphemeralCursor(anyString(), eq(5L))).thenReturn(completedFuture(cursor));
+        when(cursor.readOffset()).thenReturn(5L);
+        List<LogEntry> appendedByAnotherOwner = List.of(entry(5L, records("a")));
+        when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(6L)))
+                .thenReturn(completedFuture(appendedByAnotherOwner));
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, new MockTime(0L, 1_000L, 0L))) {
+            // A read of the window is already in flight, from before another owner appended.
+            CompletableFuture<Long> readInFlight = reader.highWatermark();
+            assertFalse(readInFlight.isDone());
+
+            // The consumer learned of offset 5 elsewhere and seeks to it. Joining the read above
+            // would condemn a valid offset with OFFSET_OUT_OF_RANGE and reset the consumer.
+            CompletableFuture<FetchPartitionData> seek = reader.fetch(fetchRequest(5L));
+            readBeforeTheAppend.complete(new LogOffset(0L, 1, 1L));          // hwm = 1: the old log
+
+            FetchPartitionData response = seek.get(5, TimeUnit.SECONDS);
+            assertEquals(Errors.NONE, response.error);
+            assertEquals(6L, response.highWatermark);
+            assertEquals(1, count(response.records));
+            // The older read still answers the caller that asked for it, with what it read.
+            assertEquals(1L, readInFlight.get(5, TimeUnit.SECONDS));
+            verify(log, times(2)).getLastOffset();
+        }
+    }
+
+    @Test
+    void anAppendKeepsTheLastEntryOffsetAndTimestampTogether() throws Exception {
+        Log log = mock(Log.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(4L, 1, 500L)));   // hwm = 5
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, new MockTime(0L, 1_000L, 0L))) {
+            assertEquals(5L, reader.highWatermark().get());
+
+            // An entry written under a clock behind the one that stamped entry 4: ahead on offset,
+            // behind on write time.
+            reader.observeAppend(new LogOffset(9L, 1, 200L));
+
+            // The high watermark still covers the append, so its records are readable...
+            assertEquals(10L, reader.highWatermark().get());
+            // ...but MAX_TIMESTAMP must name one real entry, not offset 9 beside entry 4's time.
+            ListOffsetsPartitionResponse maxTimestamp = reader.listOffsets(
+                    listOffsetsRequest(ListOffsetsPartitionRequest.MAX_TIMESTAMP)).get();
+            assertEquals(4L, maxTimestamp.offset());
+            assertEquals(500L, maxTimestamp.timestamp());
+        }
+    }
+
+    @Test
+    void aTimestampLookupSearchesUpToTheAppendedEntry() throws Exception {
+        // observeAppend runs only after Log.append completed, so storage's index already carries
+        // the appended entry: it is a valid upper bound for the binary search even though the
+        // cached window predates it.
+        Log log = mock(Log.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 100L)));
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(2L, 1, 300L)));   // hwm = 3
+        LogEntry appended = entry(3L, recordAt(400L), 400L);
+        when(log.binarySearchOffset(eq(0L), eq(3L), any())).thenReturn(completedFuture(3L));
+        when(log.readEntry(3L)).thenReturn(completedFuture(appended));
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, new MockTime(0L, 1_000L, 0L))) {
+            assertEquals(3L, reader.highWatermark().get());
+            reader.observeAppend(new LogOffset(3L, 1, 400L));
+
+            ListOffsetsPartitionResponse response = reader.listOffsets(listOffsetsRequest(350L)).get();
+
+            assertEquals(3L, response.offset());
+            assertEquals(400L, response.timestamp());
+            verify(log).binarySearchOffset(eq(0L), eq(3L), any());
+        }
+    }
+
+    @Test
+    void aFailedWindowReadDoesNotPoisonTheCache() throws Exception {
+        Log log = mock(Log.class);
+        LogCursor cursor = mock(LogCursor.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));
+        when(log.getLastOffset())
+                .thenReturn(CompletableFuture.failedFuture(new RuntimeException("index read failed")))
+                .thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));   // hwm = 1
+        when(log.openEphemeralCursor(anyString(), eq(0L))).thenReturn(completedFuture(cursor));
+        when(cursor.readOffset()).thenReturn(0L);
+        List<LogEntry> afterTheFailure = List.of(entry(0L, records("a")));
+        when(cursor.readEntries(anyInt(), anyLong(), isNull(), eq(1L)))
+                .thenReturn(completedFuture(afterTheFailure));
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, new MockTime(0L, 1_000L, 0L))) {
+            assertThrows(ExecutionException.class, () -> reader.fetch(fetchRequest(0L)).get());
+
+            // A read that failed caches nothing and leaves nothing in flight, so the next request
+            // simply reads the window again.
+            FetchPartitionData afterFailure = reader.fetch(fetchRequest(0L)).get();
+            assertEquals(Errors.NONE, afterFailure.error);
+            assertEquals(1, count(afterFailure.records));
             verify(log, times(2)).getFirstOffset();
             verify(log, times(2)).getLastOffset();
         }

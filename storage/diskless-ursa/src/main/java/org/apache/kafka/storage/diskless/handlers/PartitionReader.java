@@ -32,6 +32,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.OptionalLong;
@@ -78,17 +79,21 @@ final class PartitionReader implements AutoCloseable {
      *
      * <p>A Lakestream log has many concurrent writers -- one per zone-aware owner -- so no broker
      * can hold an exact view of where the log ends. This one is deliberately inexact instead: an
-     * offset written by <em>another</em> owner becomes visible here within this interval plus one
-     * fetch wait, because a fetch that reaches the tail drops the cached window (see
-     * {@link #invalidateRange()}) and the long-poll re-read that follows it reads storage again.
-     * Appends made through this partition's own writer are reported by
-     * {@link #observeAppend(LogOffset)} and are visible immediately.
+     * offset written by <em>another</em> owner becomes visible here within this interval or one
+     * fetch wait, whichever is longer. A caught-up consumer long-polls for {@code
+     * fetch.max.wait.ms} before re-reading, which is already longer than this interval, so the
+     * interval alone is what refreshes it. Appends made through this partition's own writer are
+     * reported by {@link #observeAppend(LogOffset)} and are visible immediately.
      *
      * <p>It is a constant rather than a config: 100 ms is short enough to stay under a consumer's
      * poll interval and long enough that a partition being read by many consumers costs storage a
      * bounded number of index reads per second instead of two per fetch.
+     *
+     * <p>Package-private so that the tests can assert against this value rather than repeat it.
      */
-    private static final long OFFSET_RANGE_REFRESH_MS = 100L;
+    static final long OFFSET_RANGE_REFRESH_MS = 100L;
+    /** Passed to {@link #refreshedRange(long)} by a caller that any read in flight may answer. */
+    private static final long ANY_READ = 0L;
 
     private final TopicIdPartition topicIdPartition;
     private final Log logInstance;
@@ -99,7 +104,9 @@ final class PartitionReader implements AutoCloseable {
     /** The last window read from storage, with the time of that read. */
     private final AtomicReference<CachedRange> cachedRange = new AtomicReference<>();
     /** The read every caller shares while it is in flight, so a burst costs one pair of reads. */
-    private final AtomicReference<CompletableFuture<Range>> rangeRefresh = new AtomicReference<>();
+    private final AtomicReference<RangeRead> rangeRefresh = new AtomicReference<>();
+    /** Numbers the reads of the window, so a caller can tell one issued before it from a later one. */
+    private final AtomicLong rangeReads = new AtomicLong();
     /** The newest entry this partition's own writer appended, or null before the first append. */
     private final AtomicReference<LogOffset> lastAppend = new AtomicReference<>();
     /** Counts drops of the cached window, so a read in flight across one does not republish it. */
@@ -110,7 +117,7 @@ final class PartitionReader implements AutoCloseable {
         this.topicIdPartition = topicIdPartition;
         this.logInstance = logInstance;
         this.maxEntriesPerFetch = maxEntriesPerFetch;
-        this.time = time;
+        this.time = Objects.requireNonNull(time, "time must not be null");
         this.cursorName = "kafka-fetch-" + topicIdPartition.topic() + "-" + topicIdPartition.partition();
     }
 
@@ -134,8 +141,8 @@ final class PartitionReader implements AutoCloseable {
 
     /**
      * Drops the cached window, so the next request reads it from storage. Called when the window
-     * this reader holds may no longer describe the log: after a retention trim moved the first
-     * offset, and after a fetch reached the tail.
+     * this reader holds cannot describe the log any more: after a retention trim moved the first
+     * offset, and when this reader closes.
      */
     void invalidateRange() {
         rangeGeneration.incrementAndGet();
@@ -148,14 +155,19 @@ final class PartitionReader implements AutoCloseable {
         log.debug("Fetching from partition {} at offset {} with maxBytes {}",
                 topicIdPartition, fetchOffset, maxBytes);
 
+        // Read before the cache is consulted: any read of the window that starts after this point
+        // is one that must already see whatever was appended before this request arrived.
+        long readsBeforeRequest = rangeReads.get();
         Range cached = cachedWindow();
         if (cached != null && cached.covers(fetchOffset)) {
             return readWithin(fetchOffset, maxBytes, cached);
         }
-        // A cached window that does not cover the fetch offset may simply predate an append by
-        // another owner of this log, so the answer -- and OFFSET_OUT_OF_RANGE above all -- has to
-        // come from a window read from storage now.
-        return refreshedRange().thenCompose(range -> readWithin(fetchOffset, maxBytes, range));
+        // A window that does not cover the fetch offset may simply predate an append by another
+        // owner of this log, and answering OFFSET_OUT_OF_RANGE resets the client's offset. So the
+        // verdict must come from a read issued after this request arrived: sharing a read that was
+        // already running would let a window fetched before that append condemn a valid offset.
+        return refreshedRange(readsBeforeRequest + 1)
+                .thenCompose(range -> readWithin(fetchOffset, maxBytes, range));
     }
 
     private CompletableFuture<FetchPartitionData> readWithin(long fetchOffset, int maxBytes, Range range) {
@@ -166,10 +178,10 @@ final class PartitionReader implements AutoCloseable {
                     fetchData(Errors.OFFSET_OUT_OF_RANGE, range, MemoryRecords.EMPTY));
         }
         if (fetchOffset == range.highWatermark()) {
-            // This consumer is caught up, which makes it exactly the one that must see what the
-            // other owners of this log append next. Its next read -- the long-poll re-read of this
-            // request, or its next poll -- therefore reads the window from storage again.
-            invalidateRange();
+            // Caught up. The window is left cached on purpose: this request now long-polls for
+            // fetch.max.wait.ms, which is longer than the refresh interval, so its re-read finds
+            // the window expired and reads storage anyway. Dropping it here only doubled the index
+            // reads of the very consumers that are idle.
             return CompletableFuture.completedFuture(fetchData(Errors.NONE, range, MemoryRecords.EMPTY));
         }
         return readEntries(fetchOffset, range.highWatermark(), maxBytes)
@@ -303,6 +315,13 @@ final class PartitionReader implements AutoCloseable {
      * entry that was written at or after {@code target}, which is at or before the record the
      * caller asked for and never past it, so a consumer seeking there re-reads a little rather than
      * skipping records.
+     *
+     * <p>The window handed in here may name an entry newer than the last window read from storage,
+     * because {@link #observeAppend(LogOffset)} folds this partition's own appends into it. That is
+     * safe to search over: {@code observeAppend} is called only once {@link Log#append} has
+     * completed, and an append that has completed is one storage's index already carries -- it is
+     * what a fresh {@code getLastOffset} would report. The staleness this class introduces is in
+     * the cached copy of the window, never in what storage knows when it is asked.
      */
     private CompletableFuture<ListOffsetsPartitionResponse> firstAtOrAfter(Range range, long target) {
         return call(() -> logInstance.binarySearchOffset(
@@ -410,13 +429,18 @@ final class PartitionReader implements AutoCloseable {
     /** The cached window while it is still fresh, otherwise one read from storage. */
     private CompletableFuture<Range> range() {
         Range cached = cachedWindow();
-        return cached != null ? CompletableFuture.completedFuture(cached) : refreshedRange();
+        return cached != null ? CompletableFuture.completedFuture(cached) : refreshedRange(ANY_READ);
     }
 
-    /** The cached window, or {@code null} once it is as old as {@link #OFFSET_RANGE_REFRESH_MS}. */
+    /**
+     * The cached window, or {@code null} once it is as old as {@link #OFFSET_RANGE_REFRESH_MS}.
+     *
+     * <p>Timed against the monotonic clock: a wall clock that steps backwards would make a window
+     * look young again and leave its staleness unbounded.
+     */
     private Range cachedWindow() {
         CachedRange current = cachedRange.get();
-        if (current == null || time.milliseconds() - current.readAtMs() >= OFFSET_RANGE_REFRESH_MS) {
+        if (current == null || time.hiResClockMs() - current.readAtMs() >= OFFSET_RANGE_REFRESH_MS) {
             return null;
         }
         return widened(current.range());
@@ -426,43 +450,58 @@ final class PartitionReader implements AutoCloseable {
      * Reads the window from storage, sharing one read with every caller that asks while it is in
      * flight: a partition read by many consumers at once costs storage one pair of index reads
      * rather than one pair per request.
+     *
+     * @param minReadSequence the earliest read that may answer this caller, as a value of
+     *                        {@link #rangeReads}. {@link #ANY_READ} takes whatever is in flight;
+     *                        a caller that must not be answered by a read issued before it asks
+     *                        passes the count it saw plus one.
      */
-    private CompletableFuture<Range> refreshedRange() {
+    private CompletableFuture<Range> refreshedRange(long minReadSequence) {
         while (true) {
-            CompletableFuture<Range> inFlight = rangeRefresh.get();
-            if (inFlight != null) {
-                return inFlight.thenApply(this::widened);
+            RangeRead inFlight = rangeRefresh.get();
+            if (inFlight == null) {
+                RangeRead read = new RangeRead(rangeReads.incrementAndGet(), new CompletableFuture<>());
+                if (rangeRefresh.compareAndSet(null, read)) {
+                    startRefresh(read);
+                    return read.result().thenApply(this::widened);
+                }
+                continue;
             }
-            CompletableFuture<Range> refresh = new CompletableFuture<>();
-            if (rangeRefresh.compareAndSet(null, refresh)) {
-                startRefresh(refresh);
-                return refresh.thenApply(this::widened);
+            if (inFlight.sequence() >= minReadSequence) {
+                return inFlight.result().thenApply(this::widened);
             }
+            // This read was issued before the caller needed one, so what it reports may predate
+            // what the caller is asking about. One read runs at a time, so wait for it -- its
+            // failure is its own caller's to report -- and then read again.
+            return inFlight.result()
+                    .handle((ignored, error) -> null)
+                    .thenCompose(ignored -> refreshedRange(minReadSequence));
         }
     }
 
-    private void startRefresh(CompletableFuture<Range> refresh) {
+    private void startRefresh(RangeRead read) {
         long generation = rangeGeneration.get();
-        CompletableFuture<Range> read = call(logInstance::getFirstOffset, "Log.getFirstOffset")
+        CompletableFuture<Range> window = call(logInstance::getFirstOffset, "Log.getFirstOffset")
                 .thenCombine(call(logInstance::getLastOffset, "Log.getLastOffset"), Range::of);
-        read.whenComplete((range, error) -> {
+        window.whenComplete((range, error) -> {
             if (error == null) {
                 publish(range, generation);
             }
             // Cleared before the waiters run: a caller that asks for the window from inside one of
             // them must be able to start the next read instead of being handed this finished one.
-            rangeRefresh.compareAndSet(refresh, null);
+            // A failed read caches nothing, so the next request simply reads again.
+            rangeRefresh.compareAndSet(read, null);
             if (error != null) {
-                refresh.completeExceptionally(DisklessFutures.unwrap(error));
+                read.result().completeExceptionally(DisklessFutures.unwrap(error));
             } else {
-                refresh.complete(range);
+                read.result().complete(range);
             }
         });
     }
 
     /** Caches one window read, unless it was invalidated or this reader closed while it was read. */
     private void publish(Range range, long generation) {
-        CachedRange published = new CachedRange(range, time.milliseconds());
+        CachedRange published = new CachedRange(range, time.hiResClockMs());
         cachedRange.set(published);
         if (closed.get() || rangeGeneration.get() != generation) {
             cachedRange.compareAndSet(published, null);
@@ -581,24 +620,35 @@ final class PartitionReader implements AutoCloseable {
          * This window widened to hold one append, never narrowed by it: the append is durable, so
          * its records are readable even when this window was read from storage before it landed.
          * A trim is what moves {@code start}, so an append leaves it alone.
+         *
+         * <p>The high watermark moves on its own, but the last entry's offset and timestamp move
+         * only together, as the pair they were read as. MAX_TIMESTAMP answers with that pair, and
+         * a pair assembled from two entries -- one entry's offset beside another's timestamp --
+         * would name an entry that never existed. The newer entry is the one with the newer write
+         * time, since entries are appended in write-timestamp order; equal times fall back to the
+         * later offset, so a storage clock too coarse to separate two appends still advances.
          */
         Range including(LogOffset appended) {
             long appendedHighWatermark = highWatermarkOf(appended);
-            if (appendedHighWatermark <= highWatermark
-                    && appended.offset() <= lastEntryOffset
-                    && appended.timestamp() <= lastEntryTimestamp) {
+            boolean appendedIsNewer = appended.timestamp() > lastEntryTimestamp
+                    || (appended.timestamp() == lastEntryTimestamp && appended.offset() > lastEntryOffset);
+            if (appendedHighWatermark <= highWatermark && !appendedIsNewer) {
                 return this;
             }
             return new Range(
                     start,
                     Math.max(highWatermark, appendedHighWatermark),
-                    Math.max(lastEntryOffset, appended.offset()),
-                    Math.max(lastEntryTimestamp, appended.timestamp()));
+                    appendedIsNewer ? appended.offset() : lastEntryOffset,
+                    appendedIsNewer ? appended.timestamp() : lastEntryTimestamp);
         }
     }
 
-    /** One window read from storage, with the clock reading of that read. */
+    /** One window read from storage, with the monotonic clock reading of that read. */
     private record CachedRange(Range range, long readAtMs) {
+    }
+
+    /** One read of the window in flight, numbered by when it was issued. */
+    private record RangeRead(long sequence, CompletableFuture<Range> result) {
     }
 
     /**

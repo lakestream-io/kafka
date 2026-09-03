@@ -100,7 +100,7 @@ Controller → DisklessTopicLifecycleReconciler → DisklessTopicLifecycle → S
 
 **Ursa implementation** (`storage/diskless-ursa/src/main/java/org/apache/kafka/storage/diskless/`):
 - `handlers/UrsaStorageEngineImpl.java` — Diskless storage engine implementation backed by Ursa
-- `handlers/PartitionReader.java` — Read path for fetch and list offsets, with a cached cursor and an offset window cached for 100 ms (`OFFSET_RANGE_REFRESH_MS`); local appends widen it at once, a tail fetch or a retention trim drops it
+- `handlers/PartitionReader.java` — Read path for fetch and list offsets, with a cached cursor and an offset window cached for 100 ms (`OFFSET_RANGE_REFRESH_MS`); local appends widen it at once, a retention trim or close drops it, and `OFFSET_OUT_OF_RANGE` is only ever answered from a window read after the request arrived
 - `handlers/PartitionWriter.java` — Write path: validation, append, producer state, append notifications
 - `handlers/PartitionRetention.java` — Coalesced retention worker
 - `handlers/LakestreamStorageHolder.java` — Catalog and Oxia client ownership; opens partitions with create-if-absent

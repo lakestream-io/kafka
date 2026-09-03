@@ -322,7 +322,8 @@ ReplicaManager.fetchMessages()
        │         │         ├──▶ UrsaStorageState.getOrCreatePartitionLog()
        │         │         │
        │         │         ├──▶ PartitionReader offset window
-       │         │         │      (cached ≤ 100 ms; else Log.getFirstOffset + getLastOffset)
+       │         │         │      (cached ≤ 100 ms; else Log.getFirstOffset + getLastOffset,
+       │         │         │       always re-read before OFFSET_OUT_OF_RANGE)
        │         │         │
        │         │         ├──▶ LogCursor.readEntries()
        │         │         │
@@ -354,14 +355,17 @@ view rather than an exact one:
 - **This broker's own appends are visible immediately.** `PartitionWriter` reports every entry that
   lands to `PartitionReader.observeAppend()` before it wakes any long-polling fetch, which widens
   the cached window with no read at all. The window only ever moves forward.
-- **Another owner's appends are visible within 100 ms plus one fetch wait.** A fetch that reaches
-  the high watermark drops the cached window, so the long-poll re-read that follows it -- and the
-  consumer's next poll -- reads the window from storage again. A caught-up consumer therefore costs
-  a bounded number of index reads per poll, while a consumer reading history stays on the cache.
-- **`OFFSET_OUT_OF_RANGE` is never answered from a cached window.** A fetch offset the cached window
-  does not cover forces a read from storage first, and only that fresh window may report the error.
+- **Another owner's appends are visible within the refresh interval or one fetch wait, whichever is
+  longer.** A caught-up consumer long-polls for `fetch.max.wait.ms` before it re-reads, which is
+  already longer than 100 ms, so the interval alone is what refreshes the window it reads through.
+- **`OFFSET_OUT_OF_RANGE` is never answered from a window read before the request arrived.** A fetch
+  offset the cached window does not cover forces a read from storage, and that read must have been
+  *issued after the fetch arrived* -- joining one that was already running could let a window
+  fetched before another owner's append condemn an offset that does exist and reset the consumer.
 - **A retention trim drops the window**, because the trim is what moves the first offset; closing
   the partition drops it too.
+- **The window is timed against the monotonic clock**, so a wall-clock step backwards cannot make a
+  stale window look young and leave its staleness unbounded.
 
 #### ListOffsets Path
 
@@ -471,7 +475,7 @@ No changes to the Kafka protocol. Existing `ProduceRequest`, `FetchRequest`, and
 - Transactional produce requests are rejected with `INVALID_REQUEST` for diskless topics
 - Long-polling fetch waits inside the diskless read path rather than in the fetch purgatory: a request wakes on the first append to any of its caught-up partitions, or on `maxWaitMs`. `minBytes` is honoured only through that wait -- a fetch never waits when any of its partitions already has data.
 - `ListOffsets` by timestamp can answer with an offset at or before the exact match on a topic whose record timestamps lag their entries' write times by more than 256 entries (see **Limitations**)
-- The high watermark a fetch or `ListOffsets(-1)` reports can lag another owner's append by up to 100 ms (see **Limitations**); this broker's own appends never lag
+- The high watermark a fetch or `ListOffsets(-1)` reports can lag another owner's append by up to the refresh interval or one fetch wait, whichever is longer (see **Limitations**); this broker's own appends never lag, and `OFFSET_OUT_OF_RANGE` is never reported from a stale window
 
 #### Binary Protocol
 
@@ -684,7 +688,7 @@ For diskless topics:
 3. **RF=1 Only**: Multi-replica diskless topics not supported
 4. **No Internal Topics**: System topics use traditional storage
 5. **MAX_TIMESTAMP is approximate**: `ListOffsets(-3)` answers with the last entry's base offset and its write timestamp instead of scanning records for the true maximum create time. Entries are written in write-timestamp order, so this is exact whenever record timestamps follow write order; where they do not, the answer names the last entry rather than the record with the highest timestamp. The exact answer would cost one index lookup per record.
-6. **The reported high watermark is bounded-stale across owners**: the offset window behind fetch, `ListOffsets(-2/-1/-3)` and the high watermark is read from storage at most once every 100 ms per partition. Records appended by this broker are folded into it immediately, so a producer and consumer on the same broker see no delay; records appended by *another* owner of the same log become visible within 100 ms plus one fetch wait, because a fetch that reaches the high watermark drops the window. `OFFSET_OUT_OF_RANGE` is exempt: it is only ever answered from a window read at that moment.
+6. **The reported high watermark is bounded-stale across owners**: the offset window behind fetch, `ListOffsets(-2/-1/-3)` and the high watermark is read from storage at most once every 100 ms per partition. Records appended by this broker are folded into it immediately, so a producer and consumer on the same broker see no delay; records appended by *another* owner of the same log become visible within the refresh interval or one fetch wait, whichever is longer -- a caught-up consumer long-polls for `fetch.max.wait.ms`, which is longer than the interval, so the interval is what governs. `OFFSET_OUT_OF_RANGE` is exempt: it is only ever answered from a window whose read was issued after the fetch arrived.
 7. **Timestamp lookups scan a bounded window**: `ListOffsets(t)` reads at most 256 entries past its binary search. Beyond that it answers with the first entry written at or after `t`, which is at or before the true offset and never past it. If none of the scanned entries was written at or after `t`, the lookup reports no offset at all, even though a later entry past the window may hold one. That exhaustion answer's timestamp is always the entry's write time, not a record's create time.
 
 ### Future Enhancements
