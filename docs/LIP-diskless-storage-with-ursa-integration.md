@@ -724,30 +724,25 @@ The Ursa storage runtime reads the V2 `KAFKA_BATCHED_RAW_PARQUET` format behind 
 
 **Docker Demo**:
 
-The repository includes Docker Compose files for running a compaction demo:
+The repository includes a single Docker Compose stack whose `lakehouse-demo`
+profile exercises compaction end to end:
 
 ```bash
 # Start the cluster with compaction support
 cd docker/examples/docker-compose-files/cluster/ursa
-docker compose -f docker-compose-localstack-compaction.yml up -d
+docker compose up -d
 
-# Run the demo (creates a topic, produces raw Kafka records, waits for Parquet compaction)
-docker compose -f docker-compose-localstack-compaction.yml \
-  -f docker-compose-localstack-compaction.demo.yml \
-  run --rm raw-consumer
+# Run the demo (creates a topic, produces raw Kafka records, waits for Parquet
+# compaction, then asserts the Kafka and Iceberg row counts)
+./run-lakehouse-demo.sh
 
 # Cleanup
-docker compose -f docker-compose-localstack-compaction.yml down -v --remove-orphans
-```
-
-Or use the helper script:
-```bash
-bash ./run-localstack-compaction-demo.sh
+docker compose down -v --remove-orphans
 ```
 
 **Requirements**:
 - Standalone Ursa compactor Maven package (built from the `ursa-storage` repository)
-- LocalStack or real S3 for storage backend
+- MinIO or real S3 for storage backend
 
 ### Lakestream identity compatibility
 

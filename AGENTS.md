@@ -163,15 +163,19 @@ The script reports jars missing from `LICENSE-binary` (need to add) and stale en
 
 ## Docker Demo
 
+A single `docker-compose.yml` holds the whole stack; demo workloads sit behind Compose profiles (`demo`, `share-demo`, `lakehouse-demo`, `tools`).
+
 ```bash
 cd docker/examples/docker-compose-files/cluster/ursa
-./build-image.sh          # Build kafka-diskless:latest
-make demo                 # Full demo: 3-broker cluster + Oxia + MinIO + perf test
-make up                   # Start cluster only
+./build-image.sh          # Build lakestream/kafka:latest
+URSA_STORAGE_DIR=/path/to/ursa-storage ./build-images.sh  # + lakestream/compactor:latest
+make up                   # Start the full stack
 make create-topic         # Create diskless topic
+make demo                 # Profile `demo`: perf producers + consumer, torn down on exit
+make lakehouse-demo       # Profile `lakehouse-demo`: Kafka -> Iceberg -> DuckDB assertion
 ```
 
-Architecture: 3 Kafka brokers + Oxia (metadata) + MinIO (S3 storage). Ports: kafka-1:29092, kafka-2:39092, kafka-3:49092, oxia:6648, minio:19000/19001.
+Architecture: 3 Kafka brokers + Oxia (metadata) + MinIO (S3 storage) + Polaris (Iceberg catalog) + the Ursa compactor. Ports (all bound to 127.0.0.1): kafka-1:29092, kafka-2:39092, kafka-3:49092, oxia:6648, minio:19000/19001, polaris:18181/18182.
 
 ## Upstream Compatibility
 
