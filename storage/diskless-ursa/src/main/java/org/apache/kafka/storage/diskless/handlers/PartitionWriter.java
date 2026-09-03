@@ -411,6 +411,10 @@ final class PartitionWriter {
                 // from this append rather than from an offset window read before it landed. The
                 // record count comes from this request rather than from the header, because it is
                 // exactly what was handed to storage.
+                //
+                // This runs before the ack and the wake-up because both must already see the new
+                // tail, which is why it sits inside a try whose catch unwinds producer state for
+                // an append that is already durable: onAppended must not throw.
                 onAppended.accept(new LogOffset(
                         entryHeader.offset(),
                         preparedWrite.analysisResult().recordCount(),

@@ -101,7 +101,7 @@ final class PartitionReader implements AutoCloseable {
     private final Time time;
     private final String cursorName;
     private final AtomicReference<LogCursor> cachedCursor = new AtomicReference<>();
-    /** The last window read from storage, with the time of that read. */
+    /** The last window read from storage, with the time and the generation of that read. */
     private final AtomicReference<CachedRange> cachedRange = new AtomicReference<>();
     /** The read every caller shares while it is in flight, so a burst costs one pair of reads. */
     private final AtomicReference<RangeRead> rangeRefresh = new AtomicReference<>();
@@ -109,7 +109,7 @@ final class PartitionReader implements AutoCloseable {
     private final AtomicLong rangeReads = new AtomicLong();
     /** The newest entry this partition's own writer appended, or null before the first append. */
     private final AtomicReference<LogOffset> lastAppend = new AtomicReference<>();
-    /** Counts drops of the cached window, so a read in flight across one does not republish it. */
+    /** Counts drops of the cached window; a window read under an older generation is never served. */
     private final AtomicLong rangeGeneration = new AtomicLong();
     private final AtomicBoolean closed = new AtomicBoolean();
 
@@ -433,14 +433,19 @@ final class PartitionReader implements AutoCloseable {
     }
 
     /**
-     * The cached window, or {@code null} once it is as old as {@link #OFFSET_RANGE_REFRESH_MS}.
+     * The cached window, or {@code null} once it is as old as {@link #OFFSET_RANGE_REFRESH_MS} or
+     * was read under a generation that has since been dropped. This is the one place the cache is
+     * consulted, so a window read across a drop is refused here rather than being installed and
+     * then taken back -- which would leave a moment in which another request could still see it.
      *
      * <p>Timed against the monotonic clock: a wall clock that steps backwards would make a window
      * look young again and leave its staleness unbounded.
      */
     private Range cachedWindow() {
         CachedRange current = cachedRange.get();
-        if (current == null || time.hiResClockMs() - current.readAtMs() >= OFFSET_RANGE_REFRESH_MS) {
+        if (current == null
+                || current.generation() != rangeGeneration.get()
+                || time.hiResClockMs() - current.readAtMs() >= OFFSET_RANGE_REFRESH_MS) {
             return null;
         }
         return widened(current.range());
@@ -499,16 +504,31 @@ final class PartitionReader implements AutoCloseable {
         });
     }
 
-    /** Caches one window read, unless it was invalidated or this reader closed while it was read. */
+    /**
+     * Caches one window read under the generation it was issued in. A drop that lands while the
+     * read is in flight leaves that generation behind, and {@link #cachedWindow()} refuses the
+     * entry -- so an invalidated window is never observable, not even briefly. The check here only
+     * saves the work of caching an entry that is already doomed; the refusal is what makes it safe.
+     */
     private void publish(Range range, long generation) {
-        CachedRange published = new CachedRange(range, time.hiResClockMs());
-        cachedRange.set(published);
         if (closed.get() || rangeGeneration.get() != generation) {
-            cachedRange.compareAndSet(published, null);
+            return;
         }
+        cachedRange.set(new CachedRange(range, time.hiResClockMs(), generation));
     }
 
-    /** One window as storage reported it, widened by any append this partition made since. */
+    /**
+     * One window as storage reported it, widened by any append this partition made since.
+     *
+     * <p>{@link #lastAppend} is never cleared, so an append that storage has long since reported
+     * itself is still offered to every later window. That is harmless because {@link
+     * Range#including(LogOffset)} widens only on a strict improvement -- a window already past the
+     * append is returned untouched -- and it stays harmless only while storage holds up its end:
+     * a non-empty log's last offset never moves backwards. Retention moves a log's <em>first</em>
+     * offset, never its last, and an append that completed is one the index carries. Were storage
+     * to regress a last offset instead, this retired append would hold the window past the end of
+     * the log.
+     */
     private Range widened(Range range) {
         LogOffset appended = lastAppend.get();
         return appended == null ? range : range.including(appended);
@@ -643,8 +663,11 @@ final class PartitionReader implements AutoCloseable {
         }
     }
 
-    /** One window read from storage, with the monotonic clock reading of that read. */
-    private record CachedRange(Range range, long readAtMs) {
+    /**
+     * One window read from storage, with the monotonic clock reading of that read and the
+     * generation it was read under. Both are what {@link #cachedWindow()} checks before serving it.
+     */
+    private record CachedRange(Range range, long readAtMs, long generation) {
     }
 
     /** One read of the window in flight, numbered by when it was issued. */

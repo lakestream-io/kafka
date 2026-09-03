@@ -362,8 +362,10 @@ view rather than an exact one:
   offset the cached window does not cover forces a read from storage, and that read must have been
   *issued after the fetch arrived* -- joining one that was already running could let a window
   fetched before another owner's append condemn an offset that does exist and reset the consumer.
-- **A retention trim drops the window**, because the trim is what moves the first offset; closing
-  the partition drops it too.
+- **This broker's own retention trim drops the window**, because the trim is what moves the first
+  offset; closing the partition drops it too. A trim run by *another* owner of the log is not
+  signalled here, so it lands in the cached window only when the window is next read -- bounded by
+  the refresh interval, exactly like that owner's appends.
 - **The window is timed against the monotonic clock**, so a wall-clock step backwards cannot make a
   stale window look young and leave its staleness unbounded.
 
@@ -688,7 +690,7 @@ For diskless topics:
 3. **RF=1 Only**: Multi-replica diskless topics not supported
 4. **No Internal Topics**: System topics use traditional storage
 5. **MAX_TIMESTAMP is approximate**: `ListOffsets(-3)` answers with the last entry's base offset and its write timestamp instead of scanning records for the true maximum create time. Entries are written in write-timestamp order, so this is exact whenever record timestamps follow write order; where they do not, the answer names the last entry rather than the record with the highest timestamp. The exact answer would cost one index lookup per record.
-6. **The reported high watermark is bounded-stale across owners**: the offset window behind fetch, `ListOffsets(-2/-1/-3)` and the high watermark is read from storage at most once every 100 ms per partition. Records appended by this broker are folded into it immediately, so a producer and consumer on the same broker see no delay; records appended by *another* owner of the same log become visible within the refresh interval or one fetch wait, whichever is longer -- a caught-up consumer long-polls for `fetch.max.wait.ms`, which is longer than the interval, so the interval is what governs. `OFFSET_OUT_OF_RANGE` is exempt: it is only ever answered from a window whose read was issued after the fetch arrived.
+6. **The reported high watermark is bounded-stale across owners**: the offset window behind fetch, `ListOffsets(-2/-1/-3)` and the high watermark is read from storage at most once every 100 ms per partition. Records appended by this broker are folded into it immediately, so a producer and consumer on the same broker see no delay; records appended by *another* owner of the same log become visible within the refresh interval or one fetch wait, whichever is longer -- a caught-up consumer long-polls for `fetch.max.wait.ms`, which is longer than the interval, so the interval is what governs. `OFFSET_OUT_OF_RANGE` is exempt: it is only ever answered from a window whose read was issued after the fetch arrived. The log's first offset is bounded the same way: only *this* broker's own retention trim drops the cached window, so a trim run by another owner shows up in the earliest offset this broker reports within the refresh interval, like that owner's appends.
 7. **Timestamp lookups scan a bounded window**: `ListOffsets(t)` reads at most 256 entries past its binary search. Beyond that it answers with the first entry written at or after `t`, which is at or before the true offset and never past it. If none of the scanned entries was written at or after `t`, the lookup reports no offset at all, even though a later entry past the window may hold one. That exhaustion answer's timestamp is always the entry's write time, not a record's create time.
 
 ### Future Enhancements

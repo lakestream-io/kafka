@@ -773,6 +773,33 @@ class PartitionReaderTest {
         }
     }
 
+    @Test
+    void aWindowInvalidatedWhileItWasBeingReadIsNeverServed() throws Exception {
+        Log log = mock(Log.class);
+        CompletableFuture<LogOffset> gatedLastOffset = new CompletableFuture<>();
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));
+        when(log.getLastOffset())
+                .thenReturn(gatedLastOffset)
+                .thenReturn(completedFuture(new LogOffset(9L, 1, 100L)));   // hwm = 10
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, new MockTime(0L, 1_000L, 0L))) {
+            CompletableFuture<Long> readAcrossTheTrim = reader.highWatermark();
+            assertFalse(readAcrossTheTrim.isDone());
+
+            // A trim lands while the read is in flight, so what that read reports describes the
+            // log as it was before the trim. It still answers its own caller...
+            reader.invalidateRange();
+            gatedLastOffset.complete(new LogOffset(9L, 1, 100L));
+            assertEquals(10L, readAcrossTheTrim.get(5, TimeUnit.SECONDS));
+
+            // ...but it is not cached: the next request reads storage again, inside the refresh
+            // interval, rather than being answered from a window the trim already condemned.
+            assertEquals(10L, reader.highWatermark().get(5, TimeUnit.SECONDS));
+            verify(log, times(2)).getFirstOffset();
+            verify(log, times(2)).getLastOffset();
+        }
+    }
+
     /** A clock that never moves, so one test's requests all fall inside a single refresh interval. */
     private static Time frozenTime() {
         return new MockTime(0L, 1_000L, 0L);
