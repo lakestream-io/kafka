@@ -24,6 +24,12 @@ compactor_image="${COMPACTOR_IMAGE:-lakestream/compactor:latest}"
 num_records="${NUM_RECORDS:-100}"
 passed=false
 
+# The brokers default to general-purpose write-path settings. This verifier
+# wants every record on its way to the compactor immediately, so it trades
+# produce latency for a short feedback loop.
+export URSA_WRITE_BUFFER_FLUSH_INTERVAL_MS="${URSA_WRITE_BUFFER_FLUSH_INTERVAL_MS:-100}"
+export URSA_WRITE_BUFFER_FLUSH_SIZE="${URSA_WRITE_BUFFER_FLUSH_SIZE:-4096}"
+
 # The compaction/Iceberg services live in the `lakehouse` profile and the demo
 # workload in `lakehouse-demo`; this verifier needs both.
 compose() {
@@ -33,6 +39,8 @@ compose() {
 
 # `ps`/`down` only see services in the enabled profiles, so the project guard and
 # the cleanup have to name every profile.
+# Keep this profile list in sync with ALL_PROFILES in Makefile and in
+# committer-tools/docker_cluster_smoke.py.
 compose_all() {
   docker compose --project-name "$project" -f "$compose_file" \
     --profile lakehouse --profile demo --profile share-demo \

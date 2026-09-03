@@ -16,7 +16,9 @@
 DOCKER := docker
 COMPOSE := $(DOCKER) compose
 # `down` only touches services in the enabled profiles, so teardown has to name
-# every profile or the lakehouse and one-shot demo containers survive it.
+# every profile or the lakehouse and one-shot demo containers survive it. Keep
+# this list in sync with ALL_PROFILES in committer-tools/docker_cluster_smoke.py
+# and compose_all() in run-lakehouse-demo.sh.
 ALL_PROFILES := --profile lakehouse --profile demo --profile share-demo --profile lakehouse-demo --profile tools
 # The compaction/Iceberg services (polaris, polaris-setup, compactor) are not
 # part of the default stack; they need the locally built compactor image.
@@ -39,6 +41,9 @@ help:
 	@echo "  make create-topic     - Create a diskless topic (TOPIC=name, PARTITIONS=n)"
 	@echo "  make produce          - Run producer perf test"
 	@echo "  make consume          - Run consumer perf test"
+	@echo "  make list-topics      - List all topics"
+	@echo "  make console-producer - Interactive console producer"
+	@echo "  make console-consumer - Interactive console consumer"
 	@echo ""
 	@echo "  make demo             - Producer/consumer perf demo, torn down on exit"
 	@echo "  make share-demo       - Share-group demo, torn down on exit"

@@ -60,8 +60,13 @@ x-kafka-environment: &kafka-environment
   KAFKA_URSA_STORAGE_S3_PATH_STYLE_ACCESS: "true"
   KAFKA_URSA_STORAGE_COMPACTION_BUCKET: "kafka-ursa"
   KAFKA_URSA_STORAGE_COMPACTION_PREFIX: "ursa/compacted"
-  KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE: "4096"
-  KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS: "100"
+
+  # The WAL write buffer flushes on whichever comes first, the interval or the
+  # size. The interval is the produce-latency floor, so these are the general
+  # purpose values; `run-lakehouse-demo.sh` lowers both to shorten its loop.
+  KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS: "${URSA_WRITE_BUFFER_FLUSH_INTERVAL_MS:-250}"
+  KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE: "${URSA_WRITE_BUFFER_FLUSH_SIZE:-268435456}"
+  KAFKA_URSA_STORAGE_WRITE_BUFFER_SIZE: "16777216" # 16 MiB (default is 4 MiB)
 
 x-kafka-service: &kafka-service
   image: ${IMAGE:-lakestream/kafka:latest}
@@ -300,13 +305,37 @@ services:
     depends_on:
       kafka-ready:
         condition: service_completed_successfully
-    command: ["/opt/kafka/bin/kafka-topics.sh",
-              "--bootstrap-server", "kafka-1:19092",
-              "--create",
-              "--if-not-exists",
-              "--config", "ursa.storage.enable=true",
-              "--topic", "test-diskless",
-              "--partitions", "64"]
+    environment:
+      DEMO_PARTITIONS: ${PARTITIONS:-12}
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        topic=test-diskless
+        bootstrap="kafka-1:19092,kafka-2:19092,kafka-3:19092"
+        # `--timeout-ms` only exists on some kafka-topics.sh builds.
+        extra_timeout=()
+        if /opt/kafka/bin/kafka-topics.sh --help 2>&1 | grep -q -- '--timeout-ms'; then
+          extra_timeout+=(--timeout-ms 120000)
+        fi
+        echo "Creating topic $$topic with $${DEMO_PARTITIONS} partitions..."
+        for attempt in $$(seq 1 60); do
+          if /opt/kafka/bin/kafka-topics.sh \
+              --bootstrap-server "$$bootstrap" \
+              --create \
+              --if-not-exists \
+              --config ursa.storage.enable=true \
+              --topic "$$topic" \
+              --partitions "$${DEMO_PARTITIONS}" \
+              --replication-factor 1 \
+              "$${extra_timeout[@]}"; then
+            echo "Created topic: $$topic"
+            exit 0
+          fi
+          echo "Topic creation not ready yet, retrying... ($$attempt/60)"
+          sleep 5
+        done
+        echo "Failed to create topic after retries: $$topic" >&2
+        exit 1
 
   producer-1: &producer-config
     <<: *kafka-cli
@@ -515,14 +544,18 @@ services:
         mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null
         echo "Waiting for Parquet objects under s3://$${COMPACTION_BUCKET}/$${COMPACTION_PREFIX}..."
         for attempt in $$(seq 1 180); do
-          # The mc image ships no grep, so match with the shell itself.
+          # The mc image ships no grep, so match with the shell itself. The
+          # pattern is anchored: a partial upload named `*.parquet.tmp` is not
+          # a compacted object.
           listing="$$(mc ls --recursive "local/$${COMPACTION_BUCKET}/$${COMPACTION_PREFIX}" 2>/dev/null || true)"
-          case "$$listing" in
-            *.parquet*)
-              echo "Parquet found."
-              exit 0
-              ;;
-          esac
+          for name in $$listing; do
+            case "$$name" in
+              *.parquet)
+                echo "Parquet found: $$name"
+                exit 0
+                ;;
+            esac
+          done
           echo "No Parquet yet, waiting... ($$attempt/180)"
           sleep 2
         done

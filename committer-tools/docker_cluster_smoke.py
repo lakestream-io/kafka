@@ -101,7 +101,9 @@ def build_kafka_image(project_dir: str, tarball: str, image_tag: str) -> None:
 
 
 # `down` only removes containers for services in the enabled profiles, so the
-# cleanup has to name every profile the compose file defines.
+# cleanup has to name every profile the compose file defines. Keep this list in
+# sync with ALL_PROFILES in the compose directory's Makefile and with
+# compose_all() in run-lakehouse-demo.sh.
 ALL_PROFILES = [
     "--profile", "lakehouse",
     "--profile", "demo",
@@ -131,14 +133,20 @@ def print_compose_diagnostics(
 ) -> None:
     print("\nDocker compose startup failed. Collecting diagnostics...")
 
+    # `ps`/`logs` only see services in the enabled profiles, so the demo profile
+    # has to be on for a failing kafka-ready or create-topic to show up.
     diagnostic_commands = [
         (
             "docker compose ps -a",
-            ["-f", compose_file, "ps", "-a"],
+            ["-f", compose_file, "--profile", "demo", "ps", "-a"],
         ),
         (
             "docker compose logs",
-            ["-f", compose_file, "logs", "--no-color", "--tail", "200", *services],
+            [
+                "-f", compose_file, "--profile", "demo",
+                "logs", "--no-color", "--tail", "200",
+                *services, "kafka-ready", "create-topic",
+            ],
         ),
     ]
 

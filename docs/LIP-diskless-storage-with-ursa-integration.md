@@ -728,17 +728,15 @@ The repository includes a single Docker Compose stack whose `lakehouse-demo`
 profile exercises compaction end to end:
 
 ```bash
-# Start the cluster with compaction support. The compactor and Polaris live in
-# the `lakehouse` profile; the core cluster runs without them.
+# Run the demo. It starts the stack itself -- the compactor and Polaris live in
+# the `lakehouse` profile, which the core cluster does not enable -- then
+# creates a topic, produces raw Kafka records, waits for Parquet compaction and
+# asserts the Kafka and Iceberg row counts. It requires a clean project, and on
+# success it removes its own containers and volumes.
 cd docker/examples/docker-compose-files/cluster/ursa
-docker compose --profile lakehouse up -d
+make lakehouse-demo
 
-# Run the demo (creates a topic, produces raw Kafka records, waits for Parquet
-# compaction, then asserts the Kafka and Iceberg row counts). It starts what it
-# needs, so it can also be run against a stopped stack.
-./run-lakehouse-demo.sh
-
-# Cleanup
+# Cleanup after a failed or retained run (KEEP_RUNNING=true)
 make destroy
 ```
 

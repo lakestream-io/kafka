@@ -68,7 +68,7 @@ Classic local-log ingestion is not part of this diskless demo and will use a sep
 ## Prerequisites
 
 - Docker >= 20.10.4
-- Docker Compose v2+
+- Docker Compose >= 2.20 (the stack uses `depends_on: ... required: false`)
 - Python >= 3.7 (for building the Kafka image)
 - Java >= 17 (for building Kafka)
 - A local `ursa-storage` checkout (only for the compactor image)
@@ -131,7 +131,7 @@ Each demo is a Compose profile of one-shot containers. They never run during a p
 | Profile | Services | What it does |
 |---------|----------|--------------|
 | `lakehouse` | `polaris`, `polaris-setup`, `compactor` | Adds compaction and the Iceberg REST catalog to the core cluster (long-running, not one-shot) |
-| `demo` | `kafka-ready`, `create-topic`, `producer-1`, `producer-2`, `consumer` | Creates `test-diskless` with 64 partitions and runs two producers plus a consumer perf test |
+| `demo` | `kafka-ready`, `create-topic`, `producer-1`, `producer-2`, `consumer` | Creates `test-diskless` (`PARTITIONS`, default 12) and runs two producers plus a consumer perf test |
 | `share-demo` | `kafka-ready`, `create-share-topic`, `configure-share-group`, `share-producer`, `share-consumer`, `describe-share-group` | Share-group consumption on a single-partition diskless topic |
 | `lakehouse-demo` | `kafka-ready`, `lakehouse-create-topic`, `raw-producer`, `kafka-consumer-check`, `wait-for-parquet`, `duckdb-query-check` | Kafka -> Ursa WAL -> compaction -> Iceberg -> DuckDB assertions (combine with `lakehouse`) |
 | `tools` | `duckdb` | On-demand SQL shell against the local Polaris catalog |
@@ -158,6 +158,11 @@ docker compose --profile lakehouse --profile tools run --rm duckdb
 KEEP_RUNNING=true ./run-lakehouse-demo.sh   # keep the stack for inspection
 NUM_RECORDS=500 ./run-lakehouse-demo.sh     # change the record count
 ```
+
+It also lowers the brokers' WAL write buffer to a 100 ms interval and 4096
+bytes (`URSA_WRITE_BUFFER_FLUSH_INTERVAL_MS`, `URSA_WRITE_BUFFER_FLUSH_SIZE`)
+so its 100 records reach the compactor immediately. Those are verifier
+settings, not perf-demo settings.
 
 The verifier requires a fresh Compose project so a prior topic or Iceberg snapshot cannot make an assertion pass accidentally. After a retained or failed run, use `make destroy` before retrying.
 
@@ -187,6 +192,13 @@ make console-consumer
 ```
 
 ## Advanced performance testing
+
+`ursa.storage.write.buffer.flush.interval.ms` is the produce-latency floor: a
+produce waits up to one flush interval, plus the S3 PUT, before it is
+acknowledged. The buffer also flushes early once
+`ursa.storage.write.buffer.flush.size` bytes accumulate, so a busy topic is
+bounded by throughput rather than by the interval. Lower the interval for
+latency, raise it to batch more per PUT.
 
 ```bash
 ./bin/kafka-producer-perf-test.sh \
@@ -278,6 +290,9 @@ Diskless storage is configured through the `x-kafka-environment` anchor in `dock
 | `KAFKA_URSA_STORAGE_S3_REGION` | S3 region |
 | `KAFKA_URSA_STORAGE_COMPACTION_BUCKET` | Bucket for managed compacted objects |
 | `KAFKA_URSA_STORAGE_COMPACTION_PREFIX` | Object prefix for managed compacted objects (`ursa/compacted`) |
+| `KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_INTERVAL_MS` | WAL write-buffer flush interval, `URSA_WRITE_BUFFER_FLUSH_INTERVAL_MS` (default 250) |
+| `KAFKA_URSA_STORAGE_WRITE_BUFFER_FLUSH_SIZE` | WAL write-buffer flush size, `URSA_WRITE_BUFFER_FLUSH_SIZE` (default 256 MiB) |
+| `KAFKA_URSA_STORAGE_WRITE_BUFFER_SIZE` | WAL write-buffer segment size (16 MiB here, 4 MiB by default) |
 
 **Note**: Environment variables use `_` for `.` in property names (e.g., `ursa.storage.enable` → `KAFKA_URSA_STORAGE_ENABLE`).
 
@@ -290,8 +305,13 @@ KRaft metadata lives under `/var/lib/kafka/data/kraft-combined-logs` on each bro
 | `IMAGE` | `lakestream/kafka:latest` | Kafka broker and CLI image |
 | `COMPACTOR_IMAGE` | `lakestream/compactor:latest` | Ursa compactor image |
 | `OXIA_IMAGE`, `MINIO_IMAGE`, `MINIO_MC_IMAGE`, `POLARIS_IMAGE`, `POLARIS_SETUP_IMAGE`, `DUCKDB_IMAGE` | pinned versions | Third-party images |
+| `PARTITIONS` | `12` | Partition count for the `demo` profile's `create-topic` |
 | `DEMO_TOPIC` | `ursa-lakehouse-e2e` | Topic used by the `lakehouse-demo` profile |
 | `NUM_RECORDS` | `100` | Record count used by the `lakehouse-demo` profile |
+| `COMPACTION_BUCKET` | `kafka-ursa` | Bucket `wait-for-parquet` watches |
+| `COMPACTION_PREFIX` | `ursa` | Prefix `wait-for-parquet` watches (spans `ursa/wal` and `ursa/compacted`) |
+| `URSA_WRITE_BUFFER_FLUSH_INTERVAL_MS` | `250` | Broker WAL write-buffer flush interval |
+| `URSA_WRITE_BUFFER_FLUSH_SIZE` | `268435456` | Broker WAL write-buffer flush size in bytes (256 MiB) |
 
 To use a custom Kafka image:
 
@@ -320,12 +340,16 @@ docker compose start kafka-1
 ## Cleanup
 
 ```bash
-# Stop all services
-docker compose down
+# Stop all services, every profile included
+make down
 
-# Remove all data volumes as well
-docker compose down -v --remove-orphans
+# Stop everything and remove the volumes as well
+make destroy
 ```
+
+A bare `docker compose down` only removes containers for services in the
+enabled profiles, so it leaves the one-shot demo and `lakehouse` containers
+behind. Both targets name every profile.
 
 ## Troubleshooting
 
