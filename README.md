@@ -1,10 +1,15 @@
-# Kafka with Diskless Storage
+# Diskless Kafka with a Built-in Lakehouse
 
 [![CI](https://github.com/lakestream-io/kafka/actions/workflows/ci.yml/badge.svg?branch=4.3-ursa&event=push)](https://github.com/lakestream-io/kafka/actions/workflows/ci.yml?query=event%3Apush+branch%3A4.3-ursa)
 
-A fork of [Apache Kafka](https://github.com/apache/kafka) that adds **diskless topics** — topics whose
-durability comes from object storage instead of broker disks — and a built-in path from those topics into an
-**Iceberg lakehouse**.
+A fork of [Apache Kafka](https://github.com/apache/kafka) with two additions:
+
+- **Diskless Kafka.** Topics whose durability comes from object storage instead of broker disks. Brokers hold
+  no partition data, so failover moves no bytes, scaling is a CPU and network decision, and a zone-aware
+  client never pays for cross-AZ replication.
+- **Data in the lakehouse.** The records those topics write are compacted into Parquet and registered as an
+  Iceberg table, queryable from DuckDB, Trino or Spark. No copy job, no Connect sink, no second retention
+  policy — Kafka consumers and SQL engines read the same bytes out of your own bucket.
 
 Everything Apache Kafka does, this fork still does. Diskless storage is an additional, per-topic option, so a
 single cluster can serve latency-sensitive workloads on classic topics and cost-sensitive workloads on
@@ -20,7 +25,7 @@ diskless topics at the same time.
 | Broker state             | Stateful: partition data lives on the broker     | Stateless for record data                                              |
 | Failover                 | New leader must catch up on replicated data      | Any live broker can serve the partition immediately, no data movement  |
 | Elasticity               | Adding/removing brokers moves partition data     | Scale on CPU and network alone                                         |
-| Lakehouse                | –                                                | The WAL is compacted to Parquet and exposed as an Iceberg table        |
+| Lakehouse                | –                                                | The same compacted Parquet can be registered as an Iceberg table       |
 
 Both modes share one controller quorum, one metadata log, one set of ACLs, one consumer-group coordinator,
 and the same client protocol. Consumer offsets stay in `__consumer_offsets`, which is always a classic topic.
@@ -78,6 +83,10 @@ Object storage       Oxia            Compaction
   idle topic, throughput is the bound for a busy one.
 - **Reads** are served from the same storage, transparently spanning the WAL and the compacted objects that
   compaction has already written.
+- **Compaction** consolidates the WAL into those compacted objects. It runs as a separate service, and it is
+  required: Kafka retention on a diskless topic issues a *soft* trim, and WAL objects are only physically
+  deleted up to the oldest un-compacted position across every stream. See
+  [Compaction is required](#compaction-is-required).
 - **Producer state** for idempotent producers is snapshotted into [Oxia](https://github.com/oxia-db/oxia)
   instead of local `.snapshot` files, so a broker restart does not lose idempotence guarantees.
 - **Topic lifecycle** — creation, partition growth, deletion, and orphan cleanup — is reconciled by the active
@@ -108,6 +117,23 @@ Compaction runs as a separate service (the Ursa compactor) rather than inside th
 competes with the request path. Kafka consumers and query engines read the same bytes: one copy of the data,
 one retention policy, in your own bucket.
 
+### Compaction is required
+
+Compaction is not a lakehouse add-on — it is what makes diskless storage reclaimable:
+
+1. Kafka retention on a diskless topic issues a **soft trim**, which moves the log's first offset. Soft-trimmed
+   entries are logically gone but still occupy object storage.
+2. WAL objects are physically deleted by a cleaner that runs inside the broker's storage runtime.
+3. That cleaner's delete watermark is the **oldest un-compacted position across every stream**, and only
+   compaction advances it.
+
+So a deployment with no compaction service has a WAL that only grows: `retention.ms` and `retention.bytes`
+hide records from consumers without freeing a byte. Because the watermark is a global minimum, one stream that
+never gets compacted also pins reclamation for every other stream.
+
+Registering an Iceberg table is a second, optional sink on the same compaction pass. You can run compaction
+without any catalog at all.
+
 ## Quick start
 
 The fastest way to see it running is the Docker Compose stack — three brokers, Oxia, MinIO, and optionally the
@@ -115,18 +141,20 @@ compactor plus an Iceberg catalog:
 
 ```bash
 cd docker/examples/docker-compose-files/cluster/ursa
-./build-image.sh        # build lakestream/kafka:latest
-make up                 # Oxia + MinIO + 3 brokers
+
+# Both images: the broker, and the compactor built from a local ursa-storage checkout
+URSA_STORAGE_DIR=/path/to/ursa-storage ./build-images.sh
+
+make up                 # Oxia + MinIO + 3 brokers + compactor
 make create-topic       # create a diskless topic
 make demo               # producer/consumer perf demo
 make destroy            # tear everything down
 ```
 
-The end-to-end lakehouse demo also needs the compactor image, which is built from a local
-[ursa-storage](https://github.com/lakestream-io/ursa-storage) checkout:
+Adding the Iceberg catalog is one more command — it starts Polaris and has the compactor write the external
+table alongside the compacted objects it already writes:
 
 ```bash
-URSA_STORAGE_DIR=/path/to/ursa-storage ./build-images.sh
 make lakehouse-demo     # Kafka -> Parquet -> Iceberg -> DuckDB, asserted end to end
 ```
 
@@ -135,8 +163,9 @@ profiles, ports, and knobs.
 
 ## Enabling diskless storage on your own cluster
 
-You need an object storage bucket, an [Oxia](https://github.com/oxia-db/oxia) service, and the Ursa runtime
-jars in `$KAFKA_HOME/ursa-storage/` (the release tarball built by `./gradlew releaseTarGz` puts them there).
+You need an object storage bucket, an [Oxia](https://github.com/oxia-db/oxia) service, the Ursa runtime jars
+in `$KAFKA_HOME/ursa-storage/` (the release tarball built by `./gradlew releaseTarGz` puts them there), and a
+running [compaction service](#compaction-is-required). An Iceberg catalog is optional on top of that.
 
 Broker/controller configuration:
 
@@ -224,6 +253,8 @@ the full set of live brokers when no in-zone broker is available. Clients need n
   bypassed. `CreateTopics` rejects any other value.
 - **Internal topics are always classic.** `__consumer_offsets` and `__transaction_state` stay on local logs.
 - **Mode is fixed at creation.** `ursa.storage.enable` cannot be altered afterwards.
+- **Retention needs compaction to free storage.** Without a compaction service running, `retention.ms` and
+  `retention.bytes` remove records logically but reclaim nothing.
 
 ## Building from source
 

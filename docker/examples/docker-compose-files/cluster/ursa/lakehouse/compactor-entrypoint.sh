@@ -26,8 +26,8 @@ property() {
 # Lakestream catalog, WAL metadata, and compaction task coordination.
 property metadataStoreUrl "$URSA_METADATA_STORE_URL"
 property oxiaStorageUrl "$URSA_OXIA_STORAGE_URL"
-# WAL entries contain Kafka MemoryRecords, which the materialization layer
-# decodes before writing table rows.
+# WAL entries contain Kafka MemoryRecords, which the compaction layer decodes
+# before writing compacted rows.
 
 # Ursa WAL in MinIO.
 property backendStorageType S3
@@ -63,32 +63,41 @@ property metastoreRequestRateLimitPerSecond "${URSA_METASTORE_RATE_LIMIT:-500}"
 # Lakestream logs and publishes each range before materializing it.
 property internalCompactionTaskPublisherEnabled true
 
-# Fan each Ursa WAL read out to both the managed Kafka compacted-object sink
-# and an external Iceberg table registered in Polaris.
-property materializationEnabled true
-property materializationDefaultNamespace default
-property clusterSdtEnabled true
-property clusterSbtEnabled true
-property lakehouseType ICEBERG
-property streamTableMode EXTERNAL
-property catalog.name polaris
+# Everything above is what compaction needs on its own: the WAL is compacted into
+# the managed objects Kafka fetch reads, which is also what advances the WAL
+# delete watermark so retention can free storage. That runs with no catalog.
+#
+# Materialization is the second sink: the same WAL read is additionally written
+# to an external Iceberg table registered in Polaris. It needs the `lakehouse`
+# profile to be up, so it stays off unless the caller asks for it.
+if [ "${URSA_MATERIALIZATION_ENABLED:-false}" = "true" ]; then
+  property materializationEnabled true
+  property materializationDefaultNamespace default
+  property clusterSdtEnabled true
+  property clusterSbtEnabled true
+  property lakehouseType ICEBERG
+  property streamTableMode EXTERNAL
+  property catalog.name polaris
 
-# Iceberg REST catalog and S3FileIO configuration. Polaris authentication is
-# deliberately static in this local-only stack; credential vending is not
-# needed to validate Kafka -> Ursa -> Iceberg -> DuckDB.
-property iceberg.catalog.polaris.type rest
-property iceberg.catalog.polaris.uri "$POLARIS_CATALOG_URI"
-property iceberg.catalog.polaris.warehouse "$POLARIS_CATALOG_NAME"
-property iceberg.catalog.polaris.credential "$POLARIS_CLIENT_ID:$POLARIS_CLIENT_SECRET"
-property iceberg.catalog.polaris.scope PRINCIPAL_ROLE:ALL
-property iceberg.catalog.polaris.oauth2-server-uri "$POLARIS_OAUTH2_URI"
-property iceberg.catalog.polaris.catalog-backend POLARIS
-property iceberg.catalog.polaris.io-impl org.apache.iceberg.aws.s3.S3FileIO
-property iceberg.catalog.polaris.client.region "$AWS_REGION"
-property iceberg.catalog.polaris.s3.endpoint "$URSA_S3_ENDPOINT"
-property iceberg.catalog.polaris.s3.path-style-access true
-property iceberg.catalog.polaris.s3.access-key-id "$AWS_ACCESS_KEY_ID"
-property iceberg.catalog.polaris.s3.secret-access-key "$AWS_SECRET_ACCESS_KEY"
+  # Iceberg REST catalog and S3FileIO configuration. Polaris authentication is
+  # deliberately static in this local-only stack; credential vending is not
+  # needed to validate Kafka -> Ursa -> Iceberg -> DuckDB.
+  property iceberg.catalog.polaris.type rest
+  property iceberg.catalog.polaris.uri "$POLARIS_CATALOG_URI"
+  property iceberg.catalog.polaris.warehouse "$POLARIS_CATALOG_NAME"
+  property iceberg.catalog.polaris.credential "$POLARIS_CLIENT_ID:$POLARIS_CLIENT_SECRET"
+  property iceberg.catalog.polaris.scope PRINCIPAL_ROLE:ALL
+  property iceberg.catalog.polaris.oauth2-server-uri "$POLARIS_OAUTH2_URI"
+  property iceberg.catalog.polaris.catalog-backend POLARIS
+  property iceberg.catalog.polaris.io-impl org.apache.iceberg.aws.s3.S3FileIO
+  property iceberg.catalog.polaris.client.region "$AWS_REGION"
+  property iceberg.catalog.polaris.s3.endpoint "$URSA_S3_ENDPOINT"
+  property iceberg.catalog.polaris.s3.path-style-access true
+  property iceberg.catalog.polaris.s3.access-key-id "$AWS_ACCESS_KEY_ID"
+  property iceberg.catalog.polaris.s3.secret-access-key "$AWS_SECRET_ACCESS_KEY"
+else
+  property materializationEnabled false
+fi
 
 exec java ${URSA_JAVA_OPTS:--Xmx1024M -XX:+UseZGC} \
   -Dio.netty.tryReflectionSetAccessible=true \
