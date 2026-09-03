@@ -47,7 +47,7 @@ Core cluster (started by default):
 `lakehouse` profile (opt in):
 
 - **Polaris**: Iceberg REST catalog
-- **Ursa compactor, with materialization on**: `URSA_MATERIALIZATION_ENABLED=true` adds a second sink to the same WAL read, registering an external Iceberg table in Polaris. Compose recreates the compactor when that variable changes.
+- **Ursa compactor, with materialization on**: `URSA_MATERIALIZATION_ENABLED=true` adds a second sink to the same WAL read, registering an external Iceberg table in Polaris, named after the Kafka topic. Compose recreates the compactor when that variable changes.
 - **DuckDB** (`tools` profile): on-demand SQL engine used for queries and for the end-to-end assertion
 
 ```text
@@ -174,12 +174,18 @@ settings, not perf-demo settings.
 
 The verifier requires a fresh Compose project so a prior topic or Iceberg snapshot cannot make an assertion pass accidentally. After a retained or failed run, use `make destroy` before retrying.
 
-Inside DuckDB (`make duckdb`), discover the incarnation-qualified table name and query it:
+Inside DuckDB (`make duckdb`), the table is named after the Kafka topic:
 
 ```sql
 SHOW ALL TABLES;
-SELECT count(*) FROM lakehouse.default."ursa-lakehouse-e2e-topic-id-<uuid>";
+SELECT count(*) FROM lakehouse.default."ursa-lakehouse-e2e";
 ```
+
+The stream behind it is named `<topic>-topic-id-<uuid>`, because Kafka lets a deleted topic be
+recreated under the same name and the two incarnations must not share a log. The table drops that
+suffix — `tableNameTemplate` in the compactor's config names it from the topic instead — so queries,
+views and dashboards keep working across a topic's lifetimes. The flip side is that a topic recreated
+under the same name appends to the existing table; drop the table first when that is not wanted.
 
 Polaris intentionally uses its in-memory development metastore and static MinIO credentials. It suits a reproducible local run, not a durable or production catalog. DuckDB is on demand rather than a resident server; use Trino instead when a shared JDBC/HTTP query endpoint is a requirement. All published ports bind to `127.0.0.1` because the stack uses fixed development credentials.
 

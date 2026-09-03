@@ -596,7 +596,7 @@ services:
           FROM duckdb_tables()
           WHERE database_name = 'lakehouse'
             AND schema_name = 'default'
-            AND table_name LIKE '${DEMO_TOPIC:-ursa-lakehouse-e2e}-topic-id-%'
+            AND table_name = '${DEMO_TOPIC:-ursa-lakehouse-e2e}'
           ORDER BY table_name
           LIMIT 1
         );
