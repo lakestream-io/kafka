@@ -348,7 +348,8 @@ ReplicaManager.fetchMessages()
 `Log.getFirstOffset()` and `Log.getLastOffset()`, two index reads against Ursa's metadata store.
 `PartitionReader` reads that window at most once every **100 ms** per partition
 (`OFFSET_RANGE_REFRESH_MS`, a constant rather than a config) and answers from the cached one in
-between; concurrent requests share one in-flight read rather than each starting their own. Because
+between; concurrent requests share one in-flight read rather than each starting their own. The
+exception is `ListOffsets(-2/-4)`, which always reads it fresh (see **ListOffsets Path**). Because
 a Lakestream log has one writer per zone-aware owner, the window is deliberately a bounded-staleness
 view rather than an exact one:
 
@@ -365,7 +366,9 @@ view rather than an exact one:
 - **This broker's own retention trim drops the window**, because the trim is what moves the first
   offset; closing the partition drops it too. A trim run by *another* owner of the log is not
   signalled here, so it lands in the cached window only when the window is next read -- bounded by
-  the refresh interval, exactly like that owner's appends.
+  the refresh interval, exactly like that owner's appends. What a client is told about the first
+  offset is not bounded that way: `ListOffsets(-2/-4)` reads the window fresh, so it reports every
+  trim, whoever ran it.
 - **The window is timed against the monotonic clock**, so a wall-clock step backwards cannot make a
   stale window look young and leave its staleness unbounded.
 
@@ -393,7 +396,7 @@ ReplicaManager.fetchOffset()
        │         │                   ▼
        │         │              UrsaLakestreamReader.listOffsets()
        │         │                   │
-       │         │                   ├──▶ EARLIEST (-2): cached offset window start
+       │         │                   ├──▶ EARLIEST (-2): offset window start, always read fresh
        │         │                   │
        │         │                   ├──▶ LATEST (-1): cached offset window HWM
        │         │                   │
@@ -413,10 +416,10 @@ ReplicaManager.fetchOffset()
 
 | Timestamp Value | Meaning | Diskless Behavior |
 |-----------------|---------|-------------------|
-| `-2` (EARLIEST) | First available offset | Returns the first available Lakestream log offset, from the cached offset window |
+| `-2` (EARLIEST) | First available offset | Returns the first available Lakestream log offset, from a window read issued after the request arrived rather than from the cache |
 | `-1` (LATEST) | High watermark | Returns the end offset derived from the last Lakestream log offset and record count, from the cached offset window |
 | `-3` (MAX_TIMESTAMP) | Offset with highest timestamp | Answers from the last entry's header alone: its base offset and its write timestamp (see **Limitations**) |
-| `-4` (EARLIEST_LOCAL) | First local offset | Same as EARLIEST for diskless (no local/remote distinction) |
+| `-4` (EARLIEST_LOCAL) | First local offset | Same as EARLIEST for diskless (no local/remote distinction), including the fresh read |
 | `-5` (LATEST_TIERED) | End of tiered storage | Returns -1 (not applicable for diskless) |
 | `>= 0` | First offset with timestamp >= value | Binary searches entry headers, then reads forward over at most 256 entries |
 
@@ -426,7 +429,7 @@ ReplicaManager.fetchOffset()
    - Duplicate partition check → `INVALID_REQUEST`
    - Unsupported timestamp for protocol version → `UNSUPPORTED_VERSION`
 
-2. **EARLIEST/LATEST Optimization**: EARLIEST/LATEST are served from the first and last Lakestream log offsets, through the same ≤ 100 ms cached offset window the fetch path uses (see **Read Path (Fetch)** → **Offset Window Caching**).
+2. **EARLIEST is read fresh; LATEST follows the cached window**: both are served from the Lakestream log's first and last offsets, but they treat the ≤ 100 ms cached offset window (see **Read Path (Fetch)** → **Offset Window Caching**) differently. LATEST and MAX_TIMESTAMP answer from the cache and may therefore lag another owner's append by up to the refresh interval. EARLIEST and EARLIEST_LOCAL never do: they are answered from a window read *issued after the request arrived*, reusing the gate the fetch path uses before it reports `OFFSET_OUT_OF_RANGE`, so a concurrent in-flight read is shared and a request costs at most one extra pair of index reads. Only a retention trim moves the log's start, ListOffsets is rare next to fetch, and a client asking where the log begins is usually about to reset to that offset -- so exactness is worth the read. The freshly read window is cached like any other refresh.
 
 3. **Timestamp Search**: Binary searches the Lakestream entry headers for the last entry whose write time predates the target, then decodes entries forward from it until one holds a record at or after the target. A record's create time is never newer than the write time of the entry carrying it, which is what lets the binary search skip everything before that point; past it the records can lag their headers by any amount, so the forward scan is bounded at 256 entries. Exhausting the bound answers with the base offset and write time of the earliest scanned entry written at or after the target -- at or before the true answer, never past it, so a consumer seeking there re-reads a little rather than skipping records. No cursor is opened, and the broker does not depend on a provider-specific publish-time index.
 
@@ -477,7 +480,7 @@ No changes to the Kafka protocol. Existing `ProduceRequest`, `FetchRequest`, and
 - Transactional produce requests are rejected with `INVALID_REQUEST` for diskless topics
 - Long-polling fetch waits inside the diskless read path rather than in the fetch purgatory: a request wakes on the first append to any of its caught-up partitions, or on `maxWaitMs`. `minBytes` is honoured only through that wait -- a fetch never waits when any of its partitions already has data.
 - `ListOffsets` by timestamp can answer with an offset at or before the exact match on a topic whose record timestamps lag their entries' write times by more than 256 entries (see **Limitations**)
-- The high watermark a fetch or `ListOffsets(-1)` reports can lag another owner's append by up to the refresh interval or one fetch wait, whichever is longer (see **Limitations**); this broker's own appends never lag, and `OFFSET_OUT_OF_RANGE` is never reported from a stale window
+- The high watermark a fetch or `ListOffsets(-1)` reports can lag another owner's append by up to the refresh interval or one fetch wait, whichever is longer (see **Limitations**); this broker's own appends never lag, and neither `OFFSET_OUT_OF_RANGE` nor `ListOffsets(-2/-4)` is ever answered from a stale window
 
 #### Binary Protocol
 
@@ -690,7 +693,7 @@ For diskless topics:
 3. **RF=1 Only**: Multi-replica diskless topics not supported
 4. **No Internal Topics**: System topics use traditional storage
 5. **MAX_TIMESTAMP is approximate**: `ListOffsets(-3)` answers with the last entry's base offset and its write timestamp instead of scanning records for the true maximum create time. Entries are written in write-timestamp order, so this is exact whenever record timestamps follow write order; where they do not, the answer names the last entry rather than the record with the highest timestamp. The exact answer would cost one index lookup per record.
-6. **The reported high watermark is bounded-stale across owners**: the offset window behind fetch, `ListOffsets(-2/-1/-3)` and the high watermark is read from storage at most once every 100 ms per partition. Records appended by this broker are folded into it immediately, so a producer and consumer on the same broker see no delay; records appended by *another* owner of the same log become visible within the refresh interval or one fetch wait, whichever is longer -- a caught-up consumer long-polls for `fetch.max.wait.ms`, which is longer than the interval, so the interval is what governs. `OFFSET_OUT_OF_RANGE` is exempt: it is only ever answered from a window whose read was issued after the fetch arrived. The log's first offset is bounded the same way: only *this* broker's own retention trim drops the cached window, so a trim run by another owner shows up in the earliest offset this broker reports within the refresh interval, like that owner's appends.
+6. **The reported high watermark is bounded-stale across owners**: the offset window behind fetch, `ListOffsets(-1/-3)` and the high watermark is read from storage at most once every 100 ms per partition. Records appended by this broker are folded into it immediately, so a producer and consumer on the same broker see no delay; records appended by *another* owner of the same log become visible within the refresh interval or one fetch wait, whichever is longer -- a caught-up consumer long-polls for `fetch.max.wait.ms`, which is longer than the interval, so the interval is what governs. Two answers are exempt, both because they are the ones a client acts on by moving its offset: `OFFSET_OUT_OF_RANGE` and `ListOffsets(-2/-4)` are only ever answered from a window whose read was issued after the request arrived. The cached window's own first offset is *not* exempt -- only *this* broker's retention trim drops it, so a trim run by another owner reaches it within the refresh interval, like that owner's appends -- but nothing a client is told depends on that: the log start it reads comes from `ListOffsets(-2)`, and the start reported alongside a fetch is only ever too low, never past a record the fetch could still return.
 7. **Timestamp lookups scan a bounded window**: `ListOffsets(t)` reads at most 256 entries past its binary search. Beyond that it answers with the first entry written at or after `t`, which is at or before the true offset and never past it. If none of the scanned entries was written at or after `t`, the lookup reports no offset at all, even though a later entry past the window may hold one. That exhaustion answer's timestamp is always the entry's write time, not a record's create time.
 
 ### Future Enhancements

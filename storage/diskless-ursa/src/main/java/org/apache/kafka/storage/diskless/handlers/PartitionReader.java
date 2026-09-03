@@ -64,7 +64,9 @@ import io.lakestream.api.LogOffset;
  * therefore cached for {@link #OFFSET_RANGE_REFRESH_MS} rather than read per request, and appends
  * made through this partition's own writer widen it without any read at all. What that buys is a
  * bounded number of index reads per partition; what it costs is stated in
- * {@link #OFFSET_RANGE_REFRESH_MS}.
+ * {@link #OFFSET_RANGE_REFRESH_MS}. The one request that never takes the cached window is a
+ * ListOffsets for EARLIEST: where the log begins is answered from a read issued after the request
+ * arrived, so a trim made by another broker cannot go unseen.
  */
 final class PartitionReader implements AutoCloseable {
 
@@ -88,6 +90,10 @@ final class PartitionReader implements AutoCloseable {
      * <p>It is a constant rather than a config: 100 ms is short enough to stay under a consumer's
      * poll interval and long enough that a partition being read by many consumers costs storage a
      * bounded number of index reads per second instead of two per fetch.
+     *
+     * <p>This bounds the staleness of the log's <em>end</em> only. Its start moves only when
+     * retention trims the log, and {@link #listOffsets(ListOffsetsPartitionRequest)} reads that
+     * fresh rather than waiting out this interval.
      *
      * <p>Package-private so that the tests can assert against this value rather than repeat it.
      */
@@ -195,9 +201,19 @@ final class PartitionReader implements AutoCloseable {
         if (timestamp == ListOffsetsPartitionRequest.LATEST_TIERED_TIMESTAMP) {
             return CompletableFuture.completedFuture(notFound());
         }
-        return range().thenCompose(range -> {
-            if (timestamp == ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP
-                    || timestamp == ListOffsetsPartitionRequest.EARLIEST_LOCAL_TIMESTAMP) {
+        boolean earliest = timestamp == ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP
+                || timestamp == ListOffsetsPartitionRequest.EARLIEST_LOCAL_TIMESTAMP;
+        // Where the log begins is answered from a read issued after this request arrived, never
+        // from the cached window: a trim is the only thing that moves the start, this broker is
+        // not told of a trim another one ran, and a client asking for EARLIEST is usually about to
+        // reset to what it is told. That is the same gate a fetch takes before it may report
+        // OFFSET_OUT_OF_RANGE, so a read already in flight for a request no older than this one is
+        // shared, and a request costs at most one extra pair of index reads. Every other timestamp
+        // keeps the cached window: ListOffsets is rare next to fetch, but not so rare that the end
+        // of the log is worth two index reads per request as well.
+        CompletableFuture<Range> window = earliest ? refreshedRange(rangeReads.get() + 1) : range();
+        return window.thenCompose(range -> {
+            if (earliest) {
                 return CompletableFuture.completedFuture(success(range.start(), UNKNOWN_TIMESTAMP));
             }
             if (timestamp == ListOffsetsPartitionRequest.LATEST_TIMESTAMP) {

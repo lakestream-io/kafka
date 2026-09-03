@@ -753,6 +753,95 @@ class PartitionReaderTest {
             verify(log, times(2)).getLastOffset();
         }
     }
+    @Test
+    void earliestIsAlwaysAnsweredFromAFreshWindowRead() throws Exception {
+        Log log = mock(Log.class);
+        when(log.getFirstOffset())
+                .thenReturn(completedFuture(new LogOffset(0L, 1, 1L)))
+                .thenReturn(completedFuture(new LogOffset(5L, 1, 1L)))   // a trim moved the log's start
+                .thenReturn(completedFuture(new LogOffset(7L, 1, 1L)));  // and then another one did
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(9L, 1, 100L)));   // hwm = 10
+
+        // The clock never moves, so every request below falls inside one refresh interval.
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, frozenTime())) {
+            assertEquals(0L, reader.listOffsets(
+                    listOffsetsRequest(ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP)).get().offset());
+            verify(log, times(1)).getFirstOffset();
+
+            // Retention trimmed the log through another broker, so nothing invalidated the window
+            // this reader is holding. EARLIEST still has to report where the log now starts.
+            assertEquals(5L, reader.listOffsets(
+                    listOffsetsRequest(ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP)).get().offset());
+            verify(log, times(2)).getFirstOffset();
+
+            assertEquals(7L, reader.listOffsets(
+                    listOffsetsRequest(ListOffsetsPartitionRequest.EARLIEST_LOCAL_TIMESTAMP)).get().offset());
+            verify(log, times(3)).getFirstOffset();
+        }
+    }
+
+    @Test
+    void latestIsAnsweredFromTheCachedWindowWithinTheInterval() throws Exception {
+        Log log = mock(Log.class);
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(9L, 1, 100L)));   // hwm = 10
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, frozenTime())) {
+            assertEquals(10L, reader.listOffsets(
+                    listOffsetsRequest(ListOffsetsPartitionRequest.LATEST_TIMESTAMP)).get().offset());
+            assertEquals(10L, reader.listOffsets(
+                    listOffsetsRequest(ListOffsetsPartitionRequest.LATEST_TIMESTAMP)).get().offset());
+            ListOffsetsPartitionResponse maxTimestamp = reader.listOffsets(
+                    listOffsetsRequest(ListOffsetsPartitionRequest.MAX_TIMESTAMP)).get();
+            assertEquals(9L, maxTimestamp.offset());
+
+            // Only the log's start is worth a read per request; the end is allowed to lag by an
+            // interval, as it does for a fetch.
+            verify(log, times(1)).getFirstOffset();
+            verify(log, times(1)).getLastOffset();
+        }
+    }
+
+    @Test
+    void anEarliestRequestJoinsOnlyAWindowReadIssuedAfterIt() throws Exception {
+        Log log = mock(Log.class);
+        CompletableFuture<LogOffset> readBeforeTheTrim = new CompletableFuture<>();
+        CompletableFuture<LogOffset> readAfterTheTrim = new CompletableFuture<>();
+        when(log.getFirstOffset())
+                .thenReturn(readBeforeTheTrim)                             // issued at T0
+                .thenReturn(readAfterTheTrim)                              // the read both requests need
+                .thenReturn(completedFuture(new LogOffset(9L, 1, 1L)));    // a third read: never issued
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(9L, 1, 100L)));   // hwm = 10
+
+        try (PartitionReader reader = new PartitionReader(TP, log, 10, frozenTime())) {
+            // A read of the window is already in flight, from before the trim.
+            CompletableFuture<Long> readInFlight = reader.highWatermark();
+            assertFalse(readInFlight.isDone());
+
+            CompletableFuture<ListOffsetsPartitionResponse> first =
+                    reader.listOffsets(listOffsetsRequest(ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP));
+            CompletableFuture<ListOffsetsPartitionResponse> second =
+                    reader.listOffsets(listOffsetsRequest(ListOffsetsPartitionRequest.EARLIEST_TIMESTAMP));
+            // Neither may be answered by that read: it started before either request arrived, so
+            // what it reports may predate the trim they are asking about.
+            assertFalse(first.isDone());
+            assertFalse(second.isDone());
+            verify(log, times(1)).getFirstOffset();
+
+            readBeforeTheTrim.complete(new LogOffset(0L, 1, 1L));   // the log as it stood before the trim
+            // Both requests waited for that one, and now share the single read that follows it.
+            verify(log, times(2)).getFirstOffset();
+            assertFalse(first.isDone());
+            assertFalse(second.isDone());
+
+            readAfterTheTrim.complete(new LogOffset(5L, 1, 1L));
+            assertEquals(5L, first.get(5, TimeUnit.SECONDS).offset());
+            assertEquals(5L, second.get(5, TimeUnit.SECONDS).offset());
+            verify(log, times(2)).getFirstOffset();
+            // The older read still answers the caller that asked for it, with what it read.
+            assertEquals(10L, readInFlight.get(5, TimeUnit.SECONDS));
+        }
+    }
 
     @Test
     void invalidatingTheWindowMakesTheNextRequestReadStorage() throws Exception {
