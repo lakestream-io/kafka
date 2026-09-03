@@ -43,6 +43,9 @@ import io.lakestream.api.exception.LogFencedException;
  *
  * <p>Nothing here blocks: each stage is chained onto the storage future that precedes it, which is
  * what lets the shared diskless timer start a run without waiting for one.
+ *
+ * <p>A trim that lands is reported to {@code onTrimmed}: it moved the log's first offset, so the
+ * offset window {@link PartitionReader} caches no longer describes the log and has to be dropped.
  */
 final class PartitionRetention {
 
@@ -51,6 +54,8 @@ final class PartitionRetention {
     private final TopicIdPartition topicIdPartition;
     private final Supplier<CompletableFuture<Log>> logSupplier;
     private final Consumer<Throwable> onFenced;
+    /** Told after each trim that landed, so the read side stops answering from a window it moved. */
+    private final Runnable onTrimmed;
     /** The settings of the newest request that has not started running yet, if any. */
     private final AtomicReference<RetentionRequest> pending = new AtomicReference<>();
     private final AtomicBoolean running = new AtomicBoolean();
@@ -60,10 +65,12 @@ final class PartitionRetention {
     PartitionRetention(
             TopicIdPartition topicIdPartition,
             Supplier<CompletableFuture<Log>> logSupplier,
-            Consumer<Throwable> onFenced) {
+            Consumer<Throwable> onFenced,
+            Runnable onTrimmed) {
         this.topicIdPartition = Objects.requireNonNull(topicIdPartition, "topicIdPartition must not be null");
         this.logSupplier = Objects.requireNonNull(logSupplier, "logSupplier must not be null");
         this.onFenced = Objects.requireNonNull(onFenced, "onFenced must not be null");
+        this.onTrimmed = Objects.requireNonNull(onTrimmed, "onTrimmed must not be null");
     }
 
     /** Coalesces requests: at most one trim in flight, the latest request wins. */
@@ -165,7 +172,11 @@ final class PartitionRetention {
                 return CompletableFuture.failedFuture(new IllegalStateException(
                         "Log.softTrim returned a null future for " + topicIdPartition));
             }
-            return trim.thenApply(ignored -> null);
+            return trim.thenApply(ignored -> {
+                // The log now starts past what the read side last saw, so its window must go.
+                onTrimmed.run();
+                return null;
+            });
         });
     }
 

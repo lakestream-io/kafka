@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import io.lakestream.api.Log;
@@ -31,6 +32,7 @@ import io.lakestream.api.LogOffset;
 import io.lakestream.api.exception.LogFencedException;
 
 import static java.util.concurrent.CompletableFuture.completedFuture;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -56,7 +58,7 @@ class PartitionRetentionTest {
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(0L, 1, 1L)));
         when(log.softTrim(3L)).thenReturn(firstTrim);
         when(log.softTrim(6L)).thenReturn(completedFuture(7L));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(1000L, -1L);
         retention.request(700L, -1L);   // superseded before the first trim finishes
@@ -71,7 +73,7 @@ class PartitionRetentionTest {
     @Test
     void disabledRetentionDoesNotInspectTheLog() throws Exception {
         Log log = mock(Log.class);
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(-1L, -1L);
         retention.close().get(5, TimeUnit.SECONDS);
@@ -87,7 +89,7 @@ class PartitionRetentionTest {
                 .thenReturn(completedFuture(10L));
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));
         when(log.softTrim(10L)).thenReturn(completedFuture(11L));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(120_000L, 2L * 1024 * 1024);
         retention.close().get(5, TimeUnit.SECONDS);
@@ -101,7 +103,7 @@ class PartitionRetentionTest {
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(42L, 1, 1L)));
         when(log.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(completedFuture(4L));
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(120_000L, -1L);
         retention.close().get(5, TimeUnit.SECONDS);
@@ -113,7 +115,7 @@ class PartitionRetentionTest {
     void anEmptyLogSkipsTheRetentionComputation() throws Exception {
         Log log = mock(Log.class);
         when(log.getLastOffset()).thenReturn(completedFuture(LogOffset.NOT_FOUND));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(120_000L, -1L);
         retention.close().get(5, TimeUnit.SECONDS);
@@ -129,7 +131,7 @@ class PartitionRetentionTest {
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(42L, 1, 1L)));
         when(log.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(completedFuture(10L));
         when(log.getFirstOffset()).thenReturn(completedFuture(null));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(120_000L, -1L);
         retention.close().get(5, TimeUnit.SECONDS);
@@ -146,7 +148,7 @@ class PartitionRetentionTest {
         when(log.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(completedFuture(10L));
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));
         when(log.softTrim(10L)).thenReturn(completedFuture(11L));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(120_000L, -1L);
         retention.request(120_000L, -1L);
@@ -156,12 +158,48 @@ class PartitionRetentionTest {
     }
 
     @Test
+    void aCompletedTrimDropsTheReadersCachedOffsetWindow() throws Exception {
+        Log log = mock(Log.class);
+        AtomicInteger trims = new AtomicInteger();
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(42L, 1, 1L)));
+        when(log.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(completedFuture(10L));
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));
+        when(log.softTrim(10L)).thenReturn(completedFuture(11L));
+        PartitionRetention retention = new PartitionRetention(
+                TP, () -> completedFuture(log), e -> { }, trims::incrementAndGet);
+
+        retention.request(120_000L, -1L);
+        retention.close().get(5, TimeUnit.SECONDS);
+
+        // The trim moved the log's first offset, so a window cached before it is now wrong.
+        verify(log).softTrim(10L);
+        assertEquals(1, trims.get());
+    }
+
+    @Test
+    void aTrimThatNeverRanLeavesTheCachedOffsetWindowAlone() throws Exception {
+        Log log = mock(Log.class);
+        AtomicInteger trims = new AtomicInteger();
+        when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(42L, 1, 1L)));
+        when(log.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(completedFuture(4L));
+        when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));
+        PartitionRetention retention = new PartitionRetention(
+                TP, () -> completedFuture(log), e -> { }, trims::incrementAndGet);
+
+        retention.request(120_000L, -1L);
+        retention.close().get(5, TimeUnit.SECONDS);
+
+        verify(log, never()).softTrim(anyLong());
+        assertEquals(0, trims.get());
+    }
+
+    @Test
     void aFencedLogIsReportedToTheFenceCallback() throws Exception {
         Log log = mock(Log.class);
         AtomicReference<Throwable> fenced = new AtomicReference<>();
         when(log.getLastOffset())
                 .thenReturn(CompletableFuture.failedFuture(new LogFencedException("fenced")));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), fenced::set);
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), fenced::set, () -> { });
 
         retention.request(120_000L, -1L);
         retention.close().get(5, TimeUnit.SECONDS);
@@ -175,7 +213,7 @@ class PartitionRetentionTest {
         AtomicReference<Throwable> fenced = new AtomicReference<>();
         CompletableFuture<LogOffset> lastOffset = new CompletableFuture<>();
         when(log.getLastOffset()).thenReturn(lastOffset);
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), fenced::set);
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), fenced::set, () -> { });
 
         retention.request(120_000L, -1L);
         CompletableFuture<Void> closeFuture = retention.close();
@@ -196,7 +234,7 @@ class PartitionRetentionTest {
         when(log.getLastOffset()).thenReturn(completedFuture(new LogOffset(42L, 1, 1L)));
         when(log.computeRetentionTrimOffset(42L, 120_000L, -1L)).thenReturn(trimOffset);
         when(log.getFirstOffset()).thenReturn(completedFuture(new LogOffset(5L, 1, 1L)));
-        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { });
+        PartitionRetention retention = new PartitionRetention(TP, () -> completedFuture(log), e -> { }, () -> { });
 
         retention.request(120_000L, -1L);
         verify(log).computeRetentionTrimOffset(42L, 120_000L, -1L);

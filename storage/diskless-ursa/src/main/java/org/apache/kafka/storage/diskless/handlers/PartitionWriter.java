@@ -38,11 +38,13 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 import io.lakestream.api.Log;
 import io.lakestream.api.LogEntryHeader;
+import io.lakestream.api.LogOffset;
 import io.netty.buffer.ByteBuf;
 
 /**
@@ -59,6 +61,10 @@ import io.netty.buffer.ByteBuf;
  * release: the append callback releases it on success or failure, and {@link #close()} releases
  * every payload that has not yet been handed to storage. Appends are serialized per partition by
  * {@link PartitionWriteSequencer}; only submission is ordered, completions may interleave.
+ *
+ * <p>Each entry that lands is reported to {@code onAppended} before any long-polling fetch is
+ * woken, which is what lets {@link PartitionReader} answer from a cached offset window without
+ * ever missing this broker's own appends.
  */
 final class PartitionWriter {
 
@@ -68,6 +74,8 @@ final class PartitionWriter {
     private final Supplier<CompletableFuture<Log>> logSupplier;
     private final Function<String, ProducerStateManager> producerStateForZone;
     private final Time time;
+    /** Where every entry that lands is reported, so the read side can see it without a read. */
+    private final Consumer<LogOffset> onAppended;
     private final PartitionWriteSequencer writeSequencer;
     private final Set<OwnedWritePayload> ownedWritePayloads = ConcurrentHashMap.newKeySet();
     private final Object waitersLock = new Object();
@@ -80,13 +88,15 @@ final class PartitionWriter {
                     Supplier<CompletableFuture<Log>> logSupplier,
                     Function<String, ProducerStateManager> producerStateForZone,
                     TimestampType timestampType,
-                    Time time) {
+                    Time time,
+                    Consumer<LogOffset> onAppended) {
         this.topicIdPartition = Objects.requireNonNull(topicIdPartition, "topicIdPartition must not be null");
         this.logSupplier = Objects.requireNonNull(logSupplier, "logSupplier must not be null");
         this.producerStateForZone =
                 Objects.requireNonNull(producerStateForZone, "producerStateForZone must not be null");
         this.timestampType = Objects.requireNonNull(timestampType, "timestampType must not be null");
         this.time = Objects.requireNonNull(time, "time must not be null");
+        this.onAppended = Objects.requireNonNull(onAppended, "onAppended must not be null");
         this.writeSequencer = new PartitionWriteSequencer(topicIdPartition.toString());
     }
 
@@ -396,7 +406,15 @@ final class PartitionWriter {
                     result.completeExceptionally(missingHeader);
                     return;
                 }
-                // The records are durable now, so a long-polling fetch can see them.
+                // The records are durable now, so a long-polling fetch can see them. The read
+                // side is told where the log now ends before that fetch is woken, so it answers
+                // from this append rather than from an offset window read before it landed. The
+                // record count comes from this request rather than from the header, because it is
+                // exactly what was handed to storage.
+                onAppended.accept(new LogOffset(
+                        entryHeader.offset(),
+                        preparedWrite.analysisResult().recordCount(),
+                        entryHeader.timestamp()));
                 notifyAppended();
                 result.complete(listener.completed(entryHeader, preparedWrite.appendTimestamp()));
             } catch (Throwable completeError) {

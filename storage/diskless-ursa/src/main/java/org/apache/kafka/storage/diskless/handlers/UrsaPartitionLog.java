@@ -46,6 +46,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 import io.lakestream.api.Log;
+import io.lakestream.api.LogOffset;
 import io.lakestream.api.exception.LogFencedException;
 import io.lakestream.api.exception.NoSuchStreamException;
 import io.oxia.client.api.AsyncOxiaClient;
@@ -104,8 +105,10 @@ final class UrsaPartitionLog {
                 this::initialized,
                 this::getOrCreateProducerStateManager,
                 state.timestampType(topicIdPartition.topic()),
-                state.time());
-        this.retention = new PartitionRetention(topicIdPartition, this::initialized, error -> invalidate());
+                state.time(),
+                this::observeAppend);
+        this.retention = new PartitionRetention(
+                topicIdPartition, this::initialized, error -> invalidate(), this::invalidateReaderRange);
         this.initFuture = createInitFuture(logFuture);
     }
 
@@ -241,6 +244,26 @@ final class UrsaPartitionLog {
         return initFuture;
     }
 
+    /**
+     * Widens the reader's cached offset window to cover an append this broker just made. The
+     * reader exists by then: the writer only appends once the init future has completed, which is
+     * what installs the reader.
+     */
+    private void observeAppend(LogOffset appended) {
+        PartitionReader currentReader = reader;
+        if (currentReader != null) {
+            currentReader.observeAppend(appended);
+        }
+    }
+
+    /** Drops the reader's cached offset window once a trim has moved the log's first offset. */
+    private void invalidateReaderRange() {
+        PartitionReader currentReader = reader;
+        if (currentReader != null) {
+            currentReader.invalidateRange();
+        }
+    }
+
     /** The reader installed once the log opened; it is dropped as soon as this partition log closes. */
     private PartitionReader activeReader() {
         PartitionReader currentReader = reader;
@@ -299,8 +322,8 @@ final class UrsaPartitionLog {
         if (activePartitionLog != null && activePartitionLog != this) {
             throw new NotLeaderOrFollowerException("Partition log already replaced");
         }
-        PartitionReader openedReader =
-                new PartitionReader(topicIdPartition, logInstance, MAX_ENTRIES_PER_FETCH);
+        PartitionReader openedReader = new PartitionReader(
+                topicIdPartition, logInstance, MAX_ENTRIES_PER_FETCH, state.time());
         try {
             logMetrics.register(topicIdPartition, logInstance);
         } catch (Throwable metricRegistrationError) {
