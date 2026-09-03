@@ -14,112 +14,72 @@
 # limitations under the License.
 
 DOCKER := docker
-LAKEHOUSE_PROJECT ?= kafka-ursa-lakehouse
-LAKEHOUSE_COMPOSE := docker-compose-lakehouse.yml
-LAKEHOUSE_DEMO_COMPOSE := docker-compose-lakehouse.demo.yml
+COMPOSE := $(DOCKER) compose
+# `down` only touches services in the enabled profiles, so teardown has to name
+# every profile or one-shot demo containers survive it.
+ALL_PROFILES := --profile demo --profile share-demo --profile lakehouse-demo --profile tools
+
+TOPIC ?= test-diskless
+PARTITIONS ?= 12
 
 .PHONY: help
 help:
 	@echo "Diskless Storage Demo Commands:"
 	@echo ""
-	@echo "  make demo         - Start cluster with demo (topic creation + producer/consumer perf tests)"
-	@echo "  make up           - Start cluster only (no demo workloads)"
-	@echo "  make down         - Stop all services"
-	@echo "  make destroy      - Stop all services and remove volumes"
-	@echo "  make logs         - Follow kafka-1 logs"
-	@echo "  make ps           - Show running services"
-	@echo "  make create-topic - Create a diskless topic (TOPIC=name, default: test-diskless)"
-	@echo "  make produce      - Run producer perf test"
-	@echo "  make consume      - Run consumer perf test"
+	@echo "  make build-images     - Build the Kafka and Ursa compactor images"
+	@echo "                          (URSA_STORAGE_DIR=/path/to/ursa-storage)"
+	@echo "  make up               - Start the full stack (Oxia, MinIO, Polaris, compactor, brokers)"
+	@echo "  make down             - Stop all services"
+	@echo "  make destroy          - Stop all services and remove volumes"
+	@echo "  make logs             - Follow kafka-1 logs"
+	@echo "  make ps               - Show running services"
+	@echo "  make create-topic     - Create a diskless topic (TOPIC=name, PARTITIONS=n)"
+	@echo "  make produce          - Run producer perf test"
+	@echo "  make consume          - Run consumer perf test"
 	@echo ""
-	@echo "Lakehouse Demo Commands:"
-	@echo "  make build-lakehouse URSA_STORAGE_DIR=/path/to/ursa-storage"
-	@echo "  make up-lakehouse"
-	@echo "  make demo-lakehouse"
-	@echo "  make duckdb-lakehouse"
-	@echo "  make destroy-lakehouse"
+	@echo "  make demo             - Producer/consumer perf demo, torn down on exit"
+	@echo "  make share-demo       - Share-group demo, torn down on exit"
+	@echo "  make lakehouse-demo   - Kafka -> Iceberg -> DuckDB end-to-end assertion"
+	@echo "  make duckdb           - Open DuckDB against the local Polaris catalog"
+	@echo "  make compaction-logs  - Follow compactor logs"
 	@echo ""
 
-.PHONY: build-lakehouse
-build-lakehouse:
-	URSA_STORAGE_DIR="$(URSA_STORAGE_DIR)" ./build-lakehouse-images.sh
-
-.PHONY: up-lakehouse
-up-lakehouse:
-	$(DOCKER) compose --project-name $(LAKEHOUSE_PROJECT) -f $(LAKEHOUSE_COMPOSE) up -d \
-		oxia minio minio-init polaris polaris-setup compactor kafka-1 kafka-2 kafka-3
-
-.PHONY: demo-lakehouse
-demo-lakehouse:
-	COMPOSE_PROJECT_NAME=$(LAKEHOUSE_PROJECT) ./run-lakehouse-demo.sh
-
-.PHONY: duckdb-lakehouse
-duckdb-lakehouse:
-	$(DOCKER) compose --project-name $(LAKEHOUSE_PROJECT) -f $(LAKEHOUSE_COMPOSE) \
-		--profile tools run --rm duckdb
-
-.PHONY: destroy-lakehouse
-destroy-lakehouse:
-	$(DOCKER) compose --project-name $(LAKEHOUSE_PROJECT) -f $(LAKEHOUSE_COMPOSE) \
-		-f $(LAKEHOUSE_DEMO_COMPOSE) \
-		down -v --remove-orphans
-
-.PHONY: demo
-demo:
-	@set +e; \
-	cleanup() { status=$$?; trap - EXIT INT TERM; $(MAKE) destroy; exit $$status; }; \
-	trap cleanup EXIT INT TERM; \
-	$(DOCKER) compose -f docker-compose.yml -f docker-compose.demo.yml up
-
-.PHONY: demo-compaction
-demo-compaction:
-	$(DOCKER) compose -f docker-compose-localstack-compaction.yml up -d
-	$(DOCKER) compose -f docker-compose-localstack-compaction.yml -f docker-compose-localstack-compaction.demo.yml run --rm raw-consumer
-	$(DOCKER) compose -f docker-compose-localstack-compaction.yml down -v --remove-orphans
+.PHONY: build-images
+build-images:
+	URSA_STORAGE_DIR="$(URSA_STORAGE_DIR)" ./build-images.sh
 
 .PHONY: up
 up:
-	$(DOCKER) compose -f docker-compose.yml up -d
+	$(COMPOSE) up -d
 	@echo "Waiting for cluster to be ready..."
 	@sleep 10
-	@$(DOCKER) compose exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:19092 --list 2>/dev/null || echo "Cluster still starting..."
+	@$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:19092 --list 2>/dev/null || echo "Cluster still starting..."
 	@echo ""
 	@echo "Cluster started. Use 'make create-topic' to create a diskless topic."
 
 .PHONY: down
 down:
-	$(DOCKER) compose down
+	$(COMPOSE) $(ALL_PROFILES) down
 
 .PHONY: destroy
 destroy:
-	$(DOCKER) compose down -v --remove-orphans
-
-.PHONY: up-compaction
-up-compaction:
-	$(DOCKER) compose -f docker-compose-localstack-compaction.yml up -d
-
-.PHONY: down-compaction
-down-compaction:
-	$(DOCKER) compose -f docker-compose-localstack-compaction.yml down
-
-.PHONY: destroy-compaction
-destroy-compaction:
-	$(DOCKER) compose -f docker-compose-localstack-compaction.yml down -v --remove-orphans
+	$(COMPOSE) $(ALL_PROFILES) down -v --remove-orphans
 
 .PHONY: logs
 logs:
-	$(DOCKER) compose logs -f kafka-1
+	$(COMPOSE) logs -f kafka-1
+
+.PHONY: compaction-logs
+compaction-logs:
+	$(COMPOSE) logs -f compactor
 
 .PHONY: ps
 ps:
-	$(DOCKER) compose ps
-
-TOPIC ?= test-diskless
-PARTITIONS ?= 12
+	$(COMPOSE) ps
 
 .PHONY: create-topic
 create-topic:
-	$(DOCKER) compose exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+	$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
 		--bootstrap-server kafka-1:19092 \
 		--create \
 		--if-not-exists \
@@ -130,13 +90,13 @@ create-topic:
 
 .PHONY: list-topics
 list-topics:
-	$(DOCKER) compose exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
+	$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-topics.sh \
 		--bootstrap-server kafka-1:19092 \
 		--list
 
 .PHONY: produce
 produce:
-	$(DOCKER) compose exec kafka-1 /opt/kafka/bin/kafka-producer-perf-test.sh \
+	$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-producer-perf-test.sh \
 		--producer-props \
 			bootstrap.servers=kafka-1:19092 \
 			batch.size=1000000 \
@@ -150,7 +110,7 @@ produce:
 
 .PHONY: consume
 consume:
-	$(DOCKER) compose exec kafka-1 /opt/kafka/bin/kafka-consumer-perf-test.sh \
+	$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-consumer-perf-test.sh \
 		--bootstrap-server kafka-1:19092 \
 		--topic $(TOPIC) \
 		--messages 100000 \
@@ -161,13 +121,35 @@ consume:
 
 .PHONY: console-producer
 console-producer:
-	$(DOCKER) compose exec kafka-1 /opt/kafka/bin/kafka-console-producer.sh \
+	$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-console-producer.sh \
 		--bootstrap-server kafka-1:19092 \
 		--topic $(TOPIC)
 
 .PHONY: console-consumer
 console-consumer:
-	$(DOCKER) compose exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+	$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
 		--bootstrap-server kafka-1:19092 \
 		--topic $(TOPIC) \
 		--from-beginning
+
+.PHONY: demo
+demo:
+	@set +e; \
+	cleanup() { status=$$?; trap - EXIT INT TERM; $(MAKE) destroy; exit $$status; }; \
+	trap cleanup EXIT INT TERM; \
+	$(COMPOSE) --profile demo up
+
+.PHONY: share-demo
+share-demo:
+	@set +e; \
+	cleanup() { status=$$?; trap - EXIT INT TERM; $(MAKE) destroy; exit $$status; }; \
+	trap cleanup EXIT INT TERM; \
+	$(COMPOSE) --profile share-demo up
+
+.PHONY: lakehouse-demo
+lakehouse-demo:
+	./run-lakehouse-demo.sh
+
+.PHONY: duckdb
+duckdb:
+	$(COMPOSE) --profile tools run --rm duckdb

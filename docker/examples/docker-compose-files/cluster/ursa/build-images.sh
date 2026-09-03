@@ -14,19 +14,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#
+# Build both local project images for the compose stack:
+#   - the Kafka broker image (skip with SKIP_KAFKA_BUILD=true)
+#   - the standalone Ursa compactor image (skip with SKIP_URSA_BUILD=true)
+#
+# Environment:
+#   URSA_STORAGE_DIR   Local ursa-storage checkout (required, or pass as $1)
+#   IMAGE              Kafka image name (default: lakestream/kafka:latest)
+#   COMPACTOR_IMAGE    Compactor image name (default: lakestream/compactor:latest)
+#   GRADLE_ARGS        Extra Gradle arguments, e.g. --offline
+#   MAVEN_ARGS         Extra Maven arguments, e.g. -o
+
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ursa_storage_dir="${URSA_STORAGE_DIR:-${1:-}}"
-kafka_image="${IMAGE:-kafka-diskless:latest}"
-compactor_image="${COMPACTOR_IMAGE:-ursa-compactor:lakehouse-e2e}"
+kafka_image="${IMAGE:-lakestream/kafka:latest}"
+compactor_image="${COMPACTOR_IMAGE:-lakestream/compactor:latest}"
 
 if [[ -z "$ursa_storage_dir" || ! -f "$ursa_storage_dir/pom.xml" ]]; then
   cat >&2 <<'EOF'
 Set URSA_STORAGE_DIR to a local ursa-storage checkout (or pass it as the
 first argument), for example:
 
-  URSA_STORAGE_DIR=/path/to/ursa-storage ./build-lakehouse-images.sh
+  URSA_STORAGE_DIR=/path/to/ursa-storage ./build-images.sh
 EOF
   exit 2
 fi
@@ -36,9 +48,15 @@ if [[ "${SKIP_KAFKA_BUILD:-false}" != "true" ]]; then
 fi
 
 if [[ "${SKIP_URSA_BUILD:-false}" != "true" ]]; then
+  maven_extra_args=()
+  if [[ -n "${MAVEN_ARGS:-}" ]]; then
+    # Word splitting is intended: MAVEN_ARGS may carry several flags.
+    # shellcheck disable=SC2206
+    maven_extra_args=(${MAVEN_ARGS})
+  fi
   (
     cd "$ursa_storage_dir"
-    mvn -B -ntp \
+    mvn -B -ntp "${maven_extra_args[@]+"${maven_extra_args[@]}"}" \
       -Dmaven.gitcommitid.skip=true \
       -pl ursa-storage-compact -am \
       -DskipTests clean package

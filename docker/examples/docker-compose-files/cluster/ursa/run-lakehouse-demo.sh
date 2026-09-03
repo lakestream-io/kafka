@@ -17,54 +17,65 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-base="$here/docker-compose-lakehouse.yml"
-demo="$here/docker-compose-lakehouse.demo.yml"
-project="${COMPOSE_PROJECT_NAME:-kafka-ursa-lakehouse}"
-kafka_image="${IMAGE:-kafka-diskless:latest}"
-compactor_image="${COMPACTOR_IMAGE:-ursa-compactor:lakehouse-e2e}"
+compose_file="$here/docker-compose.yml"
+project="${COMPOSE_PROJECT_NAME:-kafka-ursa}"
+kafka_image="${IMAGE:-lakestream/kafka:latest}"
+compactor_image="${COMPACTOR_IMAGE:-lakestream/compactor:latest}"
 num_records="${NUM_RECORDS:-100}"
 passed=false
+
+compose() {
+  docker compose --project-name "$project" -f "$compose_file" \
+    --profile lakehouse-demo "$@"
+}
+
+# `ps`/`down` only see services in the enabled profiles, so the project guard and
+# the cleanup have to name every profile.
+compose_all() {
+  docker compose --project-name "$project" -f "$compose_file" \
+    --profile demo --profile share-demo --profile lakehouse-demo --profile tools "$@"
+}
 
 for image in "$kafka_image" "$compactor_image"; do
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     echo "Required local image is missing: $image" >&2
-    echo "Run URSA_STORAGE_DIR=/path/to/ursa-storage ./build-lakehouse-images.sh first." >&2
+    echo "Run URSA_STORAGE_DIR=/path/to/ursa-storage ./build-images.sh first." >&2
     exit 2
   fi
 done
 
-existing_containers="$(docker compose --project-name "$project" \
-  -f "$base" -f "$demo" ps -aq)"
+existing_containers="$(compose_all ps -aq)"
 existing_volumes="$(docker volume ls \
   --filter "label=com.docker.compose.project=$project" --quiet)"
 if [[ -n "$existing_containers" || -n "$existing_volumes" ]]; then
   echo "Compose project '$project' already has containers or volumes." >&2
-  echo "Run 'make destroy-lakehouse' before starting a fresh E2E." >&2
+  echo "Run 'make destroy' before starting a fresh E2E." >&2
   exit 2
 fi
 
 cleanup() {
   if [[ "$passed" == "true" && "${KEEP_RUNNING:-false}" != "true" ]]; then
-    docker compose --project-name "$project" -f "$base" -f "$demo" \
-      down -v --remove-orphans >/dev/null
+    compose_all down -v --remove-orphans >/dev/null
   elif [[ "$passed" != "true" ]]; then
     echo "E2E failed; containers were left running for inspection." >&2
-    echo "Logs: docker compose --project-name $project -f $base logs compactor polaris" >&2
+    echo "Logs: docker compose -f $compose_file logs compactor polaris" >&2
   fi
 }
 trap cleanup EXIT
 
-docker compose --project-name "$project" -f "$base" up -d \
+compose up -d \
   oxia minio minio-init polaris polaris-setup compactor kafka-1 kafka-2 kafka-3
 
-docker compose --project-name "$project" -f "$base" -f "$demo" \
-  run --rm kafka-consumer-check
+compose run --rm kafka-consumer-check
+
+# The stack is already up and raw-producer has completed; --no-deps keeps the
+# one-shot producer from running a second time.
+compose run --rm --no-deps wait-for-parquet
 
 attempt=1
 last_query_output=""
 while [[ "$attempt" -le 120 ]]; do
-  if last_query_output="$(docker compose --project-name "$project" \
-      -f "$base" -f "$demo" run --rm --no-deps duckdb-query-check 2>&1)"; then
+  if last_query_output="$(compose run --rm --no-deps duckdb-query-check 2>&1)"; then
     echo "$last_query_output"
     break
   fi
@@ -79,7 +90,7 @@ if [[ "$attempt" -gt 120 ]]; then
   exit 1
 fi
 
-compactor_logs="$(docker compose --project-name "$project" -f "$base" logs --no-color compactor)"
+compactor_logs="$(compose logs --no-color compactor)"
 materialization_count="$(printf '%s\n' "$compactor_logs" \
   | grep -F -c "Materializing [0,$num_records) of stream" || true)"
 if [[ "$materialization_count" != "1" ]]; then

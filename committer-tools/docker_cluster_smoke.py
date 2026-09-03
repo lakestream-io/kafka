@@ -51,7 +51,7 @@ def get_tarball_path(project_dir: str) -> str:
     return max(candidates, key=os.path.getmtime)
 
 
-def build_kafka_diskless_image(project_dir: str, tarball: str, image_tag: str) -> None:
+def build_kafka_image(project_dir: str, tarball: str, image_tag: str) -> None:
     dockerfile = os.path.join(
         project_dir,
         "docker",
@@ -100,6 +100,16 @@ def build_kafka_diskless_image(project_dir: str, tarball: str, image_tag: str) -
         )
 
 
+# `down` only removes containers for services in the enabled profiles, so the
+# cleanup has to name every profile the compose file defines.
+ALL_PROFILES = [
+    "--profile", "demo",
+    "--profile", "share-demo",
+    "--profile", "lakehouse-demo",
+    "--profile", "tools",
+]
+
+
 def docker_compose(
     compose_dir: str, args: list[str], env: dict[str, str], check: bool = True
 ) -> None:
@@ -138,12 +148,12 @@ def print_compose_diagnostics(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Smoke-test the localstack compaction docker compose by starting Kafka brokers and creating a diskless topic."
+        description="Smoke-test the Ursa docker compose stack by starting Kafka brokers and creating a diskless topic."
     )
     parser.add_argument("--skip-build", action="store_true", help="skip building the tarball")
     parser.add_argument(
         "--image-tag",
-        default="kafka-diskless:ci-smoke",
+        default="lakestream/kafka:ci-smoke",
         help="docker image tag to build/use for the brokers and CLI containers",
     )
     parser.add_argument(
@@ -151,7 +161,7 @@ def main() -> None:
         default=os.path.join(
             "docker", "examples", "docker-compose-files", "cluster", "ursa"
         ),
-        help="directory containing docker-compose-localstack-compaction*.yml",
+        help="directory containing docker-compose.yml",
     )
     args = parser.parse_args()
 
@@ -159,13 +169,9 @@ def main() -> None:
     print("Using project directory:", project_dir)
 
     compose_dir = os.path.abspath(args.compose_dir)
-    base_compose = os.path.join(compose_dir, "docker-compose-localstack-compaction.yml")
-    demo_compose = os.path.join(compose_dir, "docker-compose-localstack-compaction.demo.yml")
-    if not os.path.isfile(base_compose):
-        print("Error: compose file not found:", base_compose)
-        sys.exit(1)
-    if not os.path.isfile(demo_compose):
-        print("Error: compose file not found:", demo_compose)
+    compose_file = os.path.join(compose_dir, "docker-compose.yml")
+    if not os.path.isfile(compose_file):
+        print("Error: compose file not found:", compose_file)
         sys.exit(1)
 
     if args.skip_build:
@@ -176,17 +182,17 @@ def main() -> None:
     tarball = get_tarball_path(project_dir)
     print("Tarball:", tarball)
 
-    build_kafka_diskless_image(project_dir, tarball, args.image_tag)
+    build_kafka_image(project_dir, tarball, args.image_tag)
 
     env = os.environ.copy()
     env["IMAGE"] = args.image_tag
-    env.setdefault("URSA_STORAGE_PATH", "ursa")
 
-    # Start only the services required for brokers (skip compactor to avoid extra images).
+    # Start only the services the brokers need. Polaris and the compactor stay
+    # down so CI never needs the locally built compactor image.
     up_services = [
         "oxia",
-        "localstack",
-        "localstack-init",
+        "minio",
+        "minio-init",
         "kafka-1",
         "kafka-2",
         "kafka-3",
@@ -196,34 +202,34 @@ def main() -> None:
         print("\nStarting cluster services:", " ".join(up_services))
         docker_compose(
             compose_dir,
-            ["-f", base_compose, "up", "-d", *up_services],
+            ["-f", compose_file, "up", "-d", *up_services],
             env,
         )
 
         print("\nWaiting for Kafka cluster to be ready...")
         docker_compose(
             compose_dir,
-            ["-f", base_compose, "-f", demo_compose, "run", "--rm", "kafka-ready"],
+            ["-f", compose_file, "--profile", "demo", "run", "--rm", "kafka-ready"],
             env,
         )
 
         print("\nCreating a diskless topic...")
         docker_compose(
             compose_dir,
-            ["-f", base_compose, "-f", demo_compose, "run", "--rm", "create-topic"],
+            ["-f", compose_file, "--profile", "demo", "run", "--rm", "create-topic"],
             env,
         )
 
         print("\nOK: docker compose smoke test completed.")
     except subprocess.CalledProcessError:
-        print_compose_diagnostics(compose_dir, base_compose, env, up_services)
+        print_compose_diagnostics(compose_dir, compose_file, env, up_services)
         raise
     finally:
         print("\nCleaning up docker compose resources...")
         try:
             docker_compose(
                 compose_dir,
-                ["-f", base_compose, "down", "-v", "--remove-orphans"],
+                ["-f", compose_file, *ALL_PROFILES, "down", "-v", "--remove-orphans"],
                 env,
             )
         except Exception as e:
